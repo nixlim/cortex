@@ -26,6 +26,9 @@ func newRootCmd() *cobra.Command {
 		},
 	})
 
+	// ops-dev: register every Phase 1 subcommand (see commands.go).
+	addOpsCommands(root)
+
 	return root
 }
 
