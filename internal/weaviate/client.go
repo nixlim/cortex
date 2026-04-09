@@ -177,6 +177,48 @@ func (c *HTTPClient) Health(ctx context.Context) error {
 // Ready is an alias for Health; see the Client interface docs.
 func (c *HTTPClient) Ready(ctx context.Context) error { return c.Health(ctx) }
 
+// GetObject fetches a single object by class and id. It is the
+// mirror of Upsert and is used by the watermark store (and by the
+// self-healing replay path) to read per-object state from Weaviate
+// without going through the GraphQL query path.
+//
+// Returns (nil, nil) when the object does not exist — callers use
+// that shape to distinguish "never written" from "written with the
+// zero value", which the watermark package relies on.
+func (c *HTTPClient) GetObject(ctx context.Context, class, id string) (map[string]any, error) {
+	ctx, cancel := c.ctxWithDefault(ctx)
+	defer cancel()
+
+	url := fmt.Sprintf("%s/v1/objects/%s/%s", c.baseURL, class, id)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("weaviate: build get request: %w", err)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("weaviate: get %s/%s: %w", class, id, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var outer struct {
+			Properties map[string]any `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &outer); err != nil {
+			return nil, fmt.Errorf("weaviate: decode get response: %w", err)
+		}
+		return outer.Properties, nil
+	case http.StatusNotFound:
+		// Never-written sentinel — callers use this to distinguish a
+		// fresh install from an explicit zero value.
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("weaviate: get %s/%s returned HTTP %d: %s", class, id, resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+}
+
 // Upsert stores or replaces an object. Weaviate's REST surface exposes
 // PUT /v1/objects/{class}/{id} for that purpose. The id MUST be a
 // UUIDv5 or v4 string from Weaviate's perspective; callers that have
@@ -190,7 +232,14 @@ func (c *HTTPClient) Upsert(ctx context.Context, class, id string, vector []floa
 		"class":      class,
 		"id":         id,
 		"properties": properties,
-		"vector":     vector,
+	}
+	// Vector is omitted entirely when the caller passes a zero-length
+	// slice. This lets low-dimensional metadata collections (e.g.,
+	// CortexMeta watermark objects) use the same Upsert entry point
+	// without getting a "vector: null" that some Weaviate versions
+	// reject as malformed.
+	if len(vector) > 0 {
+		body["vector"] = vector
 	}
 	buf, err := json.Marshal(body)
 	if err != nil {
