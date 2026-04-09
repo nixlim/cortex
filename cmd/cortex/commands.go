@@ -104,7 +104,10 @@ func newStatusCmd() *cobra.Command {
 		Long: "cortex status reports each managed dependency as running/stopped/degraded " +
 			"with version, log watermark, entry count, and disk usage. Deep checks " +
 			"belong to cortex doctor.",
-		RunE: notImplemented("cortex status"),
+		// implementation in cmd/cortex/status.go (cortex-4kq.27)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runStatus(cmd, args, jsonOut)
+		},
 	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON output")
 	return cmd
@@ -354,12 +357,11 @@ func newBenchCmd() *cobra.Command {
 // features-dev stubs — observe / recall / reflect / ingest / analyze
 // ---------------------------------------------------------------------------
 
+// newObserveCmd delegates to the real implementation in observe.go.
+// The stub form has been removed; see newObserveCmdReal for the
+// full write pipeline wiring.
 func newObserveCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "observe",
-		Short: "Write an observation entry through the standard pipeline",
-		RunE:  notImplemented("cortex observe"),
-	}
+	return newObserveCmdReal()
 }
 
 func newRecallCmd() *cobra.Command {
