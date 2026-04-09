@@ -1,0 +1,147 @@
+###############################################################################
+# Cortex Phase 1 — managed infrastructure compose file
+#
+# Declares the two managed services Cortex needs: Weaviate and Neo4j+GDS.
+# Ollama is a host service and is intentionally NOT declared here.
+#
+# Spec references:
+#   docs/spec/cortex-spec.md §"Dependency Set" / §"Pinned Service Versions"
+#   docs/spec/cortex-spec.md §"Resource Allocation"
+#   docs/spec/cortex-spec.md §"Volume Topology and Persistence"
+#   docs/spec/cortex-spec.md §"cortex up Readiness Contract"
+#
+# Pinned versions (FR-057, FR-059):
+#   - Weaviate:     1.36.9
+#   - Neo4j base:   5.24-community  (rebuilt locally as cortex/neo4j-gds)
+#   - GDS plugin:   2.13.2          (baked into custom image at build time)
+#
+# All managed services bind to 127.0.0.1 only. No service is exposed on
+# 0.0.0.0. Operators who need non-local access edit this file and accept
+# the deviation from spec-compliant deployment.
+###############################################################################
+
+name: cortex
+
+services:
+  weaviate:
+    # Upstream image — Cortex does not re-distribute.
+    image: cr.weaviate.io/semitechnologies/weaviate:1.36.9
+    container_name: cortex-weaviate
+    restart: unless-stopped
+
+    # Loopback binding only. Never expose on 0.0.0.0.
+    ports:
+      - "127.0.0.1:9397:8080"   # HTTP REST API
+      - "127.0.0.1:50051:50051" # gRPC API
+
+    environment:
+      # Cortex manages its own vectors via the Ollama adapter. Weaviate runs
+      # with no default vectorizer module so every object ships with a
+      # caller-supplied vector.
+      QUERY_DEFAULTS_LIMIT: "25"
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE: "none"
+      ENABLE_MODULES: ""
+      CLUSTER_HOSTNAME: "cortex-weaviate"
+      # Resource-limit hint for Weaviate's internal tuning. See spec
+      # Resource Allocation table.
+      LIMIT_RESOURCES: "true"
+
+    volumes:
+      - cortex_weaviate_data:/var/lib/weaviate
+
+    # Per spec Resource Allocation table: 2G request / 4G limit.
+    # mem_reservation is the "request" side; mem_limit is the hard cap.
+    mem_reservation: 2g
+    mem_limit: 4g
+
+    # Readiness probe matches the §cortex up Readiness Contract probe.
+    # wget is already on the upstream Weaviate image (alpine base).
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/v1/.well-known/ready || exit 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+
+  neo4j:
+    # Built locally from docker/neo4j-gds/Dockerfile (FR-057). The tag is
+    # bound to the Cortex release version, not Neo4j or GDS versions, so
+    # Cortex and its Neo4j image upgrade as a unit.
+    image: cortex/neo4j-gds:0.1.0
+    build:
+      context: ./neo4j-gds
+      dockerfile: Dockerfile
+      args:
+        NEO4J_BASE: "neo4j:5.24-community"
+        GDS_VERSION: "2.13.2"
+    container_name: cortex-neo4j
+    restart: unless-stopped
+
+    # Loopback binding only. Bolt on 7687, HTTP on 7474 for local debugging.
+    ports:
+      - "127.0.0.1:7687:7687"
+      - "127.0.0.1:7474:7474"
+
+    environment:
+      # NEO4J_AUTH is rewritten by `cortex up` on first launch with a
+      # freshly generated password stored in ~/.cortex/config.yaml (mode
+      # 0600). The literal below is a placeholder that cortex up replaces
+      # via env-file injection; operators must not ship this default.
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:-cortexbootstrap}"
+
+      # JVM heap + page cache per spec Resource Allocation.
+      NEO4J_server_memory_heap_initial__size: "1G"
+      NEO4J_server_memory_heap_max__size: "2G"
+      NEO4J_server_memory_pagecache_size: "1G"
+
+      # GDS enablement — the plugin jar is baked into the custom image at
+      # /var/lib/neo4j/plugins/. These procedure allowlists let Cortex
+      # call gds.* from Bolt sessions.
+      NEO4J_dbms_security_procedures_unrestricted: "gds.*"
+      NEO4J_dbms_security_procedures_allowlist: "gds.*"
+
+      # Bind Neo4j listeners to all interfaces inside the container; the
+      # host-side loopback binding in `ports:` enforces the loopback-only
+      # contract at the Docker daemon boundary.
+      NEO4J_server_default__listen__address: "0.0.0.0"
+
+      # Accept the Neo4j license implicitly for community edition. GDS is
+      # distributed under the same community edition terms.
+      NEO4J_ACCEPT_LICENSE_AGREEMENT: "yes"
+
+    volumes:
+      - cortex_neo4j_data:/data
+
+    # Per spec Resource Allocation table: 2G request / 4G limit.
+    mem_reservation: 2g
+    mem_limit: 4g
+
+    # The Dockerfile HEALTHCHECK runs a cypher-shell RETURN 1 ping, but we
+    # declare it here too so `docker compose ps` surfaces health without
+    # requiring the image to be built. If the image-level healthcheck
+    # disagrees, the Dockerfile wins (built into the image).
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p \"${NEO4J_PASSWORD:-cortexbootstrap}\" 'RETURN 1' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+    depends_on:
+      weaviate:
+        condition: service_healthy
+
+###############################################################################
+# Named volumes (spec Volume Topology and Persistence).
+#
+# Volume names are deterministic and bound to the Cortex release. `cortex
+# down` stops containers but does NOT remove volumes. `cortex down --purge`
+# is the only in-band destructive operation on the managed-service tier.
+###############################################################################
+volumes:
+  cortex_weaviate_data:
+    name: cortex_weaviate_data
+  cortex_neo4j_data:
+    name: cortex_neo4j_data
