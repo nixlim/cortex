@@ -77,7 +77,7 @@ func newUpCmd() *cobra.Command {
 		Long: "cortex up starts the managed Docker stack (Weaviate, Neo4j+GDS), waits for " +
 			"per-service readiness endpoints, probes the host Ollama, and only returns " +
 			"success when the 90-second startup budget has been satisfied.",
-		RunE: notImplemented("cortex up"),
+		RunE: runUp, // implementation in cmd/cortex/up.go (cortex-4kq.22)
 	}
 	return cmd
 }
