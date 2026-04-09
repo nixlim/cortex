@@ -90,7 +90,10 @@ func newDownCmd() *cobra.Command {
 		Long: "cortex down stops managed containers while preserving named volumes. " +
 			"cortex down --purge additionally removes volumes after operator confirmation. " +
 			"Neither form ever touches ~/.cortex/log.d/.",
-		RunE: notImplemented("cortex down"),
+		// implementation in cmd/cortex/down.go (cortex-4kq.26)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runDown(cmd, args, purge)
+		},
 	}
 	cmd.Flags().BoolVar(&purge, "purge", false, "also remove named volumes after confirmation")
 	return cmd
