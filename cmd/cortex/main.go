@@ -34,6 +34,15 @@ func newRootCmd() *cobra.Command {
 
 func main() {
 	if err := newRootCmd().Execute(); err != nil {
+		// Subcommands that have already rendered their own error
+		// envelope return an *exitCodeErr so main knows exactly
+		// which exit code to use (validation=2, operational=1) and
+		// must not print anything further. Anything else is an
+		// unexpected cobra-level failure (unknown flag, usage) and
+		// maps to exit 1 with a generic prefix.
+		if _, ok := err.(*exitCodeErr); ok {
+			os.Exit(exitCodeFromError(err))
+		}
 		fmt.Fprintln(os.Stderr, "cortex:", err)
 		os.Exit(1)
 	}
