@@ -1,0 +1,8 @@
+{
+  "name": "ReliabilityPattern",
+  "store": "procedural",
+  "required": ["name", "failure_mode_addressed", "technique", "scope"],
+  "optional": ["tradeoffs"],
+  "reflection_only": true,
+  "version": 1
+}

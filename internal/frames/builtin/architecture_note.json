@@ -1,0 +1,8 @@
+{
+  "name": "ArchitectureNote",
+  "store": "semantic",
+  "required": ["subject_psi", "body"],
+  "optional": ["diagram_ref"],
+  "reflection_only": true,
+  "version": 1
+}

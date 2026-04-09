@@ -1,0 +1,8 @@
+{
+  "name": "SecurityPattern",
+  "store": "procedural",
+  "required": ["name", "threat_model", "mitigation", "residual_risk"],
+  "optional": ["references"],
+  "reflection_only": true,
+  "version": 1
+}

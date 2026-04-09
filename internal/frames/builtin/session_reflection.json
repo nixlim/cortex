@@ -1,0 +1,8 @@
+{
+  "name": "SessionReflection",
+  "store": "episodic",
+  "required": ["body", "agent"],
+  "optional": ["outcomes"],
+  "reflection_only": false,
+  "version": 1
+}

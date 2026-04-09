@@ -1,0 +1,8 @@
+{
+  "name": "DesignDecision",
+  "store": "procedural",
+  "required": ["name", "context", "choice", "rationale", "consequences"],
+  "optional": ["alternatives", "supersedes"],
+  "reflection_only": true,
+  "version": 1
+}

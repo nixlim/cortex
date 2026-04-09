@@ -1,0 +1,8 @@
+{
+  "name": "BugPattern",
+  "store": "semantic",
+  "required": ["name", "symptom", "root_cause", "conditions", "remediation"],
+  "optional": ["exemplars", "first_seen", "last_seen"],
+  "reflection_only": true,
+  "version": 1
+}

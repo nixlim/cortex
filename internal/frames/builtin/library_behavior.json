@@ -1,0 +1,8 @@
+{
+  "name": "LibraryBehavior",
+  "store": "semantic",
+  "required": ["library_psi", "behavior", "observed_in"],
+  "optional": ["version_range", "workaround"],
+  "reflection_only": true,
+  "version": 1
+}

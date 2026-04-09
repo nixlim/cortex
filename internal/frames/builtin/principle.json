@@ -1,0 +1,8 @@
+{
+  "name": "Principle",
+  "store": "procedural",
+  "required": ["name", "statement", "scope"],
+  "optional": ["counterexamples"],
+  "reflection_only": true,
+  "version": 1
+}

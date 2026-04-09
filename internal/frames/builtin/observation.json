@@ -1,0 +1,8 @@
+{
+  "name": "Observation",
+  "store": "episodic",
+  "required": ["body"],
+  "optional": ["source_ref", "subject"],
+  "reflection_only": false,
+  "version": 1
+}

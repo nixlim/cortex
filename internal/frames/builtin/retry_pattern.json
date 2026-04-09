@@ -1,0 +1,8 @@
+{
+  "name": "RetryPattern",
+  "store": "procedural",
+  "required": ["name", "trigger", "strategy", "backoff", "max_attempts", "terminal_error_handling"],
+  "optional": ["jitter", "idempotency_note"],
+  "reflection_only": true,
+  "version": 1
+}

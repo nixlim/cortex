@@ -1,0 +1,8 @@
+{
+  "name": "ObservedRace",
+  "store": "episodic",
+  "required": ["body", "participants", "ordering_violation"],
+  "optional": ["reproducer"],
+  "reflection_only": false,
+  "version": 1
+}
