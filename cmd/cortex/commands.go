@@ -225,26 +225,11 @@ func newObserveCmd() *cobra.Command {
 	return newObserveCmdReal()
 }
 
-func newRecallCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "recall <query>",
-		Short: "Retrieve entries matching a query",
-		Args:  cobra.MinimumNArgs(1),
-		RunE:  notImplemented("cortex recall"),
-	}
-}
+// newRecallCmd delegates to the real implementation in recall.go.
+func newRecallCmd() *cobra.Command { return newRecallCmdReal() }
 
-func newReflectCmd() *cobra.Command {
-	var dryRun, explain bool
-	cmd := &cobra.Command{
-		Use:   "reflect",
-		Short: "Promote episodic clusters into typed frames",
-		RunE:  notImplemented("cortex reflect"),
-	}
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "evaluate candidates without writing frames")
-	cmd.Flags().BoolVar(&explain, "explain", false, "print rejection reasons per candidate")
-	return cmd
-}
+// newReflectCmd delegates to the real implementation in reflect.go.
+func newReflectCmd() *cobra.Command { return newReflectCmdReal() }
 
 // newIngestCmd delegates to the real implementation in ingest.go.
 func newIngestCmd() *cobra.Command { return newIngestCmdReal() }
