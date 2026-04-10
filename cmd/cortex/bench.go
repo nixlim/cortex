@@ -1,7 +1,7 @@
 // cmd/cortex/bench.go wires `cortex bench` onto the internal/bench
 // harness. The command constructs a bench.Config from the --profile
-// and --corpus flags, registers stub operations (the real pipeline
-// closures will be injected once the full stack is wired), runs the
+// and --corpus flags, invokes newBenchOperations to build the real
+// pipeline-backed operation closures (see bench_harness.go), runs the
 // harness, and renders the report in JSON or human form.
 //
 // The bench package (adapter-dev, cortex-4kq.55) owns all scoring
@@ -9,7 +9,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -52,15 +51,19 @@ func newBenchCmdReal() *cobra.Command {
 					nil), jsonFlag)
 			}
 
-			// Stub operations — once the full stack is wired, these will be
-			// replaced with closures over the real pipelines. For now each
-			// op succeeds instantly so the harness shape can be exercised.
-			ops := []bench.Operation{
-				bench.OperationFunc{OpName: bench.OpRecall, Fn: func(ctx context.Context) error { return nil }},
-				bench.OperationFunc{OpName: bench.OpObserve, Fn: func(ctx context.Context) error { return nil }},
-				bench.OperationFunc{OpName: bench.OpReflectDryRun, Fn: func(ctx context.Context) error { return nil }},
-				bench.OperationFunc{OpName: bench.OpAnalyzeDryRun, Fn: func(ctx context.Context) error { return nil }},
+			// Real pipeline-backed operations. See bench_harness.go for
+			// the full wire-up: observe runs against a real log.Writer
+			// in a throwaway temp dir; recall / reflect / analyze run
+			// against the production internal/* packages with in-process
+			// deterministic adapters in place of live backends. This is
+			// the grill-code CRIT-005 fix — bench no longer passes on
+			// constant-success closures.
+			ops, harnessCleanup, err := newBenchOperations()
+			if err != nil {
+				return emitAndExit(cmd, errs.Operational("BENCH_HARNESS_FAILED",
+					"could not construct bench operations", err), jsonFlag)
 			}
+			defer harnessCleanup()
 
 			home, _ := os.UserHomeDir()
 			outDir := filepath.Join(home, ".cortex", "bench")
