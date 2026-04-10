@@ -23,7 +23,10 @@ type fakeWeaviate struct {
 	schemaCalls  int32
 	schemaErrors int // how many of the first N calls return 422/already-exists
 
-	upsertBodies [][]byte
+	upsertBodies        [][]byte
+	upsertPostCalls     int32 // atomic; counts POST /v1/objects invocations
+	upsertPutCalls      int32 // atomic; counts PUT /v1/objects/{class}/{id} invocations
+	forceUpsertConflict int32 // atomic; when 1, POST returns 422 already-exists
 
 	// graphqlResults is the fixed hit list returned from every
 	// /v1/graphql POST. Tests set this before issuing the query.
@@ -48,14 +51,39 @@ func newFakeWeaviate() *fakeWeaviate {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	mux.HandleFunc("/v1/objects/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut {
+	// POST /v1/objects is the create path. The fake accepts any body
+	// and returns 200 unless forceUpsertConflict is set, in which case
+	// it returns 422 "already exists" so tests can exercise the
+	// POST→PUT fallback that real Weaviate requires on update.
+	mux.HandleFunc("/v1/objects", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		body, _ := io.ReadAll(r.Body)
+		atomic.AddInt32(&f.upsertPostCalls, 1)
+		if atomic.LoadInt32(&f.forceUpsertConflict) == 1 {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = io.WriteString(w, `{"error":[{"message":"id 'x' already exists"}]}`)
+			return
+		}
 		f.upsertBodies = append(f.upsertBodies, body)
 		w.WriteHeader(http.StatusOK)
+	})
+
+	// PATCH /v1/objects/{class}/{id} is the merge path. The fake
+	// accepts PATCH so tests can exercise the POST→PATCH fallback
+	// without pre-seeding state. upsertPutCalls keeps its historical
+	// name for test-code churn reasons but tracks PATCH hits now.
+	mux.HandleFunc("/v1/objects/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		atomic.AddInt32(&f.upsertPutCalls, 1)
+		f.upsertBodies = append(f.upsertBodies, body)
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	mux.HandleFunc("/v1/graphql", func(w http.ResponseWriter, r *http.Request) {

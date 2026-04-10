@@ -227,11 +227,34 @@ func (c *HTTPClient) GetObject(ctx context.Context, class, id string) (map[strin
 	}
 }
 
-// Upsert stores or replaces an object. Weaviate's REST surface exposes
-// PUT /v1/objects/{class}/{id} for that purpose. The id MUST be a
-// UUIDv5 or v4 string from Weaviate's perspective; callers that have
-// ULIDs should convert first (the write pipeline does this via
-// DeriveUUID in internal/datom).
+// Upsert stores or merges an object. Weaviate's REST surface splits
+// the lifecycle across three endpoints with subtly different semantics:
+//
+//   POST  /v1/objects              — create (422s if the id exists)
+//   PUT   /v1/objects/{class}/{id} — full REPLACE (wipes any field
+//                                     not present in the body, including
+//                                     the vector — see bead cortex-jw6)
+//   PATCH /v1/objects/{class}/{id} — MERGE (only listed fields change;
+//                                     unmentioned fields are preserved)
+//
+// Cortex's applier model requires merge semantics: after the initial
+// write, self-heal replays individual datoms as tiny bags that do not
+// carry the vector, so a PUT-based fallback would strip the vector on
+// every subsequent backend apply. PATCH preserves the vector and the
+// other properties the earlier write laid down, which is what the
+// applier's scratch-bag design intends.
+//
+// Upsert therefore:
+//  1. POST /v1/objects  — create.
+//  2. On 422 (already exists), PATCH /v1/objects/{class}/{id} — merge.
+//
+// The id MUST be a UUIDv5 or v4 string; callers that have ULIDs
+// convert first via DeriveUUID in internal/datom.
+//
+// Bead cortex-b8a documents the original PUT-only implementation,
+// which failed every first write because PUT cannot create.
+// Bead cortex-jw6 documents the PUT-replace vector-stripping failure
+// that motivated the switch to PATCH.
 func (c *HTTPClient) Upsert(ctx context.Context, class, id string, vector []float32, properties map[string]any) error {
 	ctx, cancel := c.ctxWithDefault(ctx)
 	defer cancel()
@@ -242,10 +265,9 @@ func (c *HTTPClient) Upsert(ctx context.Context, class, id string, vector []floa
 		"properties": properties,
 	}
 	// Vector is omitted entirely when the caller passes a zero-length
-	// slice. This lets low-dimensional metadata collections (e.g.,
-	// CortexMeta watermark objects) use the same Upsert entry point
-	// without getting a "vector: null" that some Weaviate versions
-	// reject as malformed.
+	// slice. Under PATCH semantics, omitting the vector preserves the
+	// existing stored vector — which is exactly what self-heal wants
+	// when replaying link datoms that carry no embedding.
 	if len(vector) > 0 {
 		body["vector"] = vector
 	}
@@ -254,28 +276,51 @@ func (c *HTTPClient) Upsert(ctx context.Context, class, id string, vector []floa
 		return fmt.Errorf("weaviate: marshal upsert body: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/v1/objects/%s/%s", c.baseURL, class, id)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(buf))
+	// First attempt: POST /v1/objects (create).
+	createURL := c.baseURL + "/v1/objects"
+	createResp, createRaw, err := c.doUpsertRequest(ctx, http.MethodPost, createURL, buf)
 	if err != nil {
-		return fmt.Errorf("weaviate: build upsert request: %w", err)
+		return fmt.Errorf("weaviate: upsert post: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	switch createResp {
+	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
+		return nil
+	case http.StatusUnprocessableEntity:
+		// "already exists" — fall through to the PATCH merge path.
+	default:
+		return fmt.Errorf("weaviate: upsert post %s/%s returned HTTP %d: %s", class, id, createResp, strings.TrimSpace(string(createRaw)))
+	}
 
-	resp, err := c.http.Do(req)
+	// Second attempt: PATCH /v1/objects/{class}/{id} (merge).
+	mergeURL := fmt.Sprintf("%s/v1/objects/%s/%s", c.baseURL, class, id)
+	mergeResp, mergeRaw, err := c.doUpsertRequest(ctx, http.MethodPatch, mergeURL, buf)
 	if err != nil {
-		return fmt.Errorf("weaviate: upsert: %w", err)
+		return fmt.Errorf("weaviate: upsert patch: %w", err)
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-
-	// Weaviate returns 200 on update, 201 (some versions) or 204 on
-	// create. Anything else is an error.
-	switch resp.StatusCode {
+	switch mergeResp {
 	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
 		return nil
 	default:
-		return fmt.Errorf("weaviate: upsert %s/%s returned HTTP %d: %s", class, id, resp.StatusCode, strings.TrimSpace(string(raw)))
+		return fmt.Errorf("weaviate: upsert patch %s/%s returned HTTP %d: %s", class, id, mergeResp, strings.TrimSpace(string(mergeRaw)))
 	}
+}
+
+// doUpsertRequest is the shared round-trip helper for Upsert's POST
+// and PUT phases. It returns the status code and response body so the
+// caller can switch on status without duplicating the request plumbing.
+func (c *HTTPClient) doUpsertRequest(ctx context.Context, method, url string, body []byte) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, fmt.Errorf("build %s request: %w", method, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, raw, nil
 }
 
 // graphqlRequest is the shape of a POST body to /v1/graphql.
