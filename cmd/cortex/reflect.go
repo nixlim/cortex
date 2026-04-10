@@ -20,13 +20,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 	"github.com/spf13/cobra"
 
+	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/errs"
+	"github.com/nixlim/cortex/internal/infra"
+	"github.com/nixlim/cortex/internal/log"
+	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/reflect"
 )
 
@@ -71,24 +77,52 @@ func newReflectCmdReal() *cobra.Command {
 }
 
 // buildReflectPipeline constructs a reflect.Pipeline from live
-// adapters. Phase 1 returns an operational error with a precise code
-// until the Neo4j cluster source, Neo4j reflection-watermark store,
-// and Ollama frame proposer adapters are wired (see cortex-4kq.44
-// adapter-dev follow-up beads). The pipeline itself is fully exercised
-// by internal/reflect/pipeline_test.go.
+// Neo4j / Ollama / log adapters. Bridge types live in
+// reflect_adapters.go. Returns a cleanup that closes the Bolt client
+// and the log writer.
 func buildReflectPipeline() (*reflect.Pipeline, func(), error) {
-	// TODO(adapter-dev): build Neo4j ClusterSource (Leiden/Louvain
-	// stream + exemplar cosine/MDL scoring), Neo4j WatermarkStore
-	// (Reflection node label), Ollama FrameProposer (frame_proposal
-	// prompt + JSON parsing), and a log.Writer LogAppender. Signature
-	// mirrors buildObservePipeline: load config, open log, build
-	// adapters, return pipeline + cleanup.
-	_ = ulid.Make // keep imports stable once wired
-	return nil, func() {}, errs.Operational("REFLECT_NOT_WIRED",
-		"cortex reflect requires a Neo4j ClusterSource, Neo4j reflection "+
-			"watermark store, and Ollama FrameProposer that are not yet "+
-			"wired in the CLI; the pipeline is fully exercised by "+
-			"internal/reflect unit tests", nil)
+	cfgPath := defaultConfigPath()
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return nil, func() {}, errs.Operational("CONFIG_LOAD_FAILED",
+			"could not load ~/.cortex/config.yaml", err)
+	}
+
+	password, _, _ := infra.EnsureNeo4jPassword(cfgPath)
+	bolt, err := neo4j.NewBoltClient(neo4j.Config{
+		BoltEndpoint: cfg.Endpoints.Neo4jBolt,
+		Username:     "neo4j",
+		Password:     password,
+		Timeout:      10 * time.Second,
+		MaxPoolSize:  4,
+	})
+	if err != nil {
+		return nil, func() {}, errs.Operational("NEO4J_UNAVAILABLE",
+			"could not open Neo4j Bolt client", err)
+	}
+
+	segDir := expandHome(cfg.Log.SegmentDir)
+	writer, err := log.NewWriter(segDir)
+	if err != nil {
+		_ = bolt.Close(context.Background())
+		return nil, func() {}, errs.Operational("LOG_OPEN_FAILED",
+			"could not open segment directory", err)
+	}
+	cleanup := func() {
+		_ = writer.Close()
+		_ = bolt.Close(context.Background())
+	}
+
+	ollamaClient := newOllamaClient(cfg)
+	pipeline := &reflect.Pipeline{
+		Source:       &neo4jReflectClusterSource{client: bolt},
+		Proposer:     &reflectFrameProposerBridge{client: ollamaClient},
+		Watermark:    &neo4jReflectionWatermarkStore{client: bolt},
+		Log:          writer,
+		Actor:        defaultActor(),
+		InvocationID: ulid.Make().String(),
+	}
+	return pipeline, cleanup, nil
 }
 
 // renderReflectResult prints a human-readable summary or a JSON
