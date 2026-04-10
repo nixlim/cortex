@@ -42,6 +42,7 @@ import (
 	"github.com/nixlim/cortex/internal/prompts"
 	"github.com/nixlim/cortex/internal/recall"
 	"github.com/nixlim/cortex/internal/weaviate"
+	"github.com/nixlim/cortex/internal/write"
 )
 
 // semanticGraphName is the GDS in-memory projection name Cortex uses
@@ -119,30 +120,58 @@ type neo4jSeedResolver struct {
 	client neo4j.Client
 }
 
-// Resolve matches :Concept nodes by lower-cased name, follows any
-// MENTIONS / REFERENCES / IN edge to an entry-tagged node, and
-// returns the top-K distinct entry_id values. When no concepts were
-// supplied (an empty-query degenerate path) Resolve returns a nil
-// slice so the PPR stage degenerates to a random walk.
+// Resolve matches :Concept nodes by prefixed entity id (concept:<token>),
+// follows any MENTIONS edge to an entry-tagged node, and returns the
+// top-K distinct entry_id values. The Cypher deliberately keeps the
+// legacy REFERENCES/IN edge types in the relationship list so
+// pre-existing graphs populated by other ingest paths still resolve.
+//
+// The concept id shape MUST match what the write pipeline lays down
+// in internal/write/concepts.go (ConceptEntityID). The resolver also
+// re-tokenizes the raw concepts slice through write.ExtractConceptTokens
+// so LLM-flavored concept phrases ("round-3 regression entry") are
+// broken into the same lexical tokens the write side used. Without
+// that symmetric tokenization, seed lookups would miss every time the
+// concept extractor returned multi-word phrases that the write side
+// had lexically split.
+//
+// When no concepts were supplied (an empty-query degenerate path)
+// Resolve returns a nil slice so the PPR stage degenerates to a
+// random walk.
 func (s *neo4jSeedResolver) Resolve(ctx context.Context, concepts []string, topK int) ([]string, error) {
 	if len(concepts) == 0 || topK <= 0 {
 		return nil, nil
 	}
-	lowered := make([]string, len(concepts))
-	for i, c := range concepts {
-		lowered[i] = strings.ToLower(strings.TrimSpace(c))
+	// Re-tokenize each incoming concept the same way the write path
+	// did, so a concept like "cortex-roundtrip-token" lands as the
+	// single id "concept:cortex-roundtrip-token" and a phrase like
+	// "persistent memory" becomes ["concept:persistent","concept:memory"].
+	seen := make(map[string]struct{}, len(concepts)*2)
+	ids := make([]string, 0, len(concepts)*2)
+	for _, c := range concepts {
+		for _, tok := range write.ExtractConceptTokens(c) {
+			id := write.ConceptEntityID(tok)
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, nil
 	}
 	const cypher = `
 MATCH (c:Concept)
-WHERE toLower(c.name) IN $concepts
+WHERE c.entry_id IN $conceptIds
 MATCH (c)-[:MENTIONS|REFERENCES|IN]-(e)
 WHERE e.entry_id IS NOT NULL
 RETURN DISTINCT e.entry_id AS id
 LIMIT $topK
 `
 	rows, err := s.client.QueryGraph(ctx, cypher, map[string]any{
-		"concepts": lowered,
-		"topK":     int64(topK),
+		"conceptIds": ids,
+		"topK":       int64(topK),
 	})
 	if err != nil {
 		return nil, err
@@ -170,6 +199,14 @@ type neo4jPPRRunner struct {
 // maps the result back onto entry_id strings. An empty seed set
 // returns an empty map without hitting the database — PPR from no
 // seeds is a no-op by construction.
+//
+// The GDS named projection is created lazily on first Run in the
+// process via ensureProjection. Phase 1 does not own a centralized
+// projection-bootstrap step (cortex up doesn't touch GDS), so making
+// each recall self-bootstrap is the narrowest correct fix. The
+// projection persists in Neo4j's in-memory graph store until the
+// database restarts, so the first recall pays the cost and every
+// subsequent recall in the same Neo4j session reuses it.
 func (p *neo4jPPRRunner) Run(ctx context.Context, seeds []string, damping float64, maxIter int) (map[string]float64, error) {
 	if len(seeds) == 0 {
 		return map[string]float64{}, nil
@@ -177,6 +214,9 @@ func (p *neo4jPPRRunner) Run(ctx context.Context, seeds []string, damping float6
 	graph := p.graphName
 	if graph == "" {
 		graph = semanticGraphName
+	}
+	if err := p.ensureProjection(ctx, graph); err != nil {
+		return nil, err
 	}
 	cypher := fmt.Sprintf(`
 MATCH (seed) WHERE seed.entry_id IN $seeds
@@ -186,7 +226,7 @@ CALL gds.pageRank.stream('%s', {
     dampingFactor: $damping,
     maxIterations: $maxIterations
 }) YIELD nodeId, score
-MATCH (n) WHERE id(n) = nodeId AND n.entry_id IS NOT NULL
+MATCH (n) WHERE id(n) = nodeId AND n.entry_id IS NOT NULL AND n.entry_id STARTS WITH 'entry:'
 RETURN n.entry_id AS id, score
 `, graph)
 	rows, err := p.client.RunGDS(ctx, cypher, map[string]any{
@@ -207,6 +247,45 @@ RETURN n.entry_id AS id, score
 		out[id] = score
 	}
 	return out, nil
+}
+
+// ensureProjection guarantees the named GDS projection exists before
+// PPR is invoked. The guard uses gds.graph.exists so a re-run in the
+// same Neo4j session is a cheap no-op — GDS projections live in the
+// in-memory graph store until the database restarts. On a fresh
+// database the helper projects all node labels and all relationships
+// with a wildcard pattern, which is the broadest reasonable default
+// for Phase 1 (Entry + Concept + MENTIONS edges). A follow-up bead
+// should move the bootstrap to `cortex up` so recall never pays the
+// projection cost.
+func (p *neo4jPPRRunner) ensureProjection(ctx context.Context, graph string) error {
+	const existsQuery = `
+CALL gds.graph.exists($graph) YIELD exists
+RETURN exists AS present
+`
+	rows, err := p.client.RunGDS(ctx, existsQuery, map[string]any{"graph": graph})
+	if err != nil {
+		return fmt.Errorf("gds.graph.exists: %w", err)
+	}
+	if len(rows) > 0 {
+		if present, ok := rows[0]["present"].(bool); ok && present {
+			return nil
+		}
+	}
+	// The projection uses wildcards so Phase 1 doesn't have to
+	// enumerate every node label and relationship type. gds.graph.project
+	// must be invoked with a fmt.Sprintf'd graph name because the
+	// first argument cannot be parameterised (it's a name literal,
+	// not a value). escapeGraphName in internal/neo4j sanitises the
+	// graph name so this is safe.
+	projectQuery := fmt.Sprintf(
+		"CALL gds.graph.project('%s', '*', '*') YIELD graphName RETURN graphName",
+		graph,
+	)
+	if _, err := p.client.RunGDS(ctx, projectQuery, nil); err != nil {
+		return fmt.Errorf("gds.graph.project: %w", err)
+	}
+	return nil
 }
 
 // rowFloat64 handles the handful of numeric types the Neo4j driver may

@@ -190,6 +190,9 @@ func renderRecallResult(cmd *cobra.Command, res *recall.Response, jsonFlag bool)
 	for i, r := range res.Results {
 		fmt.Fprintf(w, "  %d. %s  score=%.3f  base=%.3f  ppr=%.3f  sim=%.3f\n",
 			i+1, r.EntryID, r.Score, r.BaseActivation, r.PPRScore, r.Similarity)
+		if body := strings.TrimSpace(r.Body); body != "" {
+			fmt.Fprintf(w, "     %s\n", body)
+		}
 	}
 	return nil
 }
