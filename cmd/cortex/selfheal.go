@@ -35,6 +35,7 @@ import (
 	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/replay"
 	"github.com/nixlim/cortex/internal/watermark"
+	"github.com/nixlim/cortex/internal/weaviate"
 )
 
 // runRootSelfHeal is the body of the root cmd's PersistentPreRunE.
@@ -94,13 +95,15 @@ func runRootSelfHeal(cmd *cobra.Command) error {
 
 	store := watermark.NewStore(bolt, weaviateClient)
 
-	// Step 4: run the heal. neo4j and weaviate appliers are nil
-	// pending the cortex-4kq adapter beads that produce concrete
-	// replay.Applier implementations on the neo4j and weaviate
-	// clients. SelfHeal with nil appliers reads max(tx) and the
-	// current watermarks but does not advance anything, which is the
-	// correct no-op behaviour while the appliers are still missing.
-	_, err = replay.SelfHeal(ctx, report.Healthy, store, nil, nil)
+	// Step 4: run the heal with real backend appliers. The Neo4j and
+	// Weaviate adapter packages now expose concrete BackendApplier
+	// types (cortex-4kq adapter beads, MAJ-001 / MAJ-007), so SelfHeal
+	// actually advances the per-backend watermarks and replays any tx
+	// the previous run committed to the log but failed to apply to
+	// the store.
+	neoApplier := neo4j.NewBackendApplier(bolt)
+	weaviateApplier := weaviate.NewBackendApplier(weaviateClient)
+	_, err = replay.SelfHeal(ctx, report.Healthy, store, neoApplier, weaviateApplier)
 	if err != nil {
 		return errs.Operational("SELFHEAL_FAILED",
 			fmt.Sprintf("self-heal replay failed for command %q", cmd.Name()), err)

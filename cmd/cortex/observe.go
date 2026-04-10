@@ -24,7 +24,9 @@ import (
 
 	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/errs"
+	"github.com/nixlim/cortex/internal/infra"
 	"github.com/nixlim/cortex/internal/log"
+	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/ollama"
 	"github.com/nixlim/cortex/internal/prompts"
 	"github.com/nixlim/cortex/internal/psi"
@@ -139,15 +141,17 @@ func parseFacetFlag(raw []string) (map[string]string, error) {
 	return out, nil
 }
 
-// buildObservePipeline constructs a write.Pipeline with the minimum
-// set of dependencies a one-shot observe invocation requires: a log
-// writer pointing at segDir, the built-in secret detector, a fresh
-// per-invocation PSI registry, and an Ollama-backed Embedder so the
-// FR-051 embedding_model_name / embedding_model_digest datoms get
-// captured on every entry. Neo4j and Weaviate appliers are left nil
-// in Phase 1; the log commit is the authoritative step and the
-// startup self-heal replay brings the backends up to date on the
-// next command (FR-004).
+// buildObservePipeline constructs a write.Pipeline with the full set
+// of dependencies a one-shot observe invocation requires: a log writer
+// pointing at segDir, the built-in secret detector, a fresh
+// per-invocation PSI registry, an Ollama-backed Embedder so the FR-051
+// embedding_model_name / embedding_model_digest datoms get captured on
+// every entry, and concrete Neo4j + Weaviate BackendAppliers so the
+// post-commit apply phase actually mutates the live backends. A failed
+// Bolt connection is non-fatal at construction time — the pipeline
+// simply runs without the Neo4j applier; the log commit is still
+// authoritative and the next command's self-heal replay will catch up
+// the missing apply (FR-004).
 func buildObservePipeline(segDir string, cfg config.Config) (*write.Pipeline, func(), error) {
 	detector, err := secrets.LoadBuiltin(0)
 	if err != nil {
@@ -159,11 +163,37 @@ func buildObservePipeline(segDir string, cfg config.Config) (*write.Pipeline, fu
 		return nil, func() {}, errs.Operational("LOG_OPEN_FAILED",
 			"could not open segment directory", err)
 	}
-	cleanup := func() { _ = writer.Close() }
 
 	embedder := newOllamaEmbedder(cfg)
 	ollamaClient := newOllamaClient(cfg)
 	weaviateClient := newWeaviateClient(cfg)
+
+	// Open a Bolt client for the Neo4j BackendApplier. Failure here
+	// degrades to "no neo4j applier" rather than blocking the write —
+	// the log commit is the authoritative step and self-heal will
+	// replay the missing rows on the next command (FR-004).
+	cfgPath := defaultConfigPath()
+	password, _, _ := infra.EnsureNeo4jPassword(cfgPath)
+	bolt, boltErr := neo4j.NewBoltClient(neo4j.Config{
+		BoltEndpoint: cfg.Endpoints.Neo4jBolt,
+		Username:     "neo4j",
+		Password:     password,
+		Timeout:      10 * time.Second,
+		MaxPoolSize:  4,
+	})
+
+	cleanup := func() {
+		_ = writer.Close()
+		if bolt != nil {
+			_ = bolt.Close(context.Background())
+		}
+	}
+
+	var neoApplier write.BackendApplier
+	if boltErr == nil {
+		neoApplier = neo4j.NewBackendApplier(bolt)
+	}
+	weaviateApplier := weaviate.NewBackendApplier(weaviateClient)
 
 	p := &write.Pipeline{
 		Detector:     detector,
@@ -172,6 +202,8 @@ func buildObservePipeline(segDir string, cfg config.Config) (*write.Pipeline, fu
 		Embedder:     embedder,
 		Actor:        defaultActor(),
 		InvocationID: ulid.Make().String(),
+		Neo4j:        neoApplier,
+		Weaviate:     weaviateApplier,
 		Neighbors:    &weaviateNeighborFinder{client: weaviateClient},
 		LinkProposer: &ollamaLinkProposer{client: ollamaClient},
 		LinkConfig: write.LinkDerivationConfig{
