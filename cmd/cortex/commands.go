@@ -223,50 +223,22 @@ func newExportCmd() *cobra.Command { return newExportCmdReal() }
 // newMergeCmd delegates to the real implementation in merge.go.
 func newMergeCmd() *cobra.Command { return newMergeCmdReal() }
 
-func newRetractCmd() *cobra.Command {
-	var cascade bool
-	cmd := &cobra.Command{
-		Use:   "retract <entity-id>",
-		Short: "Write a retraction datom against an entity",
-		Args:  cobra.ExactArgs(1),
-		RunE:  notImplemented("cortex retract"),
-	}
-	cmd.Flags().BoolVar(&cascade, "cascade", false, "also retract derived-from descendants")
-	return cmd
-}
+// newRetractCmd delegates to the real implementation in retract.go.
+func newRetractCmd() *cobra.Command { return newRetractCmdReal() }
 
 // ---------------------------------------------------------------------------
 // Subject (PSI) — merge
 // ---------------------------------------------------------------------------
 
-func newSubjectCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "subject",
-		Short: "Manage PSI subjects",
-	}
-	cmd.AddCommand(&cobra.Command{
-		Use:   "merge <canonical-id> <alias-id>...",
-		Short: "Accretively merge subjects by adding aliases to a canonical id",
-		Args:  cobra.MinimumNArgs(2),
-		RunE:  notImplemented("cortex subject merge"),
-	})
-	return cmd
-}
+// newSubjectCmd delegates to the real implementation in subject_merge.go.
+func newSubjectCmd() *cobra.Command { return newSubjectCmdReal() }
 
 // ---------------------------------------------------------------------------
 // Migrate / bench
 // ---------------------------------------------------------------------------
 
-func newMigrateCmd() *cobra.Command {
-	var fromMempalace string
-	cmd := &cobra.Command{
-		Use:   "migrate",
-		Short: "Migrate content from an external knowledge system",
-		RunE:  notImplemented("cortex migrate"),
-	}
-	cmd.Flags().StringVar(&fromMempalace, "from-mempalace", "", "path to a MemPalace JSONL export")
-	return cmd
-}
+// newMigrateCmd delegates to the real implementation in migrate.go.
+func newMigrateCmd() *cobra.Command { return newMigrateCmdReal() }
 
 // newBenchCmd delegates to the real implementation in bench.go.
 func newBenchCmd() *cobra.Command { return newBenchCmdReal() }
