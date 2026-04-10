@@ -143,8 +143,8 @@ func TestLoadReturnsTrailNotFound(t *testing.T) {
 		t.Fatal("expected ErrTrailNotFound, got nil")
 	}
 	var e *errs.Error
-	if !errors.As(err, &e) || e.Code != "TRAIL_NOT_FOUND" {
-		t.Errorf("err = %v, want TRAIL_NOT_FOUND", err)
+	if !errors.As(err, &e) || e.Code != "NOT_FOUND" || e.Kind != errs.KindOperational {
+		t.Errorf("err = %v, want operational NOT_FOUND", err)
 	}
 }
 

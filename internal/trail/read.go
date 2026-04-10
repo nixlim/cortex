@@ -163,9 +163,12 @@ func sortableEnd(s string) string {
 }
 
 // ErrTrailNotFound is returned by Load when no datoms exist for the
-// requested trail id. Wrapped in a Validation error at the CLI layer
-// so the operator gets exit 2 with TRAIL_NOT_FOUND.
-var ErrTrailNotFound = errs.Validation("TRAIL_NOT_FOUND",
+// requested trail id. It is an operational error (exit 1) per the
+// spec acceptance criterion "cortex trail show on a missing id exits
+// 1 with error NOT_FOUND" — "not found" sits in the runtime/lookup
+// failure bucket alongside other exit-1 conditions, not in the
+// usage/validation bucket.
+var ErrTrailNotFound = errs.Operational("NOT_FOUND",
 	"no trail found for the requested id", nil)
 
 // applyAttribute folds one trail-entity datom into the running manifest.
