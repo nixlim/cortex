@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 )
 
@@ -25,8 +26,11 @@ type DockerRunner interface {
 	// to the "Docker daemon reachable" step of the readiness contract.
 	Ping(ctx context.Context) error
 
-	// ComposeUp brings up the managed stack in detached mode.
-	ComposeUp(ctx context.Context, composeFile string) error
+	// ComposeUp brings up the managed stack in detached mode. env is
+	// merged into the subprocess environment on top of os.Environ so the
+	// compose file's ${VAR} placeholders (notably NEO4J_PASSWORD) expand
+	// to the values the caller just wrote to ~/.cortex/config.yaml.
+	ComposeUp(ctx context.Context, composeFile string, env map[string]string) error
 
 	// ComposeDown stops the stack. When removeVolumes is true, named
 	// volumes are removed as well ("cortex down --purge").
@@ -57,9 +61,19 @@ func (ExecDocker) Ping(ctx context.Context) error {
 	return nil
 }
 
-// ComposeUp runs `docker compose -f <file> up -d`.
-func (ExecDocker) ComposeUp(ctx context.Context, composeFile string) error {
+// ComposeUp runs `docker compose -f <file> up -d`. Any entries in env
+// are appended to os.Environ() before exec so the compose file's
+// ${VAR:-default} placeholders expand to the caller-supplied values
+// rather than the literal fallback burned into the image on first boot.
+func (ExecDocker) ComposeUp(ctx context.Context, composeFile string, env map[string]string) error {
 	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composeFile, "up", "-d")
+	if len(env) > 0 {
+		merged := os.Environ()
+		for k, v := range env {
+			merged = append(merged, k+"="+v)
+		}
+		cmd.Env = merged
+	}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("docker compose up: %w: %s", err, bytes.TrimSpace(out))
 	}

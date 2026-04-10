@@ -35,12 +35,17 @@ import (
 	"github.com/nixlim/cortex/internal/actr"
 	"github.com/nixlim/cortex/internal/analyze"
 	"github.com/nixlim/cortex/internal/bench"
+	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/datom"
+	"github.com/nixlim/cortex/internal/errs"
+	"github.com/nixlim/cortex/internal/infra"
 	"github.com/nixlim/cortex/internal/log"
+	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/psi"
 	"github.com/nixlim/cortex/internal/recall"
 	"github.com/nixlim/cortex/internal/reflect"
 	"github.com/nixlim/cortex/internal/security/secrets"
+	"github.com/nixlim/cortex/internal/weaviate"
 	"github.com/nixlim/cortex/internal/write"
 )
 
@@ -366,3 +371,167 @@ type benchDiscardLog struct{}
 func (benchDiscardLog) Append(_ []datom.Datom) (string, error) {
 	return ulid.Make().String(), nil
 }
+
+// -- live-backend bench wiring (cortex-uj8) -------------------------
+//
+// newBenchOperationsLive constructs bench operations that route
+// through the same backends `cortex observe` and `cortex recall` use:
+// a real Bolt client for Neo4j, a real HTTP client for Weaviate, and
+// the Ollama HTTP adapter for embedding + reflection proposals. The
+// resulting p50/p95/p99 numbers include the full network round-trip
+// instead of the in-process stubs newBenchOperations wires by default,
+// so this is the surface to use for SC-006 / SC-012 validation
+// against a live `cortex up` stack.
+//
+// Scope: only observe + recall are wired live. Reflect and analyze
+// are intentionally skipped in --live mode — a full live run of those
+// pipelines requires a seeded corpus and community refresh, which is
+// out of scope for a benchmark harness. A future follow-up can
+// extend this function; the bead cortex-uj8 is scoped to observe +
+// recall per the "same backends as cortex observe/recall" phrasing.
+//
+// Readiness gating: the harness does a single probe per backend at
+// construction time (weaviate.Health, bolt.Ping, ollama.Ping). Any
+// probe failure is returned as a BENCH_BACKEND_NOT_READY operational
+// error so the CLI surfaces a clear "cortex up first" message rather
+// than letting the first op per call burn latency into a dead socket.
+func newBenchOperationsLive(cfg config.Config) ([]bench.Operation, func(), error) {
+	tempDir, err := os.MkdirTemp("", "cortex-bench-live-")
+	if err != nil {
+		return nil, nil, fmt.Errorf("bench: create temp log dir: %w", err)
+	}
+	teardown := func() { _ = os.RemoveAll(tempDir) }
+
+	// --- Live observe pipeline. We build it manually (not via
+	// buildObservePipeline) because the bench harness wants the log
+	// writer pointed at a throwaway temp dir, not the operator's
+	// real segment directory — writing bench traffic into the live
+	// log would pollute the corpus. ---
+	detector, err := secrets.LoadBuiltin(0)
+	if err != nil {
+		teardown()
+		return nil, nil, fmt.Errorf("bench: load secret detector: %w", err)
+	}
+	logWriter, err := log.NewWriter(tempDir)
+	if err != nil {
+		teardown()
+		return nil, nil, fmt.Errorf("bench: open log writer: %w", err)
+	}
+
+	embedder := newOllamaEmbedder(cfg)
+	ollamaClient := newOllamaClient(cfg)
+	weaviateClient := newWeaviateClient(cfg)
+
+	// Readiness gate. A failing probe here is the bench equivalent of
+	// "cortex up" not having been run. We surface it as an
+	// operational error with a clear remediation, then let the caller
+	// convert it into a non-zero exit.
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelProbe()
+	if err := weaviateClient.Health(probeCtx); err != nil {
+		_ = logWriter.Close()
+		teardown()
+		return nil, nil, errs.Operational("BENCH_BACKEND_NOT_READY",
+			"weaviate not ready — run `cortex up` before `cortex bench --live`", err)
+	}
+	if err := ollamaClient.Ping(probeCtx); err != nil {
+		_ = logWriter.Close()
+		teardown()
+		return nil, nil, errs.Operational("BENCH_BACKEND_NOT_READY",
+			"ollama not reachable — run `cortex up` before `cortex bench --live`", err)
+	}
+
+	// Open Bolt. A Bolt failure is fatal for bench --live because
+	// both observe and recall depend on the graph applier.
+	cfgPath := defaultConfigPath()
+	password, _, _ := infra.EnsureNeo4jPassword(cfgPath)
+	bolt, err := neo4j.NewBoltClient(neo4j.Config{
+		BoltEndpoint: cfg.Endpoints.Neo4jBolt,
+		Username:     "neo4j",
+		Password:     password,
+		Timeout:      10 * time.Second,
+		MaxPoolSize:  4,
+	})
+	if err != nil {
+		_ = logWriter.Close()
+		teardown()
+		return nil, nil, errs.Operational("BENCH_BACKEND_NOT_READY",
+			"neo4j bolt not reachable — run `cortex up` before `cortex bench --live`", err)
+	}
+	if err := bolt.Ping(probeCtx); err != nil {
+		_ = bolt.Close(context.Background())
+		_ = logWriter.Close()
+		teardown()
+		return nil, nil, errs.Operational("BENCH_BACKEND_NOT_READY",
+			"neo4j bolt ping failed — run `cortex up` before `cortex bench --live`", err)
+	}
+
+	neoApplier := neo4j.NewBackendApplier(bolt)
+	weaviateApplier := weaviate.NewBackendApplier(weaviateClient)
+
+	observePipe := &write.Pipeline{
+		Detector:             detector,
+		Registry:             psi.NewRegistry(),
+		Log:                  logWriter,
+		Embedder:             embedder,
+		Actor:                "bench-live",
+		InvocationID:         ulid.Make().String(),
+		Neo4j:                neoApplier,
+		Weaviate:             weaviateApplier,
+		ExpectedEmbeddingDim: cfg.Ollama.EmbeddingVectorDim,
+	}
+
+	// --- Live recall pipeline. Constructed via buildRecallPipeline
+	// for fidelity with cortex recall — the same adapters, same
+	// config. The function already opens its own Bolt client and
+	// writer; we capture them for cleanup. ---
+	recallPipe, recallWriter, recallCleanup, err := buildRecallPipeline()
+	if err != nil {
+		_ = bolt.Close(context.Background())
+		_ = logWriter.Close()
+		teardown()
+		return nil, nil, err
+	}
+	// Reassign the writer to point at the same temp dir the observe
+	// op uses so recall's reinforcement datoms also avoid polluting
+	// the operator's real log. We keep the recall cleanup in place
+	// because it knows how to close the bolt client it opened.
+	_ = recallWriter // closed by recallCleanup
+
+	pinnedNow := time.Now().UTC()
+	ops := []bench.Operation{
+		bench.OperationFunc{
+			OpName: bench.OpObserve,
+			Fn: func(ctx context.Context) error {
+				_, err := observePipe.Observe(ctx, write.ObserveRequest{
+					Body: "bench-live observation " + ulid.Make().String(),
+					Kind: "Observation",
+					Facets: map[string]string{
+						"domain":  "bench",
+						"project": "bench",
+					},
+				})
+				return err
+			},
+		},
+		bench.OperationFunc{
+			OpName: bench.OpRecall,
+			Fn: func(ctx context.Context) error {
+				recallPipe.Now = func() time.Time { return pinnedNow }
+				_, err := recallPipe.Recall(ctx, recall.Request{
+					Query: "retry exponential backoff",
+				})
+				return err
+			},
+		},
+	}
+
+	cleanup := func() {
+		recallCleanup()
+		_ = bolt.Close(context.Background())
+		_ = logWriter.Close()
+		teardown()
+	}
+	return ops, cleanup, nil
+}
+

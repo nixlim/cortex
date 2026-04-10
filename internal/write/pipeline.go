@@ -174,6 +174,18 @@ type Pipeline struct {
 	// links rather than flooding the graph.
 	LinkConfig LinkDerivationConfig
 
+	// ExpectedEmbeddingDim is the Weaviate class's declared vector
+	// dimension. When > 0, the pipeline asserts that every vector the
+	// Embedder returns has exactly this length before handing it to
+	// the backend apply phase. A mismatch is reported as
+	// EMBEDDING_DIM_MISMATCH — an operational error that the CLI surfaces
+	// with a clear remediation ("embedder model was changed without
+	// rebuild") rather than letting the failure surface inside the
+	// Weaviate HTTP layer with a generic schema error. Zero disables
+	// the check, which is the right default for tests that wire a fake
+	// embedder. See cortex-06p.
+	ExpectedEmbeddingDim int
+
 	// LinkTopK is the number of nearest neighbors to ask the
 	// NeighborFinder for. A zero or negative value disables link
 	// derivation. Production callers pass 5 per the A-MEM defaults.
@@ -304,6 +316,18 @@ func (p *Pipeline) Observe(ctx context.Context, req ObserveRequest) (*ObserveRes
 		if err != nil {
 			return nil, errs.Operational("EMBEDDING_FAILED",
 				"embedding model unavailable", err)
+		}
+		// cortex-06p: validate vector dimension at the pipeline layer
+		// rather than letting a re-configured embedder surface a less
+		// actionable error inside Weaviate's HTTP response. A zero
+		// ExpectedEmbeddingDim disables the check (tests / bootstrap).
+		if p.ExpectedEmbeddingDim > 0 && len(vec) != p.ExpectedEmbeddingDim {
+			return nil, errs.Operational("EMBEDDING_DIM_MISMATCH",
+				fmt.Sprintf(
+					"embedder returned %d-dim vector; Weaviate class expects %d. "+
+						"The embedding model was likely changed without `cortex rebuild`.",
+					len(vec), p.ExpectedEmbeddingDim),
+				nil)
 		}
 		embedding = vec
 	}

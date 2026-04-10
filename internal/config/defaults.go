@@ -42,6 +42,16 @@ type OllamaConfig struct {
 	// body while keeping the KV cache bounded to ~1 GB on a 4-8B q4
 	// model.
 	NumCtx int `yaml:"num_ctx"`
+
+	// EmbeddingVectorDim is the expected output dimension of the
+	// configured embedding model. The write pipeline compares every
+	// freshly-produced vector against this value BEFORE handing it
+	// to Weaviate so a mismatch surfaces as EMBEDDING_DIM_MISMATCH
+	// with a clear "embedder was changed, run cortex rebuild"
+	// remediation rather than leaking as a generic schema error from
+	// the Weaviate HTTP layer. Zero disables the check. The cortex
+	// default is 768 (nomic-embed-text). See cortex-06p.
+	EmbeddingVectorDim int `yaml:"embedding_vector_dim"`
 }
 
 type RetrievalConfig struct {
@@ -294,7 +304,8 @@ func Defaults() Config {
 			IngestSummarySeconds:     120,
 		},
 		Ollama: OllamaConfig{
-			NumCtx: 8192,
+			NumCtx:             8192,
+			EmbeddingVectorDim: 768,
 		},
 		CLI: CLIConfig{
 			ExitCode: ExitCodeConfig{

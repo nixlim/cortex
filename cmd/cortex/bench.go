@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/nixlim/cortex/internal/bench"
+	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/errs"
 )
 
@@ -28,6 +29,7 @@ func newBenchCmdReal() *cobra.Command {
 		profileFlag string
 		corpusFlag  string
 		jsonFlag    bool
+		liveFlag    bool
 	)
 	cmd := &cobra.Command{
 		Use:   "bench",
@@ -58,7 +60,30 @@ func newBenchCmdReal() *cobra.Command {
 			// deterministic adapters in place of live backends. This is
 			// the grill-code CRIT-005 fix — bench no longer passes on
 			// constant-success closures.
-			ops, harnessCleanup, err := newBenchOperations()
+			//
+			// --live (cortex-uj8) routes observe and recall through the
+			// same Bolt / Weaviate / Ollama clients cortex observe and
+			// cortex recall use, so p50/p95/p99 reflect real network
+			// latency instead of in-process stubs. The readiness gate
+			// inside newBenchOperationsLive converts an unprepared
+			// stack into a clear BENCH_BACKEND_NOT_READY error so the
+			// operator is told to run `cortex up` first.
+			var (
+				ops            []bench.Operation
+				harnessCleanup func()
+				err            error
+			)
+			if liveFlag {
+				cfgPath := defaultConfigPath()
+				appCfg, cfgErr := config.Load(cfgPath)
+				if cfgErr != nil {
+					return emitAndExit(cmd, errs.Operational("CONFIG_LOAD_FAILED",
+						"could not load ~/.cortex/config.yaml", cfgErr), jsonFlag)
+				}
+				ops, harnessCleanup, err = newBenchOperationsLive(appCfg)
+			} else {
+				ops, harnessCleanup, err = newBenchOperations()
+			}
 			if err != nil {
 				return emitAndExit(cmd, errs.Operational("BENCH_HARNESS_FAILED",
 					"could not construct bench operations", err), jsonFlag)
@@ -102,6 +127,9 @@ func newBenchCmdReal() *cobra.Command {
 	cmd.Flags().StringVar(&profileFlag, "profile", "P1-dev", "envelope profile: P1-dev or P1-ci")
 	cmd.Flags().StringVar(&corpusFlag, "corpus", "small", "fixture corpus size: small or medium")
 	cmd.Flags().BoolVar(&jsonFlag, "json", false, "emit machine-readable JSON")
+	cmd.Flags().BoolVar(&liveFlag, "live", false,
+		"route observe and recall through the live Weaviate / Neo4j / Ollama stack "+
+			"(requires `cortex up`)")
 	return cmd
 }
 

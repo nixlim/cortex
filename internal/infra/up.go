@@ -152,7 +152,7 @@ func Run(ctx context.Context, opts UpOptions) error {
 	// container environment via the compose file's NEO4J_PASSWORD
 	// placeholder. Failure here is reported as a credential-write
 	// error, not a readiness failure.
-	_, generated, err := EnsureNeo4jPassword(opts.ConfigPath)
+	neo4jPassword, generated, err := EnsureNeo4jPassword(opts.ConfigPath)
 	if err != nil {
 		return errs.Operational(CodeCredentialWriteFailed,
 			"failed to persist neo4j bootstrap credential", err)
@@ -163,8 +163,13 @@ func Run(ctx context.Context, opts UpOptions) error {
 
 	// Step 3: Compose up. A failure here is reported as COMPOSE_FAILED
 	// before any readiness probing starts, because there is no
-	// container to probe.
-	if err := opts.Docker.ComposeUp(budgetCtx, opts.ComposeFile); err != nil {
+	// container to probe. NEO4J_PASSWORD is threaded into the compose
+	// subprocess env so the compose file's ${NEO4J_PASSWORD:-...}
+	// placeholder expands to the freshly generated credential instead
+	// of the literal bootstrap fallback (which would otherwise burn
+	// into the neo4j_data volume on first boot).
+	composeEnv := map[string]string{"NEO4J_PASSWORD": neo4jPassword}
+	if err := opts.Docker.ComposeUp(budgetCtx, opts.ComposeFile, composeEnv); err != nil {
 		return errs.Operational(CodeComposeFailed,
 			"docker compose up failed", err)
 	}

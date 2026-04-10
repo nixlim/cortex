@@ -25,7 +25,9 @@ type downFakeDocker struct {
 }
 
 func (f *downFakeDocker) Ping(context.Context) error                   { return nil }
-func (f *downFakeDocker) ComposeUp(context.Context, string) error      { return nil }
+func (f *downFakeDocker) ComposeUp(context.Context, string, map[string]string) error {
+	return nil
+}
 func (f *downFakeDocker) ImageExists(context.Context, string) (bool, error) {
 	return true, nil
 }

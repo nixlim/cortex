@@ -32,6 +32,7 @@ import (
 	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/ollama"
 	"github.com/nixlim/cortex/internal/rebuild"
+	"github.com/nixlim/cortex/internal/weaviate"
 )
 
 // newRebuildCmdReal returns the wired `cortex rebuild` command.
@@ -108,12 +109,22 @@ func newRebuildCmdReal() *cobra.Command {
 			}
 			defer graph.Close(context.Background())
 
+			// Weaviate staging client: if the live Weaviate instance
+			// is reachable we wire it so rebuild's Swap also promotes
+			// the Weaviate staging namespace (cortex-s84). A nil
+			// client keeps the graph-only fallback from before.
+			weaviateClient := newWeaviateClient(cfg)
+			var weaviateStaging weaviate.StagingClient
+			if weaviateClient != nil {
+				weaviateStaging = weaviateClient
+			}
+
 			invocationID := ulid.Make().String()
 			actor := defaultActor()
 			runCfg := rebuild.Config{
 				Source:       source,
 				Digest:       digestSrc,
-				Backends:     newRealStagingBackends(graph, actor, invocationID),
+				Backends:     newRealStagingBackends(graph, weaviateStaging, actor, invocationID),
 				AcceptDrift:  acceptDrift,
 				Embedder:     ollamaEmbedder{c: ollamaClient},
 				Log:          appender,

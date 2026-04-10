@@ -22,6 +22,7 @@ type fakeDocker struct {
 	composeErr error
 	pings      int32
 	composeUps int32
+	composeEnv map[string]string
 }
 
 func (f *fakeDocker) Ping(ctx context.Context) error {
@@ -29,8 +30,9 @@ func (f *fakeDocker) Ping(ctx context.Context) error {
 	return f.pingErr
 }
 
-func (f *fakeDocker) ComposeUp(ctx context.Context, _ string) error {
+func (f *fakeDocker) ComposeUp(ctx context.Context, _ string, env map[string]string) error {
 	atomic.AddInt32(&f.composeUps, 1)
+	f.composeEnv = env
 	return f.composeErr
 }
 
@@ -152,6 +154,43 @@ func TestRunHappyPath(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("config file mode = %v, want 0600", perm)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression (cortex-54l): Run must thread the generated neo4j password
+// into the compose subprocess env map so that docker-compose expands
+// ${NEO4J_PASSWORD} to the value in config.yaml, not the bootstrap
+// fallback that would otherwise burn into the volume on first boot.
+// ---------------------------------------------------------------------------
+
+func TestRunThreadsNeo4jPasswordIntoComposeEnv(t *testing.T) {
+	opts := newOpts(t)
+	fd := &fakeDocker{}
+	opts.Docker = fd
+	opts.Weaviate = &fakeWeaviate{readyAfter: 1}
+	opts.Neo4j = &fakeNeo4j{readyAfter: 1, gdsAvail: true}
+	opts.Ollama = &fakeOllama{
+		pingAfter: 1,
+		models:    []string{"nomic-embed-text:latest", "qwen3:4b-instruct"},
+	}
+
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatalf("Run: unexpected error: %v", err)
+	}
+
+	pw, _, err := EnsureNeo4jPassword(opts.ConfigPath)
+	if err != nil {
+		t.Fatalf("read persisted password: %v", err)
+	}
+	if fd.composeEnv == nil {
+		t.Fatalf("ComposeUp received nil env map — password was not threaded through")
+	}
+	if got := fd.composeEnv["NEO4J_PASSWORD"]; got != pw {
+		t.Errorf("compose env NEO4J_PASSWORD = %q, want %q (config.yaml value)", got, pw)
+	}
+	if fd.composeEnv["NEO4J_PASSWORD"] == "" {
+		t.Errorf("NEO4J_PASSWORD must not be empty — compose would expand to the bootstrap literal")
 	}
 }
 

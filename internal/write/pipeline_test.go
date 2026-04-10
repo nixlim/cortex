@@ -232,6 +232,51 @@ func TestObserve_EmbedderMissingDigestIsOperationalError(t *testing.T) {
 	}
 }
 
+// TestObserve_DimMismatchIsOperationalError covers cortex-06p: when
+// ExpectedEmbeddingDim is set and the embedder produces a vector whose
+// length differs from that dimension, the pipeline refuses to commit
+// and returns EMBEDDING_DIM_MISMATCH. Nothing lands in the log.
+func TestObserve_DimMismatchIsOperationalError(t *testing.T) {
+	p, log := newTestPipeline(t)
+	p.ExpectedEmbeddingDim = 768
+	p.Embedder = &fakeEmbedder{
+		vec:    []float32{0.1, 0.2, 0.3}, // only 3-dim
+		model:  "some-other-model",
+		digest: "sha256:cafe",
+	}
+
+	_, err := p.Observe(context.Background(), validRequest())
+	var e *errs.Error
+	if !errors.As(err, &e) || e.Code != "EMBEDDING_DIM_MISMATCH" {
+		t.Fatalf("want EMBEDDING_DIM_MISMATCH, got %v", err)
+	}
+	if e.Kind != errs.KindOperational {
+		t.Fatalf("kind: got %v want Operational", e.Kind)
+	}
+	if !strings.Contains(e.Message, "3-dim") || !strings.Contains(e.Message, "768") {
+		t.Errorf("message should name both dims: %q", e.Message)
+	}
+	if len(log.groups) != 0 {
+		t.Fatalf("log touched on dim-mismatch reject: %d groups", len(log.groups))
+	}
+}
+
+// TestObserve_DimMatchPasses covers the happy path: ExpectedEmbeddingDim
+// equals the embedder's output, commit proceeds normally.
+func TestObserve_DimMatchPasses(t *testing.T) {
+	p, _ := newTestPipeline(t)
+	p.ExpectedEmbeddingDim = 4
+	p.Embedder = &fakeEmbedder{
+		vec:    []float32{0.1, 0.2, 0.3, 0.4},
+		model:  "nomic-embed-text",
+		digest: "sha256:beef",
+	}
+
+	if _, err := p.Observe(context.Background(), validRequest()); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+}
+
 // TestObserve_RejectsReflectionOnlyKind covers AC2: a BugPattern kind
 // is reflection-only and must be rejected with the exact error code,
 // and nothing may be written to the log.

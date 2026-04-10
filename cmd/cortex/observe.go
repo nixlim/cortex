@@ -210,8 +210,9 @@ func buildObservePipeline(segDir string, cfg config.Config) (*write.Pipeline, fu
 			ConfidenceFloor:    cfg.LinkDerivation.ConfidenceFloor,
 			SimilarCosineFloor: cfg.LinkDerivation.SimilarToCosineFloor,
 		},
-		LinkTopK:        5,
-		ConceptsEnabled: true,
+		LinkTopK:             5,
+		ConceptsEnabled:      true,
+		ExpectedEmbeddingDim: cfg.Ollama.EmbeddingVectorDim,
 	}
 	return p, cleanup, nil
 }

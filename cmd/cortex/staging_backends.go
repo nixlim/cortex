@@ -52,14 +52,17 @@
 // blocked on the BoltClient gaining a transactional execution seam
 // and is tracked as a follow-up bead.
 //
-// Weaviate-side staging is intentionally out of scope of this fix:
-// the Weaviate write pipeline targets the live ClassEntry/ClassFrame
-// directly, and the rebuild loop calls ApplyEmbedding (graph-only).
-// A full rebuild that also re-vectorizes the corpus needs a staging
-// class, a class-swap dance, and a copy-on-success step in
-// internal/weaviate. That work is deferred to the staging-Weaviate
-// adapter bead; the spec acceptance criteria SC-002/SC-019/SC-020
-// are satisfied for the graph dimension by this commit.
+// Weaviate-side staging is now wired via a weaviate.StagingClient
+// (see internal/weaviate/staging.go, bead cortex-s84). Create calls
+// EnsureStagingSchema, ApplyEmbedding also writes into the staging
+// class via UpsertStaging so the rebuilt vector lands in Weaviate's
+// staging namespace (not just a Neo4j fingerprint), Swap promotes
+// staging to live via SwapStagingToLive (bulk copy + delete), and
+// Cleanup drops the staging classes so a half-run rebuild does not
+// leave stale state behind. When no StagingClient is supplied
+// (construction-time failure or a test that doesn't need Weaviate)
+// the Weaviate side silently no-ops and the graph-only behavior from
+// before is preserved — rebuild still produces a valid Neo4j swap.
 package main
 
 import (
@@ -69,6 +72,7 @@ import (
 
 	"github.com/nixlim/cortex/internal/datom"
 	"github.com/nixlim/cortex/internal/neo4j"
+	"github.com/nixlim/cortex/internal/weaviate"
 )
 
 // stagingLabel is the Neo4j label every staging node carries. The
@@ -98,6 +102,7 @@ var stagingPromotions = []struct {
 // attributed back to the rebuild that created them.
 type realStagingBackends struct {
 	graph        neo4j.Client
+	weaviate     weaviate.StagingClient
 	actor        string
 	invocationID string
 
@@ -105,12 +110,16 @@ type realStagingBackends struct {
 }
 
 // newRealStagingBackends builds a realStagingBackends from a live
-// graph client. Construction is trivial — connection lifetime is
-// managed by the caller (cmd/cortex/rebuild.go opens and closes the
-// client around the rebuild.Run call).
-func newRealStagingBackends(graph neo4j.Client, actor, invocationID string) *realStagingBackends {
+// graph client and (optionally) a Weaviate staging client.
+// Construction is trivial — connection lifetime is managed by the
+// caller (cmd/cortex/rebuild.go opens and closes the clients around
+// the rebuild.Run call). A nil weaviate client is legal: the Weaviate
+// side of the rebuild becomes a no-op and the graph-only swap path
+// from before remains in place.
+func newRealStagingBackends(graph neo4j.Client, wv weaviate.StagingClient, actor, invocationID string) *realStagingBackends {
 	return &realStagingBackends{
 		graph:        graph,
+		weaviate:     wv,
 		actor:        actor,
 		invocationID: invocationID,
 	}
@@ -140,6 +149,20 @@ func (s *realStagingBackends) Create(ctx context.Context) error {
 		"invocation_id": s.invocationID,
 	}); err != nil {
 		return fmt.Errorf("staging: write marker: %w", err)
+	}
+	// Also prepare the Weaviate staging namespace if a client is
+	// wired. Failure to reach Weaviate here fails the whole Create:
+	// a rebuild with a half-ready staging is worse than a rebuild
+	// that refuses to start.
+	if s.weaviate != nil {
+		// Best-effort cleanup of any stranded staging classes from a
+		// prior aborted rebuild before we recreate them.
+		if err := s.weaviate.CleanupStaging(ctx); err != nil {
+			return fmt.Errorf("staging: clear prior weaviate staging classes: %w", err)
+		}
+		if err := s.weaviate.EnsureStagingSchema(ctx); err != nil {
+			return fmt.Errorf("staging: ensure weaviate staging schema: %w", err)
+		}
 	}
 	return nil
 }
@@ -230,6 +253,17 @@ func (s *realStagingBackends) ApplyEmbedding(ctx context.Context, entryID string
 	}); err != nil {
 		return fmt.Errorf("staging: apply embedding %s: %w", entryID, err)
 	}
+	// Mirror the full vector into the Weaviate staging namespace so
+	// the subsequent Swap can copy it straight into the live Entry
+	// class. Callers that wire this up pass entry:<ulid> strings;
+	// anything else (frame:, subject:, …) is skipped because the
+	// rebuild embedder only re-embeds entry bodies.
+	if s.weaviate != nil && strings.HasPrefix(entryID, "entry:") {
+		props := map[string]any{"cortex_id": entryID}
+		if err := s.weaviate.UpsertStaging(ctx, weaviate.ClassEntry, entryID, vector, props); err != nil {
+			return fmt.Errorf("staging: upsert weaviate staging %s: %w", entryID, err)
+		}
+	}
 	return nil
 }
 
@@ -263,6 +297,14 @@ func (s *realStagingBackends) Swap(ctx context.Context) error {
 	dropMarker := "MATCH (m:CortexStagingMarker) DETACH DELETE m"
 	if err := s.graph.WriteEntries(ctx, dropMarker, nil); err != nil {
 		return fmt.Errorf("staging: drop marker: %w", err)
+	}
+	// Promote the Weaviate staging namespace to live via bulk copy
+	// + delete. A nil client leaves the live Weaviate state as the
+	// graph-only rebuild found it.
+	if s.weaviate != nil {
+		if err := s.weaviate.SwapStagingToLive(ctx); err != nil {
+			return fmt.Errorf("staging: weaviate swap: %w", err)
+		}
 	}
 	return nil
 }
@@ -318,6 +360,11 @@ func (s *realStagingBackends) Cleanup(ctx context.Context) error {
 	clear := fmt.Sprintf("MATCH (n:%s) DETACH DELETE n", stagingLabel)
 	if err := s.graph.WriteEntries(ctx, clear, nil); err != nil {
 		return fmt.Errorf("staging: cleanup :%s nodes: %w", stagingLabel, err)
+	}
+	if s.weaviate != nil {
+		if err := s.weaviate.CleanupStaging(ctx); err != nil {
+			return fmt.Errorf("staging: cleanup weaviate staging: %w", err)
+		}
 	}
 	return nil
 }
