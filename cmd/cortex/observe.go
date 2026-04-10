@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -25,8 +26,10 @@ import (
 	"github.com/nixlim/cortex/internal/errs"
 	"github.com/nixlim/cortex/internal/log"
 	"github.com/nixlim/cortex/internal/ollama"
+	"github.com/nixlim/cortex/internal/prompts"
 	"github.com/nixlim/cortex/internal/psi"
 	"github.com/nixlim/cortex/internal/security/secrets"
+	"github.com/nixlim/cortex/internal/weaviate"
 	"github.com/nixlim/cortex/internal/write"
 )
 
@@ -159,6 +162,8 @@ func buildObservePipeline(segDir string, cfg config.Config) (*write.Pipeline, fu
 	cleanup := func() { _ = writer.Close() }
 
 	embedder := newOllamaEmbedder(cfg)
+	ollamaClient := newOllamaClient(cfg)
+	weaviateClient := newWeaviateClient(cfg)
 
 	p := &write.Pipeline{
 		Detector:     detector,
@@ -167,8 +172,108 @@ func buildObservePipeline(segDir string, cfg config.Config) (*write.Pipeline, fu
 		Embedder:     embedder,
 		Actor:        defaultActor(),
 		InvocationID: ulid.Make().String(),
+		Neighbors:    &weaviateNeighborFinder{client: weaviateClient},
+		LinkProposer: &ollamaLinkProposer{client: ollamaClient},
+		LinkConfig: write.LinkDerivationConfig{
+			ConfidenceFloor:    cfg.LinkDerivation.ConfidenceFloor,
+			SimilarCosineFloor: cfg.LinkDerivation.SimilarToCosineFloor,
+		},
+		LinkTopK: 5,
 	}
 	return p, cleanup, nil
+}
+
+// weaviateNeighborFinder bridges write.NeighborFinder onto a live
+// Weaviate client by calling NearestNeighbors against the Entry class
+// with the just-embedded body vector. The bridge maps each search hit's
+// cortex_id property and recovered cosine similarity into a
+// write.LinkCandidate. A nil client or a Weaviate failure surfaces as
+// an empty candidate set so the link derivation pass becomes a no-op
+// rather than blocking the write — link derivation is best-effort and
+// must never roll back the source entry.
+type weaviateNeighborFinder struct {
+	client weaviate.Client
+}
+
+func (w *weaviateNeighborFinder) Neighbors(ctx context.Context, vector []float32, k int) ([]write.LinkCandidate, error) {
+	if w.client == nil || k <= 0 || len(vector) == 0 {
+		return nil, nil
+	}
+	hits, err := w.client.NearestNeighbors(ctx, weaviate.ClassEntry, vector, k, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]write.LinkCandidate, 0, len(hits))
+	for _, h := range hits {
+		cortexID, _ := h.Properties["cortex_id"].(string)
+		if cortexID == "" {
+			continue
+		}
+		out = append(out, write.LinkCandidate{
+			TargetEntryID:    cortexID,
+			CosineSimilarity: h.CosineSimilarity,
+		})
+	}
+	return out, nil
+}
+
+// ollamaLinkProposer bridges write.LinkProposer onto a live Ollama
+// generation client. It renders the link_derivation prompt with the
+// source body and a serialized candidate block, calls Generate, and
+// parses the response as JSON of the shape {"links": [{target, type,
+// confidence}]}. Per the LinkProposer contract (and the bead's AC3),
+// any unparseable response is treated as "no proposals" — the source
+// entry is already committed and link derivation must not fail it.
+type ollamaLinkProposer struct {
+	client *ollama.HTTPClient
+}
+
+func (o *ollamaLinkProposer) Propose(ctx context.Context, sourceBody string, candidates []write.LinkCandidate) ([]write.LinkProposal, error) {
+	if o.client == nil || len(candidates) == 0 {
+		return nil, nil
+	}
+	var sb strings.Builder
+	for i, c := range candidates {
+		fmt.Fprintf(&sb, "%d. id=%s cosine=%.3f\n", i+1, c.TargetEntryID, c.CosineSimilarity)
+	}
+	prompt, err := prompts.Render(prompts.NameLinkDerivation, prompts.Data{
+		Body:       sourceBody,
+		Candidates: sb.String(),
+	})
+	if err != nil {
+		return nil, nil
+	}
+	raw, err := o.client.Generate(ctx, prompt)
+	if err != nil {
+		return nil, nil
+	}
+	// The model is instructed to return JSON only, but real models
+	// occasionally wrap the object in stray prose; trim to the first
+	// '{' and last '}' before unmarshaling.
+	if i := strings.Index(raw, "{"); i >= 0 {
+		if j := strings.LastIndex(raw, "}"); j > i {
+			raw = raw[i : j+1]
+		}
+	}
+	var parsed struct {
+		Links []struct {
+			Target     string  `json:"target"`
+			Type       string  `json:"type"`
+			Confidence float64 `json:"confidence"`
+		} `json:"links"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil, nil
+	}
+	out := make([]write.LinkProposal, 0, len(parsed.Links))
+	for _, l := range parsed.Links {
+		out = append(out, write.LinkProposal{
+			TargetEntryID: l.Target,
+			LinkType:      l.Type,
+			Confidence:    l.Confidence,
+		})
+	}
+	return out, nil
 }
 
 // observeEmbedder adapts an *ollama.HTTPClient to the write.Embedder
