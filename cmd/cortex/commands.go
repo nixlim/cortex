@@ -162,28 +162,13 @@ func newAsOfCmd() *cobra.Command { return newAsOfCmdReal() }
 // Communities
 // ---------------------------------------------------------------------------
 
-func newCommunitiesCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "communities",
-		Short: "List detected knowledge communities",
-		RunE:  notImplemented("cortex communities"),
-	}
-	return cmd
-}
+// newCommunitiesCmd / newCommunityCmd delegate to the real
+// implementations in communities.go. Kept as one-line shims so
+// commands.go remains the single place where the cobra tree is
+// described.
+func newCommunitiesCmd() *cobra.Command { return newCommunitiesCmdReal() }
 
-func newCommunityCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "community",
-		Short: "Inspect a specific community",
-	}
-	cmd.AddCommand(&cobra.Command{
-		Use:   "show <community-id>",
-		Short: "Show a community with its members and summary",
-		Args:  cobra.ExactArgs(1),
-		RunE:  notImplemented("cortex community show"),
-	})
-	return cmd
-}
+func newCommunityCmd() *cobra.Command { return newCommunityCmdReal() }
 
 // ---------------------------------------------------------------------------
 // Pin / unpin / evict / unevict
