@@ -174,41 +174,12 @@ func newCommunityCmd() *cobra.Command { return newCommunityCmdReal() }
 // Pin / unpin / evict / unevict
 // ---------------------------------------------------------------------------
 
-func newPinCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "pin <entity-id>",
-		Short: "Pin an entity so it resists activation decay",
-		Args:  cobra.ExactArgs(1),
-		RunE:  notImplemented("cortex pin"),
-	}
-}
-
-func newUnpinCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "unpin <entity-id>",
-		Short: "Remove a pin from an entity",
-		Args:  cobra.ExactArgs(1),
-		RunE:  notImplemented("cortex unpin"),
-	}
-}
-
-func newEvictCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "evict <entity-id>",
-		Short: "Force activation to zero and block reinforcement",
-		Args:  cobra.ExactArgs(1),
-		RunE:  notImplemented("cortex evict"),
-	}
-}
-
-func newUnevictCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "unevict <entity-id>",
-		Short: "Re-enable reinforcement for a previously evicted entity",
-		Args:  cobra.ExactArgs(1),
-		RunE:  notImplemented("cortex unevict"),
-	}
-}
+// newPinCmd / newUnpinCmd / newEvictCmd / newUnevictCmd delegate to
+// the real implementations in lifecycle.go.
+func newPinCmd() *cobra.Command     { return newPinCmdReal() }
+func newUnpinCmd() *cobra.Command   { return newUnpinCmdReal() }
+func newEvictCmd() *cobra.Command   { return newEvictCmdReal() }
+func newUnevictCmd() *cobra.Command { return newUnevictCmdReal() }
 
 // ---------------------------------------------------------------------------
 // Rebuild / export / merge / retract
