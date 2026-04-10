@@ -220,15 +220,8 @@ func newRebuildCmd() *cobra.Command { return newRebuildCmdReal() }
 // newExportCmd delegates to the real implementation in export.go.
 func newExportCmd() *cobra.Command { return newExportCmdReal() }
 
-func newMergeCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "merge <segment-path>...",
-		Short: "Merge external log segments into ~/.cortex/log.d",
-		Args:  cobra.MinimumNArgs(1),
-		RunE:  notImplemented("cortex merge"),
-	}
-	return cmd
-}
+// newMergeCmd delegates to the real implementation in merge.go.
+func newMergeCmd() *cobra.Command { return newMergeCmdReal() }
 
 func newRetractCmd() *cobra.Command {
 	var cascade bool
