@@ -87,7 +87,7 @@ func newObserveCmdReal() *cobra.Command {
 				Kind:    kindFlag,
 				Facets:  facets,
 				Subject: subjectFlag,
-				TrailID: trailFlag,
+				TrailID: resolveTrailID(trailFlag),
 			}
 			res, err := pipeline.Observe(cmd.Context(), req)
 			if err != nil {
@@ -413,6 +413,18 @@ func expandHome(p string) string {
 		return p
 	}
 	return filepath.Join(home, p[2:])
+}
+
+// resolveTrailID returns the explicit --trail flag value when set,
+// otherwise falls back to the CORTEX_TRAIL_ID environment variable so
+// agents that chain `cortex observe` inside a trail session do not
+// need to thread --trail through every invocation (spec integration
+// surface; grill-code round 4 follow-up cortex-0ci).
+func resolveTrailID(flag string) string {
+	if flag != "" {
+		return flag
+	}
+	return strings.TrimSpace(os.Getenv("CORTEX_TRAIL_ID"))
 }
 
 // defaultActor returns the best available identity for the Actor
