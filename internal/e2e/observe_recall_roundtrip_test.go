@@ -71,8 +71,16 @@ func TestCLI_ObserveRecallRoundtrip(t *testing.T) {
 
 	// Step 1: observe. A non-zero exit here is a hard fail; the
 	// purpose of the integration tag is that the operator has
-	// already brought the backends up.
-	obs := runCortex(t, nil, "observe", body)
+	// already brought the backends up. --kind and --facets are
+	// required by Stage 1 validation; without them the call would
+	// fail at MISSING_KIND before ever reaching recall, which is
+	// the round-4 MAJ-012 inert-test bug this fix closes.
+	obs := runCortex(t, nil,
+		"observe",
+		"--kind", "Observation",
+		"--facets", "domain:Test,project:Grill",
+		body,
+	)
 	if obs.exitCode != 0 {
 		t.Fatalf("observe exit=%d\nstdout=%q\nstderr=%q",
 			obs.exitCode, obs.stdout, obs.stderr)
