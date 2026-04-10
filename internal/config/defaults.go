@@ -25,6 +25,23 @@ type Config struct {
 	OpsLog             OpsLogConfig             `yaml:"ops_log"`
 	Disk               DiskConfig               `yaml:"disk"`
 	Docker             DockerConfig             `yaml:"docker"`
+	Ollama             OllamaConfig             `yaml:"ollama"`
+}
+
+// OllamaConfig holds adapter-level knobs for the Ollama HTTP client
+// that are not covered by Timeouts or Endpoints. See bead cortex-w5u
+// for the rationale behind exposing num_ctx: Ollama defaults to 2048
+// which silently truncates trail summaries, link-derivation prompts,
+// and any other Generate call with a non-trivial context payload.
+type OllamaConfig struct {
+	// NumCtx is the Ollama context window (options.num_ctx) passed on
+	// every /api/generate request. Zero means "inherit Ollama's own
+	// default" (2048 today); an explicit value overrides it per-call.
+	// The cortex default is 8192, which comfortably holds a 5-datom
+	// link-derivation prompt plus a multi-hundred-token observation
+	// body while keeping the KV cache bounded to ~1 GB on a 4-8B q4
+	// model.
+	NumCtx int `yaml:"num_ctx"`
 }
 
 type RetrievalConfig struct {
@@ -275,6 +292,9 @@ func Defaults() Config {
 			TrailSummarySeconds:      60,
 			ReflectionSeconds:        60,
 			IngestSummarySeconds:     120,
+		},
+		Ollama: OllamaConfig{
+			NumCtx: 8192,
 		},
 		CLI: CLIConfig{
 			ExitCode: ExitCodeConfig{

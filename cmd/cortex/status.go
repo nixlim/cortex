@@ -75,6 +75,7 @@ func runStatus(cmd *cobra.Command, _ []string, jsonOut bool) error {
 		GenerationModel:       defaultGenerationModel,
 		EmbeddingTimeout:      1 * time.Second,
 		LinkDerivationTimeout: 1 * time.Second,
+		NumCtx:                cfg.Ollama.NumCtx,
 	})
 
 	opts := infra.StatusOptions{

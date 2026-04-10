@@ -243,6 +243,7 @@ func buildIngestPipeline(cfg config.Config, segDir string) (*ingest.Pipeline, fu
 		GenerationModel:       defaultGenerationModel,
 		EmbeddingTimeout:      time.Duration(cfg.Timeouts.EmbeddingSeconds) * time.Second,
 		LinkDerivationTimeout: time.Duration(cfg.Timeouts.LinkDerivationSeconds) * time.Second,
+		NumCtx:                cfg.Ollama.NumCtx,
 	})
 
 	// The underlying write.Pipeline shares the log writer and runs one

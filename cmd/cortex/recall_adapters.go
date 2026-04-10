@@ -62,6 +62,7 @@ func newOllamaClient(cfg config.Config) *ollama.HTTPClient {
 		GenerationModel:       defaultGenerationModel,
 		EmbeddingTimeout:      time.Duration(cfg.Timeouts.EmbeddingSeconds) * time.Second,
 		LinkDerivationTimeout: time.Duration(cfg.Timeouts.LinkDerivationSeconds) * time.Second,
+		NumCtx:                cfg.Ollama.NumCtx,
 	})
 }
 

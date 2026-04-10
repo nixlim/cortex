@@ -161,6 +161,7 @@ func newTrailEndCmd() *cobra.Command {
 				GenerationModel:       defaultGenerationModel,
 				EmbeddingTimeout:      time.Duration(cfg.Timeouts.EmbeddingSeconds) * time.Second,
 				LinkDerivationTimeout: time.Duration(cfg.Timeouts.TrailSummarySeconds) * time.Second,
+				NumCtx:                cfg.Ollama.NumCtx,
 			})
 			budget := time.Duration(cfg.Timeouts.TrailSummarySeconds) * time.Second
 			if budget <= 0 {

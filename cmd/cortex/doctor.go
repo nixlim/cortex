@@ -75,6 +75,7 @@ func runDoctor(cmd *cobra.Command, _ []string, quick, full, jsonOut bool) error 
 		GenerationModel:       defaultGenerationModel,
 		EmbeddingTimeout:      1 * time.Second,
 		LinkDerivationTimeout: 1 * time.Second,
+		NumCtx:                cfg.Ollama.NumCtx,
 	})
 
 	host := sysHost{}

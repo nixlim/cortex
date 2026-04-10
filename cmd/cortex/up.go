@@ -93,6 +93,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		GenerationModel:       defaultGenerationModel,
 		EmbeddingTimeout:      time.Duration(cfg.Timeouts.EmbeddingSeconds) * time.Second,
 		LinkDerivationTimeout: time.Duration(cfg.Timeouts.LinkDerivationSeconds) * time.Second,
+		NumCtx:                cfg.Ollama.NumCtx,
 	})
 
 	composeFile := filepath.Join("docker", "docker-compose.yaml")

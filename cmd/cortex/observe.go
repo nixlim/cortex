@@ -333,6 +333,7 @@ func newOllamaEmbedder(cfg config.Config) *observeEmbedder {
 		GenerationModel:       defaultGenerationModel,
 		EmbeddingTimeout:      time.Duration(cfg.Timeouts.EmbeddingSeconds) * time.Second,
 		LinkDerivationTimeout: time.Duration(cfg.Timeouts.LinkDerivationSeconds) * time.Second,
+		NumCtx:                cfg.Ollama.NumCtx,
 	})
 	return &observeEmbedder{c: client, model: defaultEmbeddingModel}
 }
