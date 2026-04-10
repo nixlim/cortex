@@ -84,7 +84,7 @@ func newObserveCmdReal() *cobra.Command {
 				Subject: subjectFlag,
 				TrailID: trailFlag,
 			}
-			res, err := pipeline.Observe(context.Background(), req)
+			res, err := pipeline.Observe(cmd.Context(), req)
 			if err != nil {
 				// A partial success (log committed but backend apply
 				// failed) still prints the entry id so ops tooling
