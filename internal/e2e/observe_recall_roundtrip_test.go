@@ -43,9 +43,45 @@
 package e2e
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// seedRealCortexConfigInto copies the developer's real ~/.cortex/config.yaml
+// into the target temp HOME under .cortex/config.yaml, so the spawned
+// cortex subprocess resolves the same Neo4j bootstrap password and
+// endpoint configuration the running managed stack was initialized with.
+// runCortex still isolates HOME, which keeps the log segment directory
+// scoped to t.TempDir() via cortex's expandHome("~/.cortex/log.d")
+// resolution — only the config file is shared. Without this, subprocess
+// calls to cortex observe would generate a fresh random password and
+// fail Neo4j auth against the running container.
+//
+// The caller must pass the returned extraEnv slice to runCortex so
+// HOME is set consistently on both the copy step and the subprocess.
+func seedRealCortexConfigInto(t *testing.T, tempHome string) {
+	t.Helper()
+	realHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("cannot locate developer HOME to seed cortex config: %v", err)
+	}
+	srcPath := filepath.Join(realHome, ".cortex", "config.yaml")
+	data, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Skipf("no real ~/.cortex/config.yaml to seed integration test — "+
+			"run cortex up first: %v", err)
+	}
+	dstDir := filepath.Join(tempHome, ".cortex")
+	if err := os.MkdirAll(dstDir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", dstDir, err)
+	}
+	dstPath := filepath.Join(dstDir, "config.yaml")
+	if err := os.WriteFile(dstPath, data, 0o600); err != nil {
+		t.Fatalf("write %s: %v", dstPath, err)
+	}
+}
 
 // TestCLI_ObserveRecallRoundtrip is the end-to-end CRIT-008/009
 // regression guard. It writes one entry via `cortex observe` and
@@ -69,13 +105,23 @@ func TestCLI_ObserveRecallRoundtrip(t *testing.T) {
 	const body = "round-3 regression entry: " + token + " — must come back via observe→recall"
 	const query = token
 
+	// Build an isolated HOME seeded with the host's real cortex
+	// config.yaml so the subprocess inherits the Neo4j bootstrap
+	// password and managed-stack endpoints that `cortex up` wrote.
+	// The log segment directory is still scoped to this temp HOME
+	// via cortex's ~/.cortex/log.d path expansion, so segments never
+	// pollute the developer's real state.
+	tempHome := t.TempDir()
+	seedRealCortexConfigInto(t, tempHome)
+	sharedEnv := []string{"HOME=" + tempHome, "CORTEX_HOME=" + tempHome}
+
 	// Step 1: observe. A non-zero exit here is a hard fail; the
 	// purpose of the integration tag is that the operator has
 	// already brought the backends up. --kind and --facets are
 	// required by Stage 1 validation; without them the call would
 	// fail at MISSING_KIND before ever reaching recall, which is
 	// the round-4 MAJ-012 inert-test bug this fix closes.
-	obs := runCortex(t, nil,
+	obs := runCortex(t, sharedEnv,
 		"observe",
 		"--kind", "Observation",
 		"--facets", "domain:Test,project:Grill",
@@ -87,7 +133,7 @@ func TestCLI_ObserveRecallRoundtrip(t *testing.T) {
 	}
 
 	// Step 2: recall. Same hard-fail contract on exit code.
-	rec := runCortex(t, nil, "recall", query)
+	rec := runCortex(t, sharedEnv, "recall", query)
 	if rec.exitCode != 0 {
 		t.Fatalf("recall exit=%d\nstdout=%q\nstderr=%q",
 			rec.exitCode, rec.stdout, rec.stderr)

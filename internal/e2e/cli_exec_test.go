@@ -137,7 +137,22 @@ type runResult struct {
 func runCortex(t *testing.T, extraEnv []string, args ...string) runResult {
 	t.Helper()
 	bin := buildCortexOnce(t)
-	home := t.TempDir()
+
+	// If the caller pre-assigned HOME in extraEnv (integration tests
+	// that need to share state with the host cortex install — e.g.
+	// observe→recall against a live managed stack), honour it. Other-
+	// wise use an isolated t.TempDir() so hermetic tests never touch
+	// the developer's real ~/.cortex/.
+	home := ""
+	for _, kv := range extraEnv {
+		if strings.HasPrefix(kv, "HOME=") {
+			home = strings.TrimPrefix(kv, "HOME=")
+			break
+		}
+	}
+	if home == "" {
+		home = t.TempDir()
+	}
 
 	cmd := exec.Command(bin, args...)
 	cmd.Env = append(os.Environ(),
