@@ -246,29 +246,7 @@ func newReflectCmd() *cobra.Command {
 	return cmd
 }
 
-func newIngestCmd() *cobra.Command {
-	var project, strategy string
-	cmd := &cobra.Command{
-		Use:   "ingest <path>",
-		Short: "Walk a repository and ingest module summaries",
-		Args:  cobra.MinimumNArgs(1),
-		RunE:  notImplemented("cortex ingest"),
-	}
-	cmd.Flags().StringVar(&project, "project", "", "required project name for scoping")
-	cmd.Flags().StringVar(&strategy, "strategy", "", "force a built-in language strategy")
-
-	// Nested subcommands documented in the spec.
-	cmd.AddCommand(&cobra.Command{
-		Use:   "status",
-		Short: "Report last-ingested commit and counts for a project",
-		RunE:  notImplemented("cortex ingest status"),
-	})
-	cmd.AddCommand(&cobra.Command{
-		Use:   "resume",
-		Short: "Process only missing modules for a project",
-		RunE:  notImplemented("cortex ingest resume"),
-	})
-	return cmd
-}
+// newIngestCmd delegates to the real implementation in ingest.go.
+func newIngestCmd() *cobra.Command { return newIngestCmdReal() }
 
 func newAnalyzeCmd() *cobra.Command { return newAnalyzeCmdReal() }
