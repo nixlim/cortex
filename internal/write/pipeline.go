@@ -179,6 +179,16 @@ type Pipeline struct {
 	// derivation. Production callers pass 5 per the A-MEM defaults.
 	LinkTopK int
 
+	// ConceptsEnabled toggles the post-commit concept extraction pass
+	// that populates :Concept nodes and :MENTIONS edges in Neo4j so
+	// the recall pipeline's Stage 2 seed resolver has something to
+	// match against. When false, the pass is skipped — which is the
+	// right default for unit tests that don't wire a Neo4j applier.
+	// Production callers set it to true; the extractor itself is the
+	// lexical tokenizer in concepts.go, so no adapter plumbing is
+	// needed. Phase 1 architectural follow-up to cortex-jw6.
+	ConceptsEnabled bool
+
 	// Now returns the wall-clock timestamp used in every datom's Ts
 	// field. Tests pin it to make datom content deterministic.
 	// Production callers should pass func() time.Time { return time.Now().UTC() }.
@@ -385,6 +395,20 @@ func (p *Pipeline) Observe(ctx context.Context, req ObserveRequest) (*ObserveRes
 		p.deriveAndAppendLinks(ctx, entryID, req.Body, embedding, now)
 	}
 
+	// --- Stage 8b: concept extraction + mentions-edge materialization.
+	// This pass is the architectural counterpart to link derivation:
+	// it populates :Concept nodes and (:Entry)-[:MENTIONS]->(:Concept)
+	// edges in Neo4j so the recall pipeline's Stage 2 seed resolver
+	// has something to match against. Without it, recall returns
+	// zero hits because the semantic graph has no entry points. The
+	// extractor is the lexical tokenizer in concepts.go — no LLM
+	// call, no inline latency, deterministic across observe/recall.
+	// Failures are swallowed: like link derivation, concept writing
+	// is best-effort and must never roll back the source entry.
+	if p.ConceptsEnabled && p.Neo4j != nil {
+		p.deriveAndAppendConcepts(ctx, entryID, req.Body, now)
+	}
+
 	// If any backend apply hiccupped during Stage 7 we surface it
 	// here so the CLI can warn the operator (and ops.log can record
 	// the drift), but the result pointer is non-nil so the caller
@@ -453,6 +477,63 @@ func (p *Pipeline) deriveAndAppendLinks(ctx context.Context, entryID, sourceBody
 		return
 	}
 	_, _ = p.Log.Append(linkGroup)
+}
+
+// deriveAndAppendConcepts runs lexical concept extraction on the
+// observation body, builds a mentions_concept edge datom per unique
+// token, appends the new datoms to the log as a separate transaction
+// group (so the flock contract is preserved), and applies them to
+// the Neo4j backend inline. Inline application is necessary because
+// the very next command — typically `cortex recall` — needs to find
+// :Concept nodes in the graph immediately; self-heal cannot help the
+// first observe→recall round trip because self-heal runs at command
+// start, not at command end.
+//
+// All errors are swallowed. Concept extraction is a post-commit
+// augmentation and must never roll back the source entry the user
+// already saw committed.
+func (p *Pipeline) deriveAndAppendConcepts(ctx context.Context, entryID, body string, now func() time.Time) {
+	tokens := ExtractConceptTokens(body)
+	if len(tokens) == 0 {
+		return
+	}
+	conceptTx := ulid.Make().String()
+	conceptTs := now().UTC().Format(time.RFC3339Nano)
+
+	group := make([]datom.Datom, 0, len(tokens))
+	for _, tok := range tokens {
+		targetID := ConceptEntityID(tok)
+		raw, err := json.Marshal(targetID)
+		if err != nil {
+			continue
+		}
+		d := datom.Datom{
+			Tx:           conceptTx,
+			Ts:           conceptTs,
+			Actor:        p.Actor,
+			Op:           datom.OpAdd,
+			E:            entryID,
+			A:            "mentions_concept",
+			V:            raw,
+			Src:          "observe",
+			InvocationID: p.InvocationID,
+		}
+		if err := d.Seal(); err != nil {
+			continue
+		}
+		group = append(group, d)
+	}
+	if len(group) == 0 {
+		return
+	}
+	if p.Log != nil {
+		_, _ = p.Log.Append(group)
+	}
+	// Apply inline so the first observe→recall round trip works
+	// without waiting for self-heal on the next command.
+	for i := range group {
+		_ = p.Neo4j.Apply(ctx, group[i])
+	}
 }
 
 // validateFacets enforces the spec-mandated facet keys. Every observe

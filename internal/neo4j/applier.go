@@ -214,12 +214,13 @@ func (a *BackendApplier) writeEdge(ctx context.Context, srcLabel string, d datom
 // graph relationships to their Cypher relationship type. Adding a new
 // edge attribute is a one-line addition here.
 var edgeAttributes = map[string]string{
-	"trail":        "IN_TRAIL",
-	"subject":      "ABOUT",
-	"derived_from": "DERIVED_FROM",
-	"similar_to":   "SIMILAR_TO",
-	"supersedes":   "SUPERSEDES",
-	"alias_of":     "ALIAS_OF",
+	"trail":            "IN_TRAIL",
+	"subject":          "ABOUT",
+	"derived_from":     "DERIVED_FROM",
+	"similar_to":       "SIMILAR_TO",
+	"supersedes":       "SUPERSEDES",
+	"alias_of":         "ALIAS_OF",
+	"mentions_concept": "MENTIONS",
 }
 
 func isEdgeAttribute(a string) bool {
@@ -255,6 +256,8 @@ func labelForEntity(id string) string {
 		return "Community"
 	case "psi":
 		return "PSI"
+	case "concept":
+		return "Concept"
 	default:
 		return "CortexEntity"
 	}

@@ -210,7 +210,8 @@ func buildObservePipeline(segDir string, cfg config.Config) (*write.Pipeline, fu
 			ConfidenceFloor:    cfg.LinkDerivation.ConfidenceFloor,
 			SimilarCosineFloor: cfg.LinkDerivation.SimilarToCosineFloor,
 		},
-		LinkTopK: 5,
+		LinkTopK:        5,
+		ConceptsEnabled: true,
 	}
 	return p, cleanup, nil
 }

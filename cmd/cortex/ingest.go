@@ -252,12 +252,13 @@ func buildIngestPipeline(cfg config.Config, segDir string) (*ingest.Pipeline, fu
 	// on ingest entries as well.
 	embedder := &observeEmbedder{c: ollamaClient, model: defaultEmbeddingModel}
 	writePipe := &write.Pipeline{
-		Detector:     detector,
-		Registry:     psi.NewRegistry(),
-		Log:          writer,
-		Embedder:     embedder,
-		Actor:        defaultActor(),
-		InvocationID: ulid.Make().String(),
+		Detector:        detector,
+		Registry:        psi.NewRegistry(),
+		Log:             writer,
+		Embedder:        embedder,
+		Actor:           defaultActor(),
+		InvocationID:    ulid.Make().String(),
+		ConceptsEnabled: true,
 	}
 
 	entryWriter := &writePipelineEntryWriter{pipe: writePipe}
