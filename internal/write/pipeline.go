@@ -315,24 +315,31 @@ func (p *Pipeline) Observe(ctx context.Context, req ObserveRequest) (*ObserveRes
 	result := &ObserveResult{EntryID: entryID, Tx: tx}
 
 	// --- Stage 7: backend apply. Outside the log's critical section.
-	// Failures here do NOT unwind the log commit; they are surfaced
-	// as operational errors so the CLI can warn, and the next
-	// command's self-heal replay will bring the backends up to
-	// date. Neo4j and Weaviate are independent — a failure in one
-	// does not skip the other. ---
+	// Failures here do NOT unwind the log commit and they MUST NOT
+	// short-circuit the rest of the apply pass: a transient hiccup
+	// on datom 3 of 9 in the Neo4j loop must still let datoms 4..9
+	// land, must still let the Weaviate loop run, and must still let
+	// Stage 8 (link derivation) execute. The log is the source of
+	// truth, the next command's self-heal replay will bring any
+	// dropped backend writes back into line (FR-004), and rendering
+	// a hard error here for one bad datom would silently corrupt the
+	// observe outcome (log committed but partial backend state
+	// invisible to the user). Errors are collected and returned as a
+	// single best-effort report at the end of the function. Neo4j
+	// and Weaviate are independent — a failure in one does not skip
+	// the other. ---
+	var applyErrs []error
 	if p.Neo4j != nil {
 		for i := range group {
 			if err := p.Neo4j.Apply(ctx, group[i]); err != nil {
-				return result, errs.Operational("NEO4J_APPLY_FAILED",
-					"backend apply failed; log committed, self-heal will retry", err)
+				applyErrs = append(applyErrs, fmt.Errorf("neo4j apply %s: %w", group[i].A, err))
 			}
 		}
 	}
 	if p.Weaviate != nil {
 		for i := range group {
 			if err := p.Weaviate.Apply(ctx, group[i]); err != nil {
-				return result, errs.Operational("WEAVIATE_APPLY_FAILED",
-					"backend apply failed; log committed, self-heal will retry", err)
+				applyErrs = append(applyErrs, fmt.Errorf("weaviate apply %s: %w", group[i].A, err))
 			}
 		}
 	}
@@ -349,7 +356,35 @@ func (p *Pipeline) Observe(ctx context.Context, req ObserveRequest) (*ObserveRes
 		p.deriveAndAppendLinks(ctx, entryID, req.Body, embedding, now)
 	}
 
+	// If any backend apply hiccupped during Stage 7 we surface it
+	// here so the CLI can warn the operator (and ops.log can record
+	// the drift), but the result pointer is non-nil so the caller
+	// still prints the entry id — the log commit is authoritative.
+	// FR-004 self-heal will replay any dropped rows on the next
+	// command. The first error is wrapped in the envelope; remaining
+	// errors are joined into the message so a single ops.log line
+	// captures the whole batch.
+	if len(applyErrs) > 0 {
+		return result, errs.Operational("BACKEND_APPLY_PARTIAL",
+			fmt.Sprintf("backend apply reported %d failure(s); log committed, self-heal will retry: %v",
+				len(applyErrs), joinErrors(applyErrs)),
+			applyErrs[0])
+	}
+
 	return result, nil
+}
+
+// joinErrors stringifies a slice of errors into a single semicolon-
+// separated message. errors.Join would be cleaner but it stores the
+// underlying errors flat and the message format is too noisy for an
+// operator-facing CLI envelope; this helper keeps the rendered text
+// short.
+func joinErrors(errs []error) string {
+	parts := make([]string, len(errs))
+	for i, e := range errs {
+		parts[i] = e.Error()
+	}
+	return strings.Join(parts, "; ")
 }
 
 // deriveAndAppendLinks runs the post-commit A-MEM scoring pass and

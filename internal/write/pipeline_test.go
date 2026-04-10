@@ -440,8 +440,8 @@ func TestObserve_BackendFailureDoesNotRollbackLog(t *testing.T) {
 		t.Fatalf("expected error, got nil")
 	}
 	var e *errs.Error
-	if !errors.As(err, &e) || e.Code != "NEO4J_APPLY_FAILED" {
-		t.Fatalf("want NEO4J_APPLY_FAILED, got %v", err)
+	if !errors.As(err, &e) || e.Code != "BACKEND_APPLY_PARTIAL" {
+		t.Fatalf("want BACKEND_APPLY_PARTIAL, got %v", err)
 	}
 	if e.Kind != errs.KindOperational {
 		t.Fatalf("kind: got %v want Operational", e.Kind)
