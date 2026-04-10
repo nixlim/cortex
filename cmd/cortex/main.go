@@ -9,12 +9,42 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// selfHealSkip lists subcommands that must NOT trigger the startup
+// self-heal protocol. Lifecycle / diagnostic verbs run before backends
+// are guaranteed to be up (cortex up brings them up; cortex doctor is
+// allowed to report on a half-broken stack), and cortex version is
+// purely local. Every other read- or write-path verb falls through to
+// runRootSelfHeal in PersistentPreRunE.
+var selfHealSkip = map[string]bool{
+	"version": true,
+	"up":      true,
+	"down":    true,
+	"status":  true,
+	"doctor":  true,
+}
+
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "cortex",
 		Short:         "Cortex — local knowledge substrate for AI agents",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		// PersistentPreRunE wires the self-healing replay protocol
+		// (MAJ-002) onto every read- or write-path subcommand. The hook
+		// is intentionally tolerant: a missing config file, an empty
+		// log directory, an unreachable backend, or a nil applier slot
+		// all degrade silently to a no-op so a brand-new install can
+		// still run `cortex observe` before `cortex up` populates the
+		// backends. Once the neo4j / weaviate adapter packages grow
+		// concrete replay.Applier implementations, slot them into
+		// runRootSelfHeal and the hook will start performing real heals
+		// without any further wiring.
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			if selfHealSkip[cmd.Name()] {
+				return nil
+			}
+			return runRootSelfHeal(cmd)
+		},
 	}
 
 	root.AddCommand(&cobra.Command{
