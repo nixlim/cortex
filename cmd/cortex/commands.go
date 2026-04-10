@@ -125,7 +125,10 @@ func newDoctorCmd() *cobra.Command {
 			"cortex doctor --full runs adapter probes, segment scan, watermark drift, " +
 			"quarantine count, permission audit, disk space, and host prerequisites " +
 			"using doctor.parallelism workers.",
-		RunE: notImplemented("cortex doctor"),
+		// implementation in cmd/cortex/doctor.go (cortex-4kq.30)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runDoctor(cmd, args, quick, full, jsonOut)
+		},
 	}
 	cmd.Flags().BoolVar(&quick, "quick", false, "run bounded-time checks only (<5s)")
 	cmd.Flags().BoolVar(&full, "full", false, "run every check including slow probes")
