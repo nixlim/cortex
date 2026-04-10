@@ -295,17 +295,8 @@ func newMigrateCmd() *cobra.Command {
 	return cmd
 }
 
-func newBenchCmd() *cobra.Command {
-	var profile, corpus string
-	cmd := &cobra.Command{
-		Use:   "bench",
-		Short: "Run the Cortex P1 benchmark suite",
-		RunE:  notImplemented("cortex bench"),
-	}
-	cmd.Flags().StringVar(&profile, "profile", "P1-dev", "envelope profile: P1-dev or P1-ci")
-	cmd.Flags().StringVar(&corpus, "corpus", "small", "fixture corpus size: small or medium")
-	return cmd
-}
+// newBenchCmd delegates to the real implementation in bench.go.
+func newBenchCmd() *cobra.Command { return newBenchCmdReal() }
 
 // ---------------------------------------------------------------------------
 // features-dev stubs — observe / recall / reflect / ingest / analyze
