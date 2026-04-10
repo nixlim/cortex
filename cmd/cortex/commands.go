@@ -140,35 +140,11 @@ func newDoctorCmd() *cobra.Command {
 // Trail: begin / end / show / list
 // ---------------------------------------------------------------------------
 
+// newTrailCmd delegates to the real implementation in trail.go.
+// Subcommand RunEs are wired through newTrailCmdReal so begin/end/
+// show/list each speak to the internal/trail package.
 func newTrailCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "trail",
-		Short: "Manage episodic trails",
-	}
-	cmd.AddCommand(&cobra.Command{
-		Use:   "begin <name>",
-		Short: "Open a trail and print its id",
-		Args:  cobra.ExactArgs(1),
-		RunE:  notImplemented("cortex trail begin"),
-	})
-	cmd.AddCommand(&cobra.Command{
-		Use:   "end <trail-id>",
-		Short: "Close a trail and synthesize a summary",
-		Args:  cobra.ExactArgs(1),
-		RunE:  notImplemented("cortex trail end"),
-	})
-	cmd.AddCommand(&cobra.Command{
-		Use:   "show <trail-id>",
-		Short: "Show a trail with its member entries",
-		Args:  cobra.ExactArgs(1),
-		RunE:  notImplemented("cortex trail show"),
-	})
-	cmd.AddCommand(&cobra.Command{
-		Use:   "list",
-		Short: "List trails in reverse chronological order",
-		RunE:  notImplemented("cortex trail list"),
-	})
-	return cmd
+	return newTrailCmdReal()
 }
 
 // ---------------------------------------------------------------------------
