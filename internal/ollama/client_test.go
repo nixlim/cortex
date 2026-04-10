@@ -89,7 +89,7 @@ func newClientFor(f *fakeOllama) *HTTPClient {
 	return NewHTTPClient(Config{
 		Endpoint:              f.server.URL,
 		EmbeddingModel:        "nomic-embed-text",
-		GenerationModel:       "llama3.1:8b-instruct",
+		GenerationModel:       "qwen3:4b-instruct-2507",
 		EmbeddingTimeout:      2 * time.Second,
 		LinkDerivationTimeout: 2 * time.Second,
 	})

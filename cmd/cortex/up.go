@@ -32,8 +32,13 @@ import (
 // pinned model names from cortex-spec.md §"Pinned Service Versions".
 // They are used when the operator has not overridden them in config.
 const (
-	defaultEmbeddingModel  = "nomic-embed-text"
-	defaultGenerationModel = "llama3.1:8b-instruct"
+	defaultEmbeddingModel = "nomic-embed-text"
+	// Qwen3-4B-Instruct-2507 (Alibaba, Jul 2025): the non-thinking
+	// instruct sibling of qwen3:4b, 2.5 GB on disk, 256K context
+	// window. Replaces the phantom "llama3.1:8b-instruct" tag that
+	// never existed on the Ollama registry and blocked fresh-machine
+	// `cortex up` runs (bead cortex-3z1).
+	defaultGenerationModel = "qwen3:4b-instruct-2507"
 )
 
 // runUp is the RunE for `cortex up`. It is wired in commands.go

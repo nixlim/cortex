@@ -95,7 +95,7 @@ type ModelInfo struct {
 type Config struct {
 	Endpoint                    string        // e.g. "localhost:11434"
 	EmbeddingModel              string        // e.g. "nomic-embed-text"
-	GenerationModel             string        // e.g. "llama3.1:8b-instruct"
+	GenerationModel             string        // e.g. "qwen3:4b-instruct-2507"
 	EmbeddingTimeout            time.Duration // timeouts.embedding_seconds
 	LinkDerivationTimeout       time.Duration // timeouts.link_derivation_seconds
 }
