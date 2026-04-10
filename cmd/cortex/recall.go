@@ -1,32 +1,30 @@
 // cmd/cortex/recall.go wires `cortex recall` onto the recall.Pipeline.
 //
 // The command parses the query and --limit flag, constructs a
-// production pipeline, runs a default-mode retrieval, and renders the
-// surfaced results. In Phase 1 the six adapter interfaces the recall
-// pipeline needs (ConceptExtractor, SeedResolver, PPRRunner,
-// EntryLoader, QueryEmbedder, ContextFetcher) are not yet wired —
-// buildRecallPipeline returns a precise operational error naming the
-// missing adapter set so the failure mode is actionable instead of a
-// generic "not implemented".
-//
-// This file owns the full CLI surface (flags, rendering, exit codes)
-// so the only change required to light recall up end-to-end once the
-// adapters exist is a drop-in replacement for buildRecallPipeline.
+// production pipeline against live Neo4j/Ollama/Weaviate adapters
+// (see cmd/cortex/recall_adapters.go), runs a default-mode
+// retrieval, and renders the surfaced results.
 //
 // Spec references:
 //
 //	docs/spec/cortex-spec.md US-14, FR-013/014/015/016
-//	bead cortex-4kq.36
+//	bead cortex-4kq.36, code-review fix CRIT-003
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/oklog/ulid/v2"
 	"github.com/spf13/cobra"
 
+	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/errs"
+	"github.com/nixlim/cortex/internal/infra"
+	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/recall"
 )
 
@@ -72,27 +70,52 @@ func newRecallCmdReal() *cobra.Command {
 	return cmd
 }
 
-// buildRecallPipeline constructs a recall.Pipeline from live adapters.
-// Phase 1 returns an operational error with a precise code until the
-// six adapter interfaces (ConceptExtractor, SeedResolver, PPRRunner,
-// EntryLoader, QueryEmbedder, ContextFetcher) are wired — see
-// cortex-4kq.36 adapter-dev follow-ups. The pipeline itself is fully
-// exercised by internal/recall/pipeline_test.go.
+// buildRecallPipeline constructs a recall.Pipeline from live
+// adapters. The six bridge types live in recall_adapters.go; this
+// function is the single place that knows how to load config, open
+// the Neo4j / Ollama / Weaviate clients, and hand them to the
+// pipeline. The returned cleanup closes the Bolt client; the Ollama
+// and Weaviate clients are stateless stdlib http.Client wrappers and
+// do not need explicit teardown.
 func buildRecallPipeline() (*recall.Pipeline, func(), error) {
-	// TODO(adapter-dev): build the six adapters recall needs:
-	//   - ConceptExtractor  -> Ollama Generate + prompts.NameConceptExtraction
-	//   - SeedResolver      -> Neo4j concept->entry lookup
-	//   - PPRRunner         -> Neo4j GDS PersonalizedPageRank (gds.go)
-	//   - EntryLoader       -> Neo4j + Weaviate bulk fetch
-	//   - QueryEmbedder     -> Ollama /api/embeddings (reuse observeEmbedder)
-	//   - ContextFetcher    -> Neo4j trail/community lookup
-	// Mirror buildObservePipeline's pattern: load config, open log,
-	// build adapters, return pipeline + cleanup.
-	return nil, func() {}, errs.Operational("RECALL_NOT_WIRED",
-		"cortex recall requires Neo4j (ConceptExtractor, SeedResolver, "+
-			"PPRRunner, EntryLoader, ContextFetcher) and Ollama "+
-			"(QueryEmbedder) adapters that are not yet wired in the CLI; "+
-			"the pipeline is fully exercised by internal/recall unit tests", nil)
+	cfgPath := defaultConfigPath()
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return nil, func() {}, errs.Operational("CONFIG_LOAD_FAILED",
+			"could not load ~/.cortex/config.yaml", err)
+	}
+
+	password, _, _ := infra.EnsureNeo4jPassword(cfgPath)
+	bolt, err := neo4j.NewBoltClient(neo4j.Config{
+		BoltEndpoint: cfg.Endpoints.Neo4jBolt,
+		Username:     "neo4j",
+		Password:     password,
+		Timeout:      10 * time.Second,
+		MaxPoolSize:  4,
+	})
+	if err != nil {
+		return nil, func() {}, errs.Operational("NEO4J_UNAVAILABLE",
+			"could not open Neo4j Bolt client", err)
+	}
+	cleanup := func() { _ = bolt.Close(context.Background()) }
+
+	ollamaClient := newOllamaClient(cfg)
+	weaviateClient := newWeaviateClient(cfg)
+
+	pipeline := &recall.Pipeline{
+		Concepts: &ollamaConceptExtractor{client: ollamaClient},
+		Seeds:    &neo4jSeedResolver{client: bolt},
+		PPR:      &neo4jPPRRunner{client: bolt, graphName: semanticGraphName},
+		Loader: &neo4jWeaviateEntryLoader{
+			graph:    bolt,
+			weaviate: weaviateClient,
+		},
+		Embedder:     newOllamaEmbedder(cfg),
+		Context:      &neo4jContextFetcher{client: bolt},
+		Actor:        defaultActor(),
+		InvocationID: ulid.Make().String(),
+	}
+	return pipeline, cleanup, nil
 }
 
 // renderRecallResult prints the surfaced entries as either a
