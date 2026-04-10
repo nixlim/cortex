@@ -139,11 +139,14 @@ func (a *BackendApplier) Apply(ctx context.Context, d datom.Datom) error {
 		}
 	}
 
-	// Standard property write — MERGE the node by id and set the
-	// attribute. The MERGE clause uses the entity id as the merge key
-	// so two datoms touching the same entity collapse to one node.
+	// Standard property write — MERGE the node by entry_id (the
+	// property every reader filters on: see cmd/cortex/recall_adapters.go,
+	// reflect_adapters.go, analyze_adapters.go, all of which query
+	// `e.entry_id`). We also SET `n.id = $id` on the same node so any
+	// future reader that filters on `id` still resolves the entity.
+	// Round-3 grill CRIT-008.
 	cypher := fmt.Sprintf(
-		"MERGE (n:%s {id: $id}) SET n.%s = $value, n.last_tx = $tx",
+		"MERGE (n:%s {entry_id: $id}) SET n.id = $id, n.%s = $value, n.last_tx = $tx",
 		label, cypherProperty(d.A),
 	)
 	return a.g.WriteEntries(ctx, cypher, map[string]any{
@@ -157,7 +160,7 @@ func (a *BackendApplier) Apply(ctx context.Context, d datom.Datom) error {
 func (a *BackendApplier) applyRetract(ctx context.Context, label string, d datom.Datom) error {
 	if d.A == "exists" {
 		cypher := fmt.Sprintf(
-			"MERGE (n:%s {id: $id}) SET n.retracted = true, n.last_tx = $tx",
+			"MERGE (n:%s {entry_id: $id}) SET n.id = $id, n.retracted = true, n.last_tx = $tx",
 			label,
 		)
 		return a.g.WriteEntries(ctx, cypher, map[string]any{
@@ -166,7 +169,7 @@ func (a *BackendApplier) applyRetract(ctx context.Context, label string, d datom
 		})
 	}
 	cypher := fmt.Sprintf(
-		"MERGE (n:%s {id: $id}) REMOVE n.%s SET n.last_tx = $tx",
+		"MERGE (n:%s {entry_id: $id}) SET n.id = $id REMOVE n.%s SET n.last_tx = $tx",
 		label, cypherProperty(d.A),
 	)
 	return a.g.WriteEntries(ctx, cypher, map[string]any{
@@ -190,9 +193,12 @@ func (a *BackendApplier) writeEdge(ctx context.Context, srcLabel string, d datom
 	}
 	tgtLabel := labelForEntity(target)
 	rel := relationshipName(d.A)
+	// Both endpoints MERGE by entry_id (the property every reader
+	// filters on) and also receive id as a defensive secondary key.
+	// Round-3 grill CRIT-008.
 	cypher := fmt.Sprintf(
-		"MERGE (s:%s {id: $src}) "+
-			"MERGE (t:%s {id: $tgt}) "+
+		"MERGE (s:%s {entry_id: $src}) SET s.id = $src "+
+			"MERGE (t:%s {entry_id: $tgt}) SET t.id = $tgt "+
 			"MERGE (s)-[r:%s]->(t) "+
 			"SET r.last_tx = $tx",
 		srcLabel, tgtLabel, rel,

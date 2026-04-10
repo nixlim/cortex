@@ -68,10 +68,10 @@ func TestApply_EntryBodyMergesNodeWithProperty(t *testing.T) {
 		t.Fatalf("expected 1 write, got %d", len(g.calls))
 	}
 	c := g.calls[0]
-	if !strings.Contains(c.cypher, "MERGE (n:Entry {id: $id})") {
+	if !strings.Contains(c.cypher, "MERGE (n:Entry {entry_id: $id})") {
 		t.Errorf("expected Entry MERGE, got %q", c.cypher)
 	}
-	if !strings.Contains(c.cypher, "SET n.body = $value") {
+	if !strings.Contains(c.cypher, "n.body = $value") {
 		t.Errorf("expected body SET, got %q", c.cypher)
 	}
 	if c.params["id"] != "entry:01ARZ" {
@@ -110,7 +110,7 @@ func TestApply_FacetDotIsRewrittenToUnderscore(t *testing.T) {
 	if err := a.Apply(context.Background(), d); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if !strings.Contains(g.calls[0].cypher, "SET n.facet_domain = $value") {
+	if !strings.Contains(g.calls[0].cypher, "n.facet_domain = $value") {
 		t.Errorf("expected facet_domain property, got %q", g.calls[0].cypher)
 	}
 }
@@ -129,8 +129,8 @@ func TestApply_TrailEdgeMaterializesRelationship(t *testing.T) {
 		t.Fatalf("expected 2 writes (edge + property), got %d", len(g.calls))
 	}
 	edgeCypher := g.calls[0].cypher
-	if !strings.Contains(edgeCypher, "MERGE (s:Entry {id: $src})") ||
-		!strings.Contains(edgeCypher, "MERGE (t:Trail {id: $tgt})") ||
+	if !strings.Contains(edgeCypher, "MERGE (s:Entry {entry_id: $src})") ||
+		!strings.Contains(edgeCypher, "MERGE (t:Trail {entry_id: $tgt})") ||
 		!strings.Contains(edgeCypher, "[r:IN_TRAIL]") {
 		t.Errorf("expected IN_TRAIL edge, got %q", edgeCypher)
 	}
@@ -152,7 +152,7 @@ func TestApply_SubjectEdgeUsesAboutRelationship(t *testing.T) {
 	if !strings.Contains(g.calls[0].cypher, "[r:ABOUT]") {
 		t.Errorf("expected ABOUT relationship, got %q", g.calls[0].cypher)
 	}
-	if !strings.Contains(g.calls[0].cypher, "MERGE (t:Subject {id: $tgt})") {
+	if !strings.Contains(g.calls[0].cypher, "MERGE (t:Subject {entry_id: $tgt})") {
 		t.Errorf("expected Subject target, got %q", g.calls[0].cypher)
 	}
 }
@@ -167,7 +167,7 @@ func TestApply_RetractExistsSetsRetractedFlag(t *testing.T) {
 	if err := a.Apply(context.Background(), d); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if !strings.Contains(g.calls[0].cypher, "SET n.retracted = true") {
+	if !strings.Contains(g.calls[0].cypher, "n.retracted = true") {
 		t.Errorf("expected retracted flag, got %q", g.calls[0].cypher)
 	}
 }
@@ -209,6 +209,35 @@ func TestApply_NumericValuesPreserveType(t *testing.T) {
 	}
 	if v, ok := g.calls[0].params["value"].(int64); !ok || v != 7 {
 		t.Errorf("expected int64 7, got %T %v", g.calls[0].params["value"], g.calls[0].params["value"])
+	}
+}
+
+// TestApply_UsesEntryIdAsMergeKey is the round-3 CRIT-008 regression
+// guard. Every Cortex reader (recall_adapters/reflect_adapters/
+// analyze_adapters) filters on `e.entry_id`, so the writer must merge
+// on entry_id and populate it on every node it touches. This test
+// asserts both: the MERGE clause keys on entry_id, and the params
+// resolve $id to the prefixed ULID so a downstream `MATCH (e {entry_id: ...})`
+// query would find the row.
+func TestApply_UsesEntryIdAsMergeKey(t *testing.T) {
+	g := &fakeGraphWriter{}
+	a := newBackendApplierFor(g)
+	d := datom.Datom{
+		Tx: "T1", Op: datom.OpAdd,
+		E: "entry:01ARZ", A: "body", V: mustRaw(t, "hello world"),
+	}
+	if err := a.Apply(context.Background(), d); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	c := g.calls[0]
+	if !strings.Contains(c.cypher, "MERGE (n:Entry {entry_id: $id})") {
+		t.Errorf("expected entry_id merge key, got %q", c.cypher)
+	}
+	if !strings.Contains(c.cypher, "SET n.id = $id") {
+		t.Errorf("expected n.id defensive set, got %q", c.cypher)
+	}
+	if c.params["id"] != "entry:01ARZ" {
+		t.Errorf("id param = %v, want entry:01ARZ", c.params["id"])
 	}
 }
 
