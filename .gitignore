@@ -6,3 +6,8 @@
 
 # Build artifacts
 /bin/
+/cortex
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
