@@ -150,24 +150,30 @@ type sysHost struct{}
 
 // TotalRAMBytes reads the darwin sysctl value hw.memsize. Phase 1
 // targets darwin/arm64 only per the Host Prerequisites table.
+//
+// darwin's syscall.Sysctl wrapper strips trailing NUL bytes from the
+// returned buffer because many sysctl results are C strings. For a
+// uint64 value whose high byte happens to be 0x00 (any RAM size below
+// 256 GB in little-endian) the stripping produces a 7-byte buffer,
+// which the old implementation rejected as "short buffer". The fix is
+// to pad the buffer on the right to 8 bytes — the stripped bytes
+// were zeros to begin with — before decoding as a little-endian
+// uint64. This addresses the cortex-5r3 host.ram failure on darwin.
 func (sysHost) TotalRAMBytes() (uint64, error) {
-	// syscall.Sysctl returns the raw bytes; hw.memsize is a little-
-	// endian uint64 in those bytes.
-	b, err := syscall.Sysctl("hw.memsize")
+	s, err := syscall.Sysctl("hw.memsize")
 	if err != nil {
 		return 0, fmt.Errorf("sysctl hw.memsize: %w", err)
 	}
-	if len(b) < 8 {
-		// Some platforms return the value as a string — fall through
-		// to strconv as a defensive alternative path.
-		if v, perr := strconv.ParseUint(string(b), 10, 64); perr == nil {
-			return v, nil
-		}
-		return 0, fmt.Errorf("sysctl hw.memsize: short buffer (%d bytes)", len(b))
+	if len(s) == 0 {
+		return 0, fmt.Errorf("sysctl hw.memsize: empty result")
 	}
-	// Little-endian assembly. We cannot import encoding/binary purely
-	// to decode 8 bytes because the import bloat is not justified;
-	// the shift chain below is equivalent and trivially auditable.
+	// Some platforms return the value as a decimal string — honour
+	// that shape before falling through to the little-endian decoder.
+	if v, perr := strconv.ParseUint(s, 10, 64); perr == nil && v > 0 {
+		return v, nil
+	}
+	b := make([]byte, 8)
+	copy(b, s)
 	return uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 |
 		uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56, nil
 }
@@ -191,20 +197,36 @@ func (sysHost) FDLimit() (uint64, error) {
 	return uint64(r.Cur), nil
 }
 
-// PortInUse reports whether TCP port on 127.0.0.1 is already bound.
-// We probe by briefly attempting to listen on the port; if the listen
-// succeeds the port is free and we immediately close the listener. A
-// "bind: address already in use" error means the port is bound.
+// PortInUse reports whether TCP port on 127.0.0.1 is bound by a
+// listener that will NOT accept new connections. A port that is
+// either free (we successfully bind-and-close) or already serving
+// traffic (something on the other side accepts a dial) is treated
+// as "not in use" for doctor's purposes — cortex up would fail to
+// re-bind it, but that is the expected state when the stack is
+// already running, and the per-service readiness checks
+// (neo4j.ready, weaviate.ready, ollama.models) are responsible for
+// validating that the listener is actually our stack.
+//
+// This relaxation addresses cortex-5r3: the original "any bound
+// port is a conflict" semantic produced a false positive whenever
+// doctor was run against a running cortex stack.
 func (sysHost) PortInUse(port int) (bool, error) {
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		// Heuristic: treat any listen error as "port busy". This
-		// yields false positives in pathological cases (raw-socket
-		// permission failures) but never yields false negatives
-		// which is what matters for the readiness gate.
-		return true, nil
+	if err == nil {
+		_ = l.Close()
+		return false, nil
 	}
-	_ = l.Close()
-	return false, nil
+	// Bind failed. Probe with a fast dial: if something on the far
+	// side accepts the connection, there is a live listener (ours
+	// or otherwise) and the port is serving traffic — not a bind
+	// conflict doctor should flag. A dial failure here means the
+	// port is bound in a state that neither accepts connections
+	// nor frees the bind, which is the real "in use" case.
+	conn, derr := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+	if derr == nil {
+		_ = conn.Close()
+		return false, nil
+	}
+	return true, nil
 }

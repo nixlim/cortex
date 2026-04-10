@@ -78,12 +78,24 @@ func readRawConfig(path string) (map[string]any, error) {
 }
 
 // writeRawConfig marshals m as YAML and writes it to path with
-// owner-only permissions (0600). The parent directory is created with
-// 0700 if it does not exist. Writes are atomic: content is staged in a
-// sibling tempfile and renamed into place.
+// owner-only permissions (0600). The parent directory is created
+// (or, if already present, forcibly re-permissioned) with mode 0700.
+// Writes are atomic: content is staged in a sibling tempfile and
+// renamed into place.
+//
+// The explicit Chmod after MkdirAll is load-bearing for cortex-5r3:
+// MkdirAll is a no-op when the directory already exists, so a
+// ~/.cortex created by an older cortex release (or by a third-party
+// tool) at mode 0755 would survive forever and trip the doctor's
+// fs.permissions check on every run. Chmod'ing unconditionally makes
+// writeRawConfig self-healing.
 func writeRawConfig(path string, m map[string]any) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("credentials: ensure dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("credentials: chmod dir: %w", err)
 	}
 	data, err := yaml.Marshal(m)
 	if err != nil {

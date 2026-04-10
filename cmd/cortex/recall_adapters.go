@@ -249,23 +249,34 @@ RETURN n.entry_id AS id, score
 	return out, nil
 }
 
-// refreshProjection rebuilds the named GDS projection from scratch
-// before every PPR run. GDS projections are in-memory SNAPSHOTS of the
-// database taken at projection time, so any nodes or relationships
-// written after the projection was created are invisible to the
-// algorithm. A stale projection makes PPR fail with a "source node
-// not in graph" error whenever recall touches an entry that was
-// observed after the projection was first built. The cheapest correct
-// fix is to drop and re-project on every Run — for Phase 1 corpora
-// (hundreds of nodes) this is microseconds; a follow-up bead should
-// move the bootstrap to a write-path hook that only refreshes when
-// the underlying graph has actually changed.
+// refreshProjection ensures the named GDS projection is present and
+// consistent with the live graph before the PPR stage runs. The fast
+// path checks that the projection already exists and that its node +
+// relationship counts match the live graph; when they do, the
+// existing projection is reused (microseconds). When they differ, or
+// when the projection is absent, the slow path drops and re-creates
+// the projection from scratch.
+//
+// This replaces the old "drop + project on every call" strategy,
+// which was correct under single-shot recall but blew the bench
+// envelope at n=200 (cortex-3kz, p95=11s). Under steady state (bench
+// observe phase followed by recall phase, or production recall
+// between write bursts) the fast path is taken on every call after
+// the first and the projection cost disappears from the hot path.
+//
+// Any error during the fast-path checks (an unreachable GDS, a
+// missing procedure, an unexpected result shape) falls through to
+// the slow path so correctness is never compromised — the worst case
+// is the old behavior.
 //
 // gds.graph.drop is called with failIfMissing=false so the first
 // Run in a fresh database does not error. The project call uses
 // wildcards so Phase 1 doesn't have to enumerate every node label
 // and relationship type.
 func (p *neo4jPPRRunner) refreshProjection(ctx context.Context, graph string) error {
+	if p.projectionMatchesLive(ctx, graph) {
+		return nil
+	}
 	const dropQuery = `CALL gds.graph.drop($graph, false) YIELD graphName RETURN graphName`
 	if _, err := p.client.RunGDS(ctx, dropQuery, map[string]any{"graph": graph}); err != nil {
 		return fmt.Errorf("gds.graph.drop: %w", err)
@@ -282,6 +293,54 @@ func (p *neo4jPPRRunner) refreshProjection(ctx context.Context, graph string) er
 		return fmt.Errorf("gds.graph.project: %w", err)
 	}
 	return nil
+}
+
+// projectionMatchesLive returns true when the named GDS projection
+// already exists and its node + relationship counts match the live
+// graph's counts. Any error during the checks returns false so the
+// caller falls through to a full drop + reproject (correctness-first
+// behavior). The two counts are compared together because either
+// delta is sufficient to invalidate a projection: an added node that
+// no edges touch would still flip nodeCount, and an added edge would
+// flip relationshipCount.
+func (p *neo4jPPRRunner) projectionMatchesLive(ctx context.Context, graph string) bool {
+	existsRows, err := p.client.RunGDS(ctx,
+		"CALL gds.graph.exists($graph) YIELD exists RETURN exists",
+		map[string]any{"graph": graph})
+	if err != nil || len(existsRows) == 0 {
+		return false
+	}
+	exists, _ := existsRows[0]["exists"].(bool)
+	if !exists {
+		return false
+	}
+	listQuery := fmt.Sprintf(
+		"CALL gds.graph.list('%s') YIELD nodeCount, relationshipCount "+
+			"RETURN nodeCount, relationshipCount",
+		graph,
+	)
+	listRows, err := p.client.RunGDS(ctx, listQuery, nil)
+	if err != nil || len(listRows) == 0 {
+		return false
+	}
+	projNodes, okN := rowFloat64(listRows[0], "nodeCount")
+	projRels, okR := rowFloat64(listRows[0], "relationshipCount")
+	if !okN || !okR {
+		return false
+	}
+	liveRows, err := p.client.QueryGraph(ctx,
+		"MATCH (n) WITH count(n) AS nodes OPTIONAL MATCH ()-[r]->() "+
+			"RETURN nodes, count(r) AS rels",
+		nil)
+	if err != nil || len(liveRows) == 0 {
+		return false
+	}
+	liveNodes, okN := rowFloat64(liveRows[0], "nodes")
+	liveRels, okR := rowFloat64(liveRows[0], "rels")
+	if !okN || !okR {
+		return false
+	}
+	return int64(projNodes) == int64(liveNodes) && int64(projRels) == int64(liveRels)
 }
 
 // rowFloat64 handles the handful of numeric types the Neo4j driver may

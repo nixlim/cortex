@@ -216,11 +216,11 @@ func (p *Pipeline) Merge(ctx context.Context, req Request) (*Result, error) {
 	// operational one — the operator typo'd the argument.
 	canonA, err := psi.Validate(req.PsiA)
 	if err != nil {
-		return nil, fmt.Errorf("%w (psi-a): %v", ErrInvalidPSI, err)
+		return nil, fmt.Errorf("%w: first argument %q: %v", ErrInvalidPSI, req.PsiA, err)
 	}
 	canonB, err := psi.Validate(req.PsiB)
 	if err != nil {
-		return nil, fmt.Errorf("%w (psi-b): %v", ErrInvalidPSI, err)
+		return nil, fmt.Errorf("%w: second argument %q: %v", ErrInvalidPSI, req.PsiB, err)
 	}
 
 	// --- Stage 2: gather contradictions BEFORE any write. If the
