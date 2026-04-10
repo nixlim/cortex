@@ -17,7 +17,7 @@ LDFLAGS        := -s -w -buildid= -X $(VERSION_PKG).Version=$(VERSION)
 GOOS_RELEASE   ?= darwin
 GOARCH_RELEASE ?= arm64
 
-.PHONY: all build release release-verify clean test vet tidy
+.PHONY: all build release release-verify clean test test-cli vet tidy
 
 all: build
 
@@ -45,6 +45,15 @@ clean:
 ## test: Run all Go tests.
 test:
 	go test ./...
+
+## test-cli: Run the CLI-exec harness (builds the cortex binary and
+## invokes subcommands as real subprocesses). Gated behind the `cli`
+## build tag so it stays out of `make test`. Stub canary tests in this
+## suite are expected to fail until each notImplemented stub in
+## cmd/cortex/commands.go is replaced with real wiring; every red line
+## is a CLI verb that is documented but not yet honest.
+test-cli:
+	go test -tags=cli ./internal/e2e/...
 
 ## vet: Run go vet across all packages.
 vet:
