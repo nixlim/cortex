@@ -4,20 +4,21 @@
 //   - opens the segmented datom log via internal/log.NewReader
 //   - constructs an ollama-backed DigestSource so the pinned-model
 //     drift check uses the live model digest
-//   - constructs a placeholder StagingBackends (see stubStagingBackends
-//     below). The real Weaviate/Neo4j staging adapter is a follow-up
-//     bead — internal/rebuild's behavior contracts are fully covered
-//     by package tests, and this CLI shell makes the seam visible
-//     so the adapter can be plugged in without re-shaping the
-//     command surface.
+//   - constructs a real, Neo4j-backed StagingBackends (see
+//     staging_backends.go). The staging-Weaviate side and the
+//     atomic-promotion swap are explicit follow-ups; the swap path
+//     surfaces a precise STAGING_SWAP_NOT_WIRED operational error
+//     instead of pretending success.
 //   - calls rebuild.Run and renders the result
 //
-// Replaces the notImplemented stub in commands.go.
+// Replaces the notImplemented stub in commands.go and the no-op
+// stubStagingBackends from grill round 1 (CRIT-001).
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -27,7 +28,9 @@ import (
 	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/datom"
 	"github.com/nixlim/cortex/internal/errs"
+	"github.com/nixlim/cortex/internal/infra"
 	"github.com/nixlim/cortex/internal/log"
+	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/ollama"
 	"github.com/nixlim/cortex/internal/rebuild"
 )
@@ -88,20 +91,47 @@ func newRebuildCmdReal() *cobra.Command {
 				appender = w
 			}
 
+			// Open the live Neo4j graph so the staging backend can
+			// write into the :CortexStaging namespace. Failure to
+			// reach Neo4j is an operational error — rebuild cannot
+			// honestly proceed without a real backend to stage into.
+			password, _, _ := infra.EnsureNeo4jPassword(cfgPath)
+			graph, err := neo4j.NewBoltClient(neo4j.Config{
+				BoltEndpoint: cfg.Endpoints.Neo4jBolt,
+				Username:     "neo4j",
+				Password:     password,
+				Timeout:      10 * time.Second,
+				MaxPoolSize:  4,
+			})
+			if err != nil {
+				return emitAndExit(cmd, errs.Operational("NEO4J_UNAVAILABLE",
+					"could not connect to neo4j for staging namespace", err), jsonFlag)
+			}
+			defer graph.Close(context.Background())
+
+			invocationID := ulid.Make().String()
+			actor := defaultActor()
 			runCfg := rebuild.Config{
 				Source:       source,
 				Digest:       digestSrc,
-				Backends:     newStubStagingBackends(),
+				Backends:     newRealStagingBackends(graph, actor, invocationID),
 				AcceptDrift:  acceptDrift,
 				Embedder:     ollamaEmbedder{c: ollamaClient},
 				Log:          appender,
-				Actor:        defaultActor(),
-				InvocationID: ulid.Make().String(),
+				Actor:        actor,
+				InvocationID: invocationID,
 				Now:          func() time.Time { return time.Now().UTC() },
 			}
 
 			res, err := rebuild.Run(cmd.Context(), runCfg)
 			if err != nil {
+				// rebuild wraps Swap failures in STAGING_SWAP_FAILED;
+				// rewrite the staging-not-wired sentinel into a more
+				// precise envelope so the operator sees the real next
+				// step instead of the generic "swap failed" header.
+				if errors.Is(err, errStagingSwapNotWired) {
+					return emitAndExit(cmd, classifyStagingError(err), jsonFlag)
+				}
 				return emitAndExit(cmd, err, jsonFlag)
 			}
 			if jsonFlag {
@@ -160,33 +190,6 @@ type ollamaEmbedder struct {
 func (o ollamaEmbedder) Embed(ctx context.Context, body string) ([]float32, error) {
 	return o.c.Embed(ctx, body)
 }
-
-// stubStagingBackends is a placeholder StagingBackends. It records
-// the lifecycle calls so the CLI can print a meaningful summary, but
-// it does NOT yet write to live Weaviate / Neo4j staging namespaces
-// — that adapter is a follow-up bead. The package's behavior is
-// fully covered by internal/rebuild/rebuild_test.go using the same
-// shape, so the CLI surface is honest about what's wired today
-// without leaving the rebuild logic dead code.
-type stubStagingBackends struct {
-	applied int
-}
-
-func newStubStagingBackends() *stubStagingBackends { return &stubStagingBackends{} }
-
-func (s *stubStagingBackends) Create(_ context.Context) error { return nil }
-
-func (s *stubStagingBackends) ApplyDatom(_ context.Context, _ datom.Datom) error {
-	s.applied++
-	return nil
-}
-
-func (s *stubStagingBackends) ApplyEmbedding(_ context.Context, _ string, _ []float32) error {
-	return nil
-}
-
-func (s *stubStagingBackends) Swap(_ context.Context) error    { return nil }
-func (s *stubStagingBackends) Cleanup(_ context.Context) error { return nil }
 
 // renderRebuildResult prints a terse human-readable summary of one
 // rebuild run. JSON callers see the rebuild.Result struct directly.
