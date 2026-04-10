@@ -38,3 +38,29 @@ printf 'Cortex is available. %s\n' "$(printf '%s' "$status" | awk 'NR>1 {printf 
 if [[ -n "${CORTEX_TRAIL_ID:-}" ]]; then
   printf 'Active cortex trail in environment: %s — cortex observe will auto-attach to this trail until you run cortex trail end.\n' "$CORTEX_TRAIL_ID"
 fi
+
+# Ingest freshness check. Compare the last ingested commit for the
+# `cortex` project to the current git HEAD. If they differ, hint the
+# agent to re-ingest before doing architecture work so module summaries
+# reflect the current source tree.
+#
+# This is a hint, not an auto-trigger: ingest is LLM-backed and can take
+# minutes, so we never run it implicitly. The agent decides whether the
+# current task warrants the cost.
+if command -v git >/dev/null 2>&1; then
+  project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+  current_head=$(git -C "$project_dir" rev-parse --short HEAD 2>/dev/null || true)
+  if [[ -n "$current_head" ]]; then
+    ingest_status=$("$CORTEX" ingest status --project=cortex 2>/dev/null || true)
+    if [[ -n "$ingest_status" ]]; then
+      last_commit=$(printf '%s' "$ingest_status" | sed -n 's/.*last_commit=\([^ ]*\).*/\1/p')
+      if [[ -z "$last_commit" ]]; then
+        printf 'Cortex: project "cortex" has never been ingested. For architecture, refactoring, or cross-module work, run:\n  ./cortex ingest --project=cortex --commit=%s .\n' "$current_head"
+      elif [[ "$last_commit" != "$current_head"* && "$current_head" != "$last_commit"* ]]; then
+        printf 'Cortex: ingest is stale (last=%s, HEAD=%s). For architecture or refactoring work, re-ingest with:\n  ./cortex ingest --project=cortex --commit=%s .\n' "$last_commit" "$current_head" "$current_head"
+      fi
+    else
+      printf 'Cortex: project "cortex" has never been ingested. For architecture, refactoring, or cross-module work, run:\n  ./cortex ingest --project=cortex --commit=%s .\n' "$current_head"
+    fi
+  fi
+fi

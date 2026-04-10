@@ -1,178 +1,197 @@
 ---
 name: cortex-guide
-description: How to use Cortex (the local knowledge substrate this project ships) to persist and recall agent-grade knowledge across sessions. Use when the user mentions cortex, observe, recall, trails, "remember this", "what do we know about X", or is about to make a design decision worth preserving. Also consult at the start of any non-trivial task to surface prior observations.
+description: Cortex is YOUR persistent memory across sessions in this repo. Use to recall prior observations before any non-trivial task and to record decisions, root causes, and discoveries during work. MUST consult on every task that touches code, architecture, design decisions, bug investigations, performance work, or anything the user asks "how do we", "why did we", "what did we decide", "do we already". MUST write observations at every natural checkpoint (root cause found, decision made, bug fixed, benchmark run, surprising behavior discovered).
 ---
 
-# Cortex — persistent memory for this project
+# Cortex is YOUR memory
 
-Cortex is the binary this repo ships. It stores observations, decisions, and
-discoveries as an append-only datom log and exposes them through `cortex
-recall`. It is **local only** (no cloud), runs against a Docker-managed
-Weaviate + Neo4j stack, and uses a host-local Ollama for embeddings and LLM
-prompts. Every write lands in `~/.cortex/log.d/` first; the backends are
-rebuildable derived state.
+Cortex is the local knowledge substrate this repo ships. It is **not a
+user-facing tool** — it is the persistent memory you, as an agent, use to
+carry knowledge forward across sessions. Each new chat you start with the
+user has no continuity to prior chats unless you put that continuity into
+cortex. Your past self wrote observations so you could find them. Write
+observations now so your future self has them.
 
-Use cortex when the value of a piece of information outlives a single
-session: design decisions, tricky bugs, cross-project patterns, benchmarks
-results, anything a future agent (you, in a new chat) would want to find.
-
----
-
-## Golden-path commands
-
-| Command | Purpose |
-|---|---|
-| `cortex recall "<query>"` | Default-mode retrieval: concept extract → PPR over semantic graph → ACT-R rerank. This is how you ask "what do we already know about X?". |
-| `cortex observe "<body>" --kind=<kind> --facets=<k:v,...>` | Record a single episodic entry. Every successful observe prints an `entry:<ulid>`. |
-| `cortex trail begin --agent=<name> --name=<label>` | Start a work-session envelope. Prints a `trail:<ulid>`. |
-| `cortex trail end` | Close the active trail (from `CORTEX_TRAIL_ID`) and generate an LLM summary. |
-| `cortex history <id>` | Show the full retract-aware lineage of an entity. |
-| `cortex status` / `cortex doctor` | Health and readiness of the managed stack. |
-
-Run `cortex help <command>` for the full flag set. `docs/cli-reference.md`
-has an exhaustive reference.
+Everything below is a standing instruction that applies for the entire
+session, not a one-time checklist.
 
 ---
 
-## When to reach for cortex
+## The two things you MUST do
 
-### Before a non-trivial task — RECALL first
+### 1. RECALL first, every time
 
-If the user asks you to fix a bug, implement a feature, or understand an
-unfamiliar subsystem, run `cortex recall` with the most specific phrase you
-can extract from the request. A warm cortex will surface past decisions and
-observations that change your approach.
+Before you start any non-trivial work, run `cortex recall` with the most
+specific phrase you can extract from the user's request. This is
+non-optional. You do it even if you are "sure" you know the answer,
+because past-you frequently discovered non-obvious constraints that
+override your first instinct.
 
 ```bash
-cortex recall "retry strategy" --limit=5
-cortex recall "weaviate schema drift" --json    # JSON for programmatic parsing
+./cortex recall "<specific phrase from the request>" --limit=5
 ```
 
-The result carries a `WhySurfaced` field explaining the score breakdown
-(base activation, PPR, similarity, importance). Hits with a visible
-`TrailContext` or `CommunityContext` come from episodic bundles — read
-those in full; they often contain the "why" behind the "what".
+Triggers — any one of these means you MUST recall before responding:
 
-If `results=0`, that's informative too: the problem is new, and your task
-produces the first observations.
+- The user asks about a subsystem by name (`recall`, `rebuild`, `write pipeline`, …).
+- The user asks "how does X work?", "why does X do Y?", "what decides Z?".
+- The user reports a bug or an unexpected behavior.
+- You are about to edit a file you haven't seen this session.
+- The user asks about a previous session ("last time we worked on…", "the bug you fixed…").
+- You are about to propose a refactor or architectural change.
+- The user asks for performance work, benchmarks, or optimization.
 
-### During the task — OBSERVE the valuable bits
+If recall returns nothing, say so in one line and proceed. Do **not**
+silently skip the recall step — the user will see the hook-injected
+recall context anyway, and absent recall output signals a missed check.
 
-An observation is worth writing when it answers "a future me would have
-wanted to know this":
+Read the top 2-3 bodies in full. The score ranks by relevance, but the
+body carries the actual claim and the claim is what you act on.
 
-- Root causes (not symptoms) of bugs you just fixed.
-- Architectural decisions with trade-offs: "chose X over Y because Z".
-- Performance envelopes you measured.
-- Cross-cutting invariants you discovered while reading code.
-- Surprising library/tool behaviour.
+### 2. OBSERVE every valuable finding
 
-**Do not** observe:
-
-- Every file you touched (the commit log has that).
-- Step-by-step task progress (the conversation already has that).
-- Transient in-conversation state (use a plan or tasks instead).
+When work produces a fact that a future agent (you, in a new chat) would
+want to find, you write that fact to cortex. Do **not** wait for the user
+to ask. Do **not** assume the git log will preserve it — the git log
+preserves the diff, not the reasoning.
 
 ```bash
-cortex observe \
-  "Rebuild replays datoms through the live neo4j.BackendApplier; \
-   hand-rolled Cypher in staging_backends.go was the root of cortex-sv8." \
-  --kind=Observation \
-  --facets=domain:Architecture,project:cortex,subsystem:rebuild
+./cortex observe \
+  "<one-sentence claim stating the fact>" \
+  --kind=<Observation|Decision|ObservedRace|SessionReflection> \
+  --facets=domain:<X>,project:cortex,subsystem:<Y>
 ```
 
-**`--kind`** names the entry type:
-`Observation` (neutral fact), `ObservedRace` (a race or failure seen in
-the wild), `Decision`, `SessionReflection`, and a handful more in the spec.
-When in doubt, `Observation`.
+MUST-observe triggers — any one of these means you write an observation
+before moving on:
 
-**`--facets`** are `key:value` tuples. `domain:` and `project:` are the two
-the retrieval surface actually indexes for cross-project boosts; add more
-(module, subsystem, severity, …) if they'll help a future query.
+- **Root cause found.** You identified why a bug happened. Observe the
+  root cause as `--kind=Observation`, not the symptom.
+- **Decision made.** You chose approach A over approach B, with reasons.
+  Observe as `--kind=Decision` with the trade-off in the body.
+- **Bug fixed.** The fix isn't in the commit message — the bug's invariant
+  is. Observe the invariant.
+- **Benchmark run.** You measured performance (p50/p95/p99, envelope, n).
+  Observe the numbers and the conditions.
+- **Surprising behavior discovered.** A library, a tool, or the
+  operating system did something you didn't expect. Observe it.
+- **Architecture constraint learned.** You found that X can only be done
+  after Y because of Z. Observe the constraint.
+- **Failing path identified.** You reproduced a race, a deadlock, an
+  edge case. Observe it as `--kind=ObservedRace`.
 
-### After the task — REFLECT on patterns
+A good observation is one sentence that states a claim a future agent can
+act on without reading the source.
 
-If the session produced multiple related observations, `cortex reflect`
-promotes qualifying episodic clusters into semantic frames. This is cheap
-to run and keeps the knowledge graph dense. You normally do not need to
-invoke it manually — the agent convention is to run it when a trail ends
-with 3+ observations that share facets.
+**Good:**
+> `cortex rebuild replays datoms through the live neo4j.BackendApplier; a
+> parallel Cypher translator in staging_backends.go drifted from the live
+> shape and caused cortex-sv8 (Entry.id vs Entry.entry_id mismatch).`
+
+**Bad:**
+> `Fixed rebuild bug.` (no claim)
+> `I changed staging_backends.go to use BackendApplier.` (describes the
+> diff, not the invariant)
+
+Facets matter for future retrieval. Always set `project:cortex` and at
+least one `domain:<area>` facet. Add `subsystem:`, `kind:`, `severity:`,
+or custom keys whenever they'll help a query narrow in.
 
 ---
 
-## Trails — work-session envelopes
+## Trails — bundle multi-observation work
 
-A **trail** groups every observation taken during a single work session
-into a replayable bundle. At `cortex trail end` time the LLM generates a
-narrative summary so a future recall can surface the whole thread, not
-just individual datoms.
-
-### The `CORTEX_TRAIL_ID` contract
-
-- `cortex trail begin` prints a new `trail:<ulid>` to stdout **and nothing
-  else** — so you can capture it with `$(...)`.
-- Your shell exports that value as `CORTEX_TRAIL_ID`.
-- Every subsequent `cortex observe` and `cortex trail end` reads the
-  environment variable and auto-attaches. You do not pass `--trail`.
-- `cortex trail end` reads `CORTEX_TRAIL_ID`, finalizes the trail, and
-  exits `NO_ACTIVE_TRAIL` if the variable is unset.
+A **trail** groups a session's worth of observations under one
+LLM-generated summary. You open a trail at the start of any task that
+will produce more than one observation, and you close it at the end so
+the summary gets written.
 
 ```bash
-export CORTEX_TRAIL_ID=$(cortex trail begin \
+export CORTEX_TRAIL_ID=$(./cortex trail begin \
   --agent=claude-code \
-  --name="debug rebuild entry_id mismatch")
+  --name="<what you are about to do>")
 
-cortex observe "rebuild.ApplyDatom wrote id not entry_id" \
-  --kind=Observation \
-  --facets=domain:Rebuild,project:cortex
+# ... do the work, writing observations along the way.
+# Every `./cortex observe` auto-attaches to CORTEX_TRAIL_ID.
 
-cortex observe "fix: delegate to live neo4j.BackendApplier" \
-  --kind=Decision \
-  --facets=domain:Rebuild,project:cortex
-
-cortex trail end
+./cortex trail end
 unset CORTEX_TRAIL_ID
 ```
 
-### When to begin a trail — and when NOT to
+### When to begin a trail (mandatory)
 
-**Begin a trail** when:
+- Debugging a bug that takes more than ~5 minutes or produces more than
+  one observation.
+- Implementing a feature (design rationale + implementation choices
+  belong together).
+- Running a benchmark, spike, or audit.
+- Any task the user explicitly frames as a "session" or "investigation".
 
-- You are starting a debugging session that will produce multiple linked
-  observations (root cause + attempts + fix + lessons).
-- You are implementing a feature and want the design rationale + the
-  specific implementation choices bundled together for future recall.
-- You are running a one-off investigation (benchmark, spike, audit) that
-  you want future agents to find as a coherent unit.
-- The task is likely to span multiple observations over more than a few
-  minutes of work.
+### When NOT to begin a trail
 
-**Do not begin a trail** when:
+- You are writing a single standalone observation.
+- A trail is already active (`echo $CORTEX_TRAIL_ID`). Nested trails are
+  not supported.
+- You cannot guarantee you will reach the end of the task (e.g. a
+  user question that may cancel mid-work).
 
-- You are writing a single standalone observation (just `cortex observe`
-  without a trail).
-- The work is pure exploration with nothing worth persisting.
-- The task is clearly scoped to one change with no follow-up insight.
-- A trail is already active in the environment — check `echo
-  $CORTEX_TRAIL_ID` first.
+### Always end trails you open
 
-### When to end a trail
+A trail that is never ended still has its datoms, but `cortex trail end`
+is the only thing that runs the LLM summarizer. Un-ended trails don't
+surface with narrative context in future recalls. **Always** end a trail
+before claiming a task is complete, before switching to an unrelated
+task, and before the session ends.
 
-Always `cortex trail end` before:
+---
 
-- Claiming a task is complete.
-- Switching to an unrelated task.
-- The end of a working session.
+## Ingest — keep the corpus fresh
 
-Leaving a trail open is cheap (just an unset `ended_at`) but the LLM
-summary only runs at end time, so un-ended trails never appear in recall
-with their narrative context.
+`./cortex ingest --project=cortex <path>` walks the repo, summarizes
+each module with Ollama, and writes one observation per module. This is
+the bulk-capture path that lets recall surface code-level context.
+
+You do not need to run ingest on every session. The session-start hook
+checks whether the last ingest matches the current `git rev-parse HEAD`;
+if it reports staleness, either:
+
+- **Run ingest** when the user is about to do architecture work, a
+  large refactor, or anything that benefits from fresh module summaries:
+  ```bash
+  ./cortex ingest --project=cortex --commit=$(git rev-parse HEAD) .
+  ```
+- **Skip ingest** when the user is doing a small bug fix or docs change
+  — stale module summaries don't block that work.
+
+Ingest is idempotent: re-running it only re-summarizes modules whose
+files have changed. A full fresh ingest of this repo takes a few
+minutes; a re-ingest after small edits is near-instant.
+
+---
+
+## Automatic observations
+
+The repo has a post-commit hook that auto-observes every `git commit`
+you make during this session. The hook extracts the commit SHA, subject,
+and body and writes one `Decision` entry with `domain:Repo,project:cortex,
+commit:<sha>` facets. You do **not** need to observe the fact that you
+committed — the hook handles that.
+
+You **do** still need to observe:
+
+- The **root cause** of whatever the commit fixed (the commit message
+  describes the fix; the observation describes the invariant the fix
+  restores).
+- Any **decisions** you made during the work that didn't land in the
+  commit message.
+- Any **surprising behavior** you discovered while working.
+- Any **benchmark numbers** the commit produced.
+
+The post-commit hook is a floor, not a ceiling.
 
 ---
 
 ## Recall result interpretation
-
-A recall result looks like:
 
 ```
 results=4
@@ -181,68 +200,71 @@ results=4
 ```
 
 - **score** — final ACT-R activation (the sort key).
-- **base** — base-level activation (recency/retrieval count).
-- **ppr** — personalized-pagerank score from the seed walk.
+- **base** — base-level activation (recency × retrieval count).
+- **ppr** — personalized pagerank score from the seed walk.
 - **sim** — cosine similarity against the query vector.
 
-If **sim=0 for every result**, the Weaviate vectors are missing — check
-`cortex status` and consider `cortex rebuild --accept-drift` if the
-embedding model changed. If **ppr=0 for every result**, the semantic graph
-has no edges to walk; this is normal for a cold cache and the ACT-R
-rerank still surfaces relevant hits via base+sim alone.
+Signals to notice:
 
-Always read the bodies of the top 2–3 hits before using them as grounds
-for a decision — the score ranks by relevance, but the body carries the
-actual claim.
+- **sim=0 across the board** — Weaviate has no vectors. Check
+  `./cortex status`; if Weaviate is up, consider `./cortex rebuild
+  --accept-drift` (but confirm with the user first — it re-embeds
+  everything).
+- **ppr=0 across the board** — the semantic graph is cold or the
+  concept extraction missed. Results may still be useful via
+  base+similarity alone.
+- **Same 3 entries surface for every query** — their base activation is
+  dominating. They may be genuinely relevant, or the corpus is too thin.
+- **TrailContext populated** — the entry belongs to a trail. The trail
+  summary may contain the "why" behind the "what". Run
+  `./cortex trail show <trail-id>` to read the full bundle.
 
 ---
 
-## Operational footguns
+## Operational rules — never violate
 
-- **Never** pass raw user PII or secrets to `cortex observe`. The write
-  pipeline has a secret-scanner that blocks common patterns, but treat it
-  as a safety net, not a filter.
-- **Do not** delete from `~/.cortex/log.d/`. It is the source of truth;
-  backends are rebuildable, the log is not.
-- **Never** run `cortex down --purge` without confirming with the user
-  first. `--purge` drops the Weaviate + Neo4j volumes; only the datom log
-  survives, and the stack has to rebuild from scratch on the next `up`.
-- **Before editing** `cmd/cortex/rebuild.go`, `internal/rebuild/`,
-  `cmd/cortex/staging_backends.go`, or `cmd/cortex/recall_adapters.go`,
-  run the usual impact-analysis routine — those are on the hot path and
+- **Never** delete from `~/.cortex/log.d/`. The log is the source of
+  truth. Backends are rebuildable; the log is not.
+- **Never** run `./cortex down --purge` without explicit user
+  confirmation. `--purge` drops Weaviate + Neo4j volumes.
+- **Never** write PII, secrets, or credentials to `./cortex observe`.
+  The write pipeline has a secret-scanner, but treat it as a safety net.
+- **Never** observe transient task state ("I am about to edit X"). Use
+  a plan or in-conversation notes for that.
+- **Never** observe the user's prompt verbatim. Observe the *claim* you
+  derived from the work, not the request that prompted it.
+- **Before editing** `cmd/cortex/rebuild.go`, `cmd/cortex/staging_backends.go`,
+  `cmd/cortex/recall_adapters.go`, or `internal/rebuild/`: recall the
+  recent work on those files first — they are on the hot path and
   regressions there break every recall.
-- **`cortex rebuild` preserves Weaviate vectors** in non-drift mode
-  (cortex-sv8). A rebuild that flags `--accept-drift` DOES re-embed and
-  swap, which is correct but wipes anything it can't re-derive.
 
 ---
 
 ## Quick reference
 
 ```bash
-# Discover what cortex knows about a topic
-cortex recall "<topic>" --limit=5
+# MUST do at the start of any non-trivial task
+./cortex recall "<specific phrase>" --limit=5
 
-# Record a standalone observation
-cortex observe "<claim>" --kind=Observation --facets=domain:X,project:Y
+# MUST do when a fact worth persisting appears
+./cortex observe "<claim>" --kind=<kind> --facets=domain:<X>,project:cortex
 
-# Bundle a session's worth of observations
-export CORTEX_TRAIL_ID=$(cortex trail begin --agent=claude-code --name="<label>")
-# ... cortex observe ... cortex observe ...
-cortex trail end
+# Multi-observation tasks — begin and end a trail
+export CORTEX_TRAIL_ID=$(./cortex trail begin --agent=claude-code --name="<task>")
+# ... work ...
+./cortex trail end
 unset CORTEX_TRAIL_ID
 
 # Inspect
-cortex status
-cortex history entry:<ulid>
-cortex trail show trail:<ulid>
-cortex trail list
+./cortex status
+./cortex history entry:<ulid>
+./cortex trail show trail:<ulid>
+./cortex trail list
+./cortex ingest status --project=cortex
 
-# Stack ops
-cortex up        # start Weaviate + Neo4j
-cortex down      # stop containers, keep volumes
-cortex doctor    # run all readiness probes
+# Keep the corpus fresh (run when stale + architecture work pending)
+./cortex ingest --project=cortex --commit=$(git rev-parse HEAD) .
 ```
 
-For the exhaustive command set: `cortex help` or `docs/cli-reference.md`.
+For exhaustive command reference: `./cortex help` or `docs/cli-reference.md`.
 For the design doc: `docs/spec/cortex-spec.md`.
