@@ -129,7 +129,7 @@ func newBenchCmdReal() *cobra.Command {
 	cmd.Flags().BoolVar(&jsonFlag, "json", false, "emit machine-readable JSON")
 	cmd.Flags().BoolVar(&liveFlag, "live", false,
 		"route observe and recall through the live Weaviate / Neo4j / Ollama stack "+
-			"(requires `cortex up`)")
+			"(requires cortex up)")
 	return cmd
 }
 
