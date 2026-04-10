@@ -151,25 +151,12 @@ func newTrailCmd() *cobra.Command {
 // History + as-of
 // ---------------------------------------------------------------------------
 
-func newHistoryCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "history <entity-id>",
-		Short: "Show the full retract-aware history of an entity",
-		Args:  cobra.ExactArgs(1),
-		RunE:  notImplemented("cortex history"),
-	}
-	return cmd
-}
+// newHistoryCmd / newAsOfCmd delegate to the real implementations in
+// history.go. Kept as one-line shims so commands.go remains the single
+// place where the cobra tree is described.
+func newHistoryCmd() *cobra.Command { return newHistoryCmdReal() }
 
-func newAsOfCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "as-of <tx-or-timestamp>",
-		Short: "Query Cortex as it was at a given transaction or wall-clock time",
-		Args:  cobra.ExactArgs(1),
-		RunE:  notImplemented("cortex as-of"),
-	}
-	return cmd
-}
+func newAsOfCmd() *cobra.Command { return newAsOfCmdReal() }
 
 // ---------------------------------------------------------------------------
 // Communities
