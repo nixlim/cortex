@@ -214,20 +214,8 @@ func newUnevictCmd() *cobra.Command {
 // Rebuild / export / merge / retract
 // ---------------------------------------------------------------------------
 
-func newRebuildCmd() *cobra.Command {
-	var acceptDrift bool
-	cmd := &cobra.Command{
-		Use:   "rebuild",
-		Short: "Replay the log into a fresh backend state",
-		Long: "cortex rebuild replays every committed datom into a clean Weaviate and " +
-			"Neo4j using the embedding_model_digest recorded at write time. " +
-			"--accept-drift allows re-embedding under the current model and writes a " +
-			"model_rebind audit datom.",
-		RunE: notImplemented("cortex rebuild"),
-	}
-	cmd.Flags().BoolVar(&acceptDrift, "accept-drift", false, "re-embed under the current embedding model")
-	return cmd
-}
+// newRebuildCmd delegates to the real implementation in rebuild.go.
+func newRebuildCmd() *cobra.Command { return newRebuildCmdReal() }
 
 func newExportCmd() *cobra.Command {
 	var out string
