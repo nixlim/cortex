@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 	"github.com/spf13/cobra"
@@ -23,6 +24,7 @@ import (
 	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/errs"
 	"github.com/nixlim/cortex/internal/log"
+	"github.com/nixlim/cortex/internal/ollama"
 	"github.com/nixlim/cortex/internal/psi"
 	"github.com/nixlim/cortex/internal/security/secrets"
 	"github.com/nixlim/cortex/internal/write"
@@ -69,7 +71,7 @@ func newObserveCmdReal() *cobra.Command {
 			}
 			segDir := expandHome(cfg.Log.SegmentDir)
 
-			pipeline, cleanup, err := buildObservePipeline(segDir)
+			pipeline, cleanup, err := buildObservePipeline(segDir, cfg)
 			if err != nil {
 				return emitAndExit(cmd, err, jsonFlag)
 			}
@@ -136,14 +138,14 @@ func parseFacetFlag(raw []string) (map[string]string, error) {
 
 // buildObservePipeline constructs a write.Pipeline with the minimum
 // set of dependencies a one-shot observe invocation requires: a log
-// writer pointing at segDir, the built-in secret detector, and a
-// fresh per-invocation PSI registry (which the pipeline will mint
-// into on first sight of a subject). Neo4j, Weaviate, and the
-// embedder are intentionally left nil in Phase 1 while adapter
-// wiring lands in later beads; the log commit is the authoritative
-// step and self-healing replay brings the backends up to date on
-// the next command.
-func buildObservePipeline(segDir string) (*write.Pipeline, func(), error) {
+// writer pointing at segDir, the built-in secret detector, a fresh
+// per-invocation PSI registry, and an Ollama-backed Embedder so the
+// FR-051 embedding_model_name / embedding_model_digest datoms get
+// captured on every entry. Neo4j and Weaviate appliers are left nil
+// in Phase 1; the log commit is the authoritative step and the
+// startup self-heal replay brings the backends up to date on the
+// next command (FR-004).
+func buildObservePipeline(segDir string, cfg config.Config) (*write.Pipeline, func(), error) {
 	detector, err := secrets.LoadBuiltin(0)
 	if err != nil {
 		return nil, func() {}, errs.Operational("SECRETS_INIT_FAILED",
@@ -156,14 +158,66 @@ func buildObservePipeline(segDir string) (*write.Pipeline, func(), error) {
 	}
 	cleanup := func() { _ = writer.Close() }
 
+	embedder := newOllamaEmbedder(cfg)
+
 	p := &write.Pipeline{
 		Detector:     detector,
 		Registry:     psi.NewRegistry(),
 		Log:          writer,
+		Embedder:     embedder,
 		Actor:        defaultActor(),
 		InvocationID: ulid.Make().String(),
 	}
 	return p, cleanup, nil
+}
+
+// observeEmbedder adapts an *ollama.HTTPClient to the write.Embedder
+// interface. The adapter exists for two reasons:
+//
+//  1. write.Embedder requires ModelDigest(ctx) (name, digest, err) so
+//     the pipeline can emit FR-051 datoms; ollama.HTTPClient exposes
+//     this through its Show(ctx) ModelInfo accessor instead.
+//  2. The adapter pins the embedding model name from the same
+//     defaults `cortex up` uses, so the digest captured here is for
+//     the same model the readiness probe ensures is loaded.
+type observeEmbedder struct {
+	c     *ollama.HTTPClient
+	model string
+}
+
+// newOllamaEmbedder builds an Embedder around the configured Ollama
+// endpoint. The model name comes from the same Phase-1 default as
+// `cortex up` uses (defaultEmbeddingModel) so digest pinning stays
+// consistent across the readiness probe and the write path.
+func newOllamaEmbedder(cfg config.Config) *observeEmbedder {
+	client := ollama.NewHTTPClient(ollama.Config{
+		Endpoint:              cfg.Endpoints.Ollama,
+		EmbeddingModel:        defaultEmbeddingModel,
+		GenerationModel:       defaultGenerationModel,
+		EmbeddingTimeout:      time.Duration(cfg.Timeouts.EmbeddingSeconds) * time.Second,
+		LinkDerivationTimeout: time.Duration(cfg.Timeouts.LinkDerivationSeconds) * time.Second,
+	})
+	return &observeEmbedder{c: client, model: defaultEmbeddingModel}
+}
+
+func (e *observeEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	return e.c.Embed(ctx, text)
+}
+
+// ModelDigest returns the embedding model's name and content digest.
+// The first call performs a single /api/show round trip; subsequent
+// calls return the cached value (the underlying HTTPClient enforces
+// at-most-once Show semantics via sync.Once).
+func (e *observeEmbedder) ModelDigest(ctx context.Context) (string, string, error) {
+	info, err := e.c.Show(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	name := info.Name
+	if name == "" {
+		name = e.model
+	}
+	return name, info.Digest, nil
 }
 
 // emitAndExit writes err via the errs package (so the envelope shape

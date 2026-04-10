@@ -99,9 +99,10 @@ func TestObserve_HappyPathWritesSealedGroup(t *testing.T) {
 		t.Fatalf("log groups: got %d want 1", len(log.groups))
 	}
 	g := log.groups[0]
-	// body, kind, facet.artifact, facet.domain, facet.project = 5 datoms.
-	if len(g) != 5 {
-		t.Fatalf("group size: got %d want 5", len(g))
+	// body, kind, facet.artifact, facet.domain, facet.project,
+	// encoding_at, base_activation = 7 datoms (no embedder wired).
+	if len(g) != 7 {
+		t.Fatalf("group size: got %d want 7", len(g))
 	}
 	// Every datom is sealed and shares the same tx.
 	for i, d := range g {
@@ -121,12 +122,113 @@ func TestObserve_HappyPathWritesSealedGroup(t *testing.T) {
 			t.Fatalf("datom %d verify: %v", i, err)
 		}
 	}
-	// Deterministic attribute order: body, kind, facet.* (sorted).
-	wantAttrs := []string{"body", "kind", "facet.artifact", "facet.domain", "facet.project"}
+	// Deterministic attribute order: body, kind, facet.* (sorted),
+	// encoding_at, base_activation.
+	wantAttrs := []string{"body", "kind", "facet.artifact", "facet.domain", "facet.project", "encoding_at", "base_activation"}
 	for i, want := range wantAttrs {
 		if g[i].A != want {
 			t.Fatalf("attr %d: got %s want %s", i, g[i].A, want)
 		}
+	}
+	// FR-031: base_activation is seeded to 1.0 on every observe.
+	if string(g[6].V) != "1" {
+		t.Fatalf("base_activation value: got %s want 1", string(g[6].V))
+	}
+}
+
+// fakeEmbedder is a deterministic Embedder double that captures Embed
+// invocations and returns canned model metadata. It exists so the
+// FR-051 digest-capture path can be exercised without an Ollama
+// process. The recorded callCount lets tests assert Embed is called at
+// most once per observe.
+type fakeEmbedder struct {
+	vec       []float32
+	model     string
+	digest    string
+	embedErr  error
+	digestErr error
+	embeds    int
+	digests   int
+}
+
+func (f *fakeEmbedder) Embed(_ context.Context, _ string) ([]float32, error) {
+	f.embeds++
+	if f.embedErr != nil {
+		return nil, f.embedErr
+	}
+	return f.vec, nil
+}
+
+func (f *fakeEmbedder) ModelDigest(_ context.Context) (string, string, error) {
+	f.digests++
+	if f.digestErr != nil {
+		return "", "", f.digestErr
+	}
+	return f.model, f.digest, nil
+}
+
+// TestObserve_EmbedderEmitsModelNameAndDigestDatoms covers FR-051 /
+// SC-002: when an embedder is wired, every observe entry records the
+// embedding model name and digest as their own attribute datoms. The
+// rebuild pipeline relies on this to detect MODEL_DIGEST_RACE.
+func TestObserve_EmbedderEmitsModelNameAndDigestDatoms(t *testing.T) {
+	p, log := newTestPipeline(t)
+	p.Embedder = &fakeEmbedder{
+		vec:    []float32{0.1, 0.2, 0.3},
+		model:  "nomic-embed-text",
+		digest: "sha256:deadbeef",
+	}
+
+	_, err := p.Observe(context.Background(), validRequest())
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if len(log.groups) != 1 {
+		t.Fatalf("groups: %d", len(log.groups))
+	}
+	g := log.groups[0]
+	// 5 base attrs + encoding_at + base_activation + embedding_model_name + embedding_model_digest = 9.
+	if len(g) != 9 {
+		t.Fatalf("group size: got %d want 9", len(g))
+	}
+	var name, digest string
+	for _, d := range g {
+		switch d.A {
+		case "embedding_model_name":
+			name = string(d.V)
+		case "embedding_model_digest":
+			digest = string(d.V)
+		}
+	}
+	if name != `"nomic-embed-text"` {
+		t.Errorf("embedding_model_name: got %s", name)
+	}
+	if digest != `"sha256:deadbeef"` {
+		t.Errorf("embedding_model_digest: got %s", digest)
+	}
+}
+
+// TestObserve_EmbedderMissingDigestIsOperationalError ensures the
+// pipeline refuses to commit if the embedder cannot produce a digest.
+// This is the FR-051 invariant: a vector without a digest is forbidden
+// because it would silently bypass rebuild's pinned-model check.
+func TestObserve_EmbedderMissingDigestIsOperationalError(t *testing.T) {
+	p, log := newTestPipeline(t)
+	p.Embedder = &fakeEmbedder{
+		vec:    []float32{1, 2, 3},
+		model:  "nomic-embed-text",
+		digest: "", // simulates a buggy adapter
+	}
+	_, err := p.Observe(context.Background(), validRequest())
+	var e *errs.Error
+	if !errors.As(err, &e) || e.Code != "EMBEDDING_MODEL_UNAVAILABLE" {
+		t.Fatalf("want EMBEDDING_MODEL_UNAVAILABLE, got %v", err)
+	}
+	if e.Kind != errs.KindOperational {
+		t.Fatalf("kind: got %v want Operational", e.Kind)
+	}
+	if len(log.groups) != 0 {
+		t.Fatalf("log touched on missing-digest reject: %d", len(log.groups))
 	}
 }
 

@@ -26,6 +26,7 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/nixlim/cortex/internal/activation"
 	"github.com/nixlim/cortex/internal/datom"
 	"github.com/nixlim/cortex/internal/errs"
 	"github.com/nixlim/cortex/internal/psi"
@@ -73,9 +74,13 @@ type LogAppender interface {
 // Embedder is the subset of the Ollama adapter used during the write
 // path. Embed may return an error (MODEL_DIGEST_RACE, connection
 // refused); the pipeline wraps it as an operational error so the CLI
-// exits 1, not 2.
+// exits 1, not 2. ModelDigest returns the embedding model's name and
+// content digest captured at Show time, so the pipeline can emit the
+// FR-051 embedding_model_name / embedding_model_digest datoms on
+// every observed entry.
 type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float32, error)
+	ModelDigest(ctx context.Context) (name, digest string, err error)
 }
 
 // BackendApplier is the minimum contract a backend adapter must
@@ -214,9 +219,28 @@ func (p *Pipeline) Observe(ctx context.Context, req ObserveRequest) (*ObserveRes
 
 	// --- Stage 4: embedding. Optional. A failure is operational,
 	// not validation, because it indicates a runtime dependency
-	// (Ollama) is unavailable. ---
-	var embedding []float32
+	// (Ollama) is unavailable. When the embedder is wired, we also
+	// capture the embedding model's name and digest so the FR-051
+	// invariant ("every entry records the model that produced its
+	// vector") is enforced at write time. ---
+	var (
+		embedding         []float32
+		embeddingModel    string
+		embeddingDigest   string
+	)
 	if p.Embedder != nil {
+		name, digest, err := p.Embedder.ModelDigest(ctx)
+		if err != nil {
+			return nil, errs.Operational("EMBEDDING_MODEL_UNAVAILABLE",
+				"could not capture embedding model digest", err)
+		}
+		if digest == "" {
+			return nil, errs.Operational("EMBEDDING_MODEL_UNAVAILABLE",
+				"embedding model returned empty digest", nil)
+		}
+		embeddingModel = name
+		embeddingDigest = digest
+
 		vec, err := p.Embedder.Embed(ctx, req.Body)
 		if err != nil {
 			return nil, errs.Operational("EMBEDDING_FAILED",
@@ -235,8 +259,10 @@ func (p *Pipeline) Observe(ctx context.Context, req ObserveRequest) (*ObserveRes
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
 	}
-	ts := now().UTC().Format(time.RFC3339Nano)
-	group, err := buildObserveDatoms(tx, ts, p.Actor, p.InvocationID, entryID, req, subjectCanonical)
+	encodingAt := now().UTC()
+	ts := encodingAt.Format(time.RFC3339Nano)
+	group, err := buildObserveDatoms(tx, ts, p.Actor, p.InvocationID, entryID, req,
+		subjectCanonical, embeddingModel, embeddingDigest, encodingAt)
 	if err != nil {
 		return nil, errs.Operational("DATOM_BUILD_FAILED", "could not construct datom group", err)
 	}
@@ -330,9 +356,26 @@ func (p *Pipeline) resolveSubject(raw string) (string, error) {
 
 // buildObserveDatoms assembles the datom group for one observe call.
 // Ordering inside the group is deterministic (body, kind, facet.*,
-// subject, trail) so tests can assert on the slice directly.
-func buildObserveDatoms(tx, ts, actor, invocationID, entryID string, req ObserveRequest, subjectCanonical string) ([]datom.Datom, error) {
-	group := make([]datom.Datom, 0, 4+len(req.Facets))
+// subject, trail, embedding_model_name, embedding_model_digest,
+// encoding_at, base_activation) so tests can assert on the slice
+// directly.
+//
+// The trailing four attributes encode:
+//   - embedding_model_{name,digest}: FR-051 / SC-002. Emitted only when
+//     the pipeline was configured with an Embedder; rebuild's pinned-
+//     model drift check uses these to detect MODEL_DIGEST_RACE.
+//   - encoding_at: the wall-clock encoding time used as the activation
+//     decay reference point (internal/activation.State.EncodingAt).
+//   - base_activation: FR-031 seed value (1.0) so default recall sees
+//     the entry as visible immediately after observe.
+func buildObserveDatoms(
+	tx, ts, actor, invocationID, entryID string,
+	req ObserveRequest,
+	subjectCanonical string,
+	embeddingModel, embeddingDigest string,
+	encodingAt time.Time,
+) ([]datom.Datom, error) {
+	group := make([]datom.Datom, 0, 8+len(req.Facets))
 	add := func(a string, v any) error {
 		raw, err := json.Marshal(v)
 		if err != nil {
@@ -379,6 +422,26 @@ func buildObserveDatoms(tx, ts, actor, invocationID, entryID string, req Observe
 		if err := add("trail", req.TrailID); err != nil {
 			return nil, err
 		}
+	}
+	if embeddingModel != "" {
+		if err := add("embedding_model_name", embeddingModel); err != nil {
+			return nil, err
+		}
+	}
+	if embeddingDigest != "" {
+		if err := add("embedding_model_digest", embeddingDigest); err != nil {
+			return nil, err
+		}
+	}
+	// FR-031: every freshly-written entry seeds an encoding_at and a
+	// base_activation=1.0 attribute. These two datoms make a brand-new
+	// entry visible to default recall (visibility threshold 0.05) and
+	// give the activation decay math a deterministic reference point.
+	if err := add("encoding_at", encodingAt.UTC().Format(time.RFC3339Nano)); err != nil {
+		return nil, err
+	}
+	if err := add("base_activation", activation.InitialBaseActivation); err != nil {
+		return nil, err
 	}
 	return group, nil
 }
