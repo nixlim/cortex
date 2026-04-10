@@ -129,7 +129,9 @@ func readAllTxs(t *testing.T, paths []string) []string {
 //
 // Log A has tx {T1, T2, T3}. External segment B has tx {T2, T3, T4}.
 // After merge, the reader returns exactly {T1, T2, T3, T4} in
-// ascending order.
+// ascending order. Import-time dedup means only the novel tx (T4) is
+// written into logDir, so the merged loader never sees a
+// cross-segment tx collision.
 func TestMerge_DeduplicatedUnion(t *testing.T) {
 	// Use ULIDs so they sort properly.
 	t1 := ulid.Make().String()
@@ -156,11 +158,11 @@ func TestMerge_DeduplicatedUnion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Merge: %v", err)
 	}
-	if result.DatomCount != 3 {
-		t.Errorf("DatomCount = %d, want 3", result.DatomCount)
+	if result.DatomCount != 1 {
+		t.Errorf("DatomCount = %d, want 1 (only the novel tx survives dedup)", result.DatomCount)
 	}
-	if result.TxCount != 3 {
-		t.Errorf("TxCount = %d, want 3", result.TxCount)
+	if result.TxCount != 1 {
+		t.Errorf("TxCount = %d, want 1", result.TxCount)
 	}
 
 	// External file should no longer exist at the original path
@@ -297,6 +299,74 @@ func TestValidateOnly_CorruptSegment(t *testing.T) {
 	_, _, err := ValidateOnly(path)
 	if !errors.Is(err, ErrChecksumMismatch) {
 		t.Errorf("err = %v, want ErrChecksumMismatch", err)
+	}
+}
+
+// TestMerge_SelfImportDoesNotBrickLoad — cortex-rui regression.
+//
+// Re-importing the exact same content that already lives in logDir
+// must not leave logDir in a state that LOG_LOAD_FAILED rejects.
+// Before the import-time dedup fix, Merge renamed the external file
+// straight into logDir, producing cross-segment tx collisions that
+// log.Load detected and turned into LOG_LOAD_FAILED on the next
+// command. The fix is that the imported file never contains any tx
+// the live log already has.
+func TestMerge_SelfImportDoesNotBrickLoad(t *testing.T) {
+	txs := []string{
+		ulid.Make().String(),
+		ulid.Make().String(),
+		ulid.Make().String(),
+	}
+
+	logDir := t.TempDir()
+	extDir := t.TempDir()
+
+	// Populate logDir via the real writer.
+	writeSegmentViaWriter(t, logDir, txs)
+
+	// Export the existing segment as if via `cortex export`: we just
+	// copy the underlying file so the external segment's datoms are
+	// bit-identical to the ones already in logDir.
+	srcSegs := listJSONL(t, logDir)
+	if len(srcSegs) != 1 {
+		t.Fatalf("expected 1 segment in logDir, got %d", len(srcSegs))
+	}
+	extPath := filepath.Join(extDir, "reexport.jsonl")
+	data, err := os.ReadFile(srcSegs[0])
+	if err != nil {
+		t.Fatalf("read segment: %v", err)
+	}
+	if err := os.WriteFile(extPath, data, 0o600); err != nil {
+		t.Fatalf("write export: %v", err)
+	}
+
+	// Merge the self-export back into logDir. Every tx is already
+	// present, so the fix skips writing a new segment file and
+	// returns a zero-count result. Before the fix, this created a
+	// second segment tx-for-tx identical to the first and the next
+	// log.Load failed with ErrTxCollision.
+	result, err := Merge(extPath, logDir)
+	if err != nil {
+		t.Fatalf("Merge (self-reimport): %v", err)
+	}
+	if result.DatomCount != 0 {
+		t.Errorf("DatomCount = %d, want 0 (everything already present)", result.DatomCount)
+	}
+	if result.DestPath != "" {
+		t.Errorf("DestPath = %q, want empty (no file should be created)", result.DestPath)
+	}
+
+	// log.Load must succeed without ErrTxCollision — exactly the
+	// path self-heal runs on every subsequent cortex command.
+	report, err := log.Load(logDir, log.LoadOptions{})
+	if err != nil {
+		t.Fatalf("log.Load after self-reimport: %v", err)
+	}
+	if len(report.Collisions) != 0 {
+		t.Errorf("unexpected collisions after dedup merge: %+v", report.Collisions)
+	}
+	if len(report.Healthy) != 1 {
+		t.Errorf("Healthy segments = %d, want 1 (original kept, reimport skipped)", len(report.Healthy))
 	}
 }
 

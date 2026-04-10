@@ -200,13 +200,13 @@ type neo4jPPRRunner struct {
 // returns an empty map without hitting the database — PPR from no
 // seeds is a no-op by construction.
 //
-// The GDS named projection is created lazily on first Run in the
-// process via ensureProjection. Phase 1 does not own a centralized
-// projection-bootstrap step (cortex up doesn't touch GDS), so making
-// each recall self-bootstrap is the narrowest correct fix. The
-// projection persists in Neo4j's in-memory graph store until the
-// database restarts, so the first recall pays the cost and every
-// subsequent recall in the same Neo4j session reuses it.
+// The GDS named projection is rebuilt from scratch on every Run via
+// refreshProjection. GDS projections are in-memory snapshots, so any
+// entries observed after the projection was first created would
+// otherwise be invisible to PageRank and trigger a "source node not
+// in graph" failure. Phase 1 does not own a centralized projection
+// bootstrap step; a follow-up bead should move the refresh to a
+// write-path hook so recall doesn't pay the cost on every call.
 func (p *neo4jPPRRunner) Run(ctx context.Context, seeds []string, damping float64, maxIter int) (map[string]float64, error) {
 	if len(seeds) == 0 {
 		return map[string]float64{}, nil
@@ -215,7 +215,7 @@ func (p *neo4jPPRRunner) Run(ctx context.Context, seeds []string, damping float6
 	if graph == "" {
 		graph = semanticGraphName
 	}
-	if err := p.ensureProjection(ctx, graph); err != nil {
+	if err := p.refreshProjection(ctx, graph); err != nil {
 		return nil, err
 	}
 	cypher := fmt.Sprintf(`
@@ -249,35 +249,31 @@ RETURN n.entry_id AS id, score
 	return out, nil
 }
 
-// ensureProjection guarantees the named GDS projection exists before
-// PPR is invoked. The guard uses gds.graph.exists so a re-run in the
-// same Neo4j session is a cheap no-op — GDS projections live in the
-// in-memory graph store until the database restarts. On a fresh
-// database the helper projects all node labels and all relationships
-// with a wildcard pattern, which is the broadest reasonable default
-// for Phase 1 (Entry + Concept + MENTIONS edges). A follow-up bead
-// should move the bootstrap to `cortex up` so recall never pays the
-// projection cost.
-func (p *neo4jPPRRunner) ensureProjection(ctx context.Context, graph string) error {
-	const existsQuery = `
-CALL gds.graph.exists($graph) YIELD exists
-RETURN exists AS present
-`
-	rows, err := p.client.RunGDS(ctx, existsQuery, map[string]any{"graph": graph})
-	if err != nil {
-		return fmt.Errorf("gds.graph.exists: %w", err)
+// refreshProjection rebuilds the named GDS projection from scratch
+// before every PPR run. GDS projections are in-memory SNAPSHOTS of the
+// database taken at projection time, so any nodes or relationships
+// written after the projection was created are invisible to the
+// algorithm. A stale projection makes PPR fail with a "source node
+// not in graph" error whenever recall touches an entry that was
+// observed after the projection was first built. The cheapest correct
+// fix is to drop and re-project on every Run — for Phase 1 corpora
+// (hundreds of nodes) this is microseconds; a follow-up bead should
+// move the bootstrap to a write-path hook that only refreshes when
+// the underlying graph has actually changed.
+//
+// gds.graph.drop is called with failIfMissing=false so the first
+// Run in a fresh database does not error. The project call uses
+// wildcards so Phase 1 doesn't have to enumerate every node label
+// and relationship type.
+func (p *neo4jPPRRunner) refreshProjection(ctx context.Context, graph string) error {
+	const dropQuery = `CALL gds.graph.drop($graph, false) YIELD graphName RETURN graphName`
+	if _, err := p.client.RunGDS(ctx, dropQuery, map[string]any{"graph": graph}); err != nil {
+		return fmt.Errorf("gds.graph.drop: %w", err)
 	}
-	if len(rows) > 0 {
-		if present, ok := rows[0]["present"].(bool); ok && present {
-			return nil
-		}
-	}
-	// The projection uses wildcards so Phase 1 doesn't have to
-	// enumerate every node label and relationship type. gds.graph.project
-	// must be invoked with a fmt.Sprintf'd graph name because the
-	// first argument cannot be parameterised (it's a name literal,
-	// not a value). escapeGraphName in internal/neo4j sanitises the
-	// graph name so this is safe.
+	// gds.graph.project must be invoked with a fmt.Sprintf'd graph
+	// name because the first argument cannot be parameterised (it's
+	// a name literal, not a value). escapeGraphName in internal/neo4j
+	// sanitises the graph name so this is safe.
 	projectQuery := fmt.Sprintf(
 		"CALL gds.graph.project('%s', '*', '*') YIELD graphName RETURN graphName",
 		graph,

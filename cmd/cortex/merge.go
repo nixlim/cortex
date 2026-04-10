@@ -49,9 +49,15 @@ func newMergeCmdReal() *cobra.Command {
 					return emitAndExit(cmd, errs.Operational("MERGE_FAILED",
 						fmt.Sprintf("could not merge %s into log dir", srcPath), err), false)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(),
-					"cortex merge: imported %s -> %s (%d datoms, %d tx)\n",
-					res.SourcePath, res.DestPath, res.DatomCount, res.TxCount)
+				if res.DatomCount == 0 {
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"cortex merge: %s already present; no new datoms imported\n",
+						res.SourcePath)
+				} else {
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"cortex merge: imported %s -> %s (%d datoms, %d tx)\n",
+						res.SourcePath, res.DestPath, res.DatomCount, res.TxCount)
+				}
 			}
 			return nil
 		},
