@@ -237,16 +237,17 @@ type neo4jWeaviateEntryLoader struct {
 // query collects body, trail id, community id, cross-project flag,
 // and the activation snapshot the write path mirrored onto each
 // entry node (base_activation, encoding_at, last_retrieved_at,
-// retrieval_count, evicted, pinned, pin_activation). Candidate
-// entries missing from Neo4j are simply absent from the output map,
-// matching the contract in internal/recall/pipeline.go.
+// retrieval_count, evicted, pinned, pin_activation). One GraphQL
+// round-trip against Weaviate then pulls the embedding vectors keyed
+// by cortex_id. Candidate entries missing from Neo4j are simply
+// absent from the output map, matching the contract in
+// internal/recall/pipeline.go.
 //
-// The embedding vector is not stored in Neo4j; it lives in Weaviate.
-// Phase 1 leaves the vector nil here (cosine() in the recall pipeline
-// returns 0 for nil vectors) so a missing Weaviate object does not
-// abort the whole recall. When the write-side backend applier lands
-// and starts writing real Entry objects to Weaviate, this method can
-// be extended to issue a GetObject per id.
+// A Weaviate fetch failure is non-fatal: the loader still returns
+// the Neo4j-resolved metadata with Embedding=nil, so cosine rerank
+// silently degrades to a 0 contribution rather than failing the
+// whole recall. Cosine is one of four ACT-R weights and the spec
+// permits the lexical fallback for cold caches (FR-014).
 func (l *neo4jWeaviateEntryLoader) Load(ctx context.Context, entryIDs []string) (map[string]recall.EntryState, error) {
 	if len(entryIDs) == 0 {
 		return map[string]recall.EntryState{}, nil
@@ -273,6 +274,19 @@ RETURN
 	if err != nil {
 		return nil, err
 	}
+
+	// Pull embeddings in a single GraphQL round-trip. A Weaviate
+	// failure here is intentionally swallowed: cosine rerank degrades
+	// to a 0 contribution but the rest of the ACT-R formula (base /
+	// PPR / importance) is unaffected, and a cold Weaviate must not
+	// kill recall on its hot path.
+	vectors := map[string][]float32{}
+	if l.weaviate != nil {
+		if vs, verr := l.weaviate.FetchVectorsByCortexIDs(ctx, weaviate.ClassEntry, entryIDs); verr == nil {
+			vectors = vs
+		}
+	}
+
 	out := make(map[string]recall.EntryState, len(rows))
 	for _, row := range rows {
 		id, _ := row["id"].(string)
@@ -308,7 +322,7 @@ RETURN
 		out[id] = recall.EntryState{
 			EntryID:      id,
 			Body:         body,
-			Embedding:    nil, // Phase 1: vector lookup deferred to Weaviate applier bead
+			Embedding:    vectors[id],
 			Activation:   state,
 			TrailID:      trailID,
 			CommunityID:  communityID,

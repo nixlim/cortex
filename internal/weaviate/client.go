@@ -77,6 +77,14 @@ type Client interface {
 	// cosineFloor of 0 disables the floor. Results are ordered by
 	// descending similarity (i.e., ascending Weaviate distance).
 	NearestNeighbors(ctx context.Context, class string, vector []float32, k int, cosineFloor float64) ([]SearchResult, error)
+
+	// FetchVectorsByCortexIDs returns the stored embedding vector for
+	// every object in the class whose cortex_id property is in the
+	// supplied set. Missing ids are absent from the returned map (no
+	// error). The recall pipeline uses this to populate
+	// EntryState.Embedding so the cosine rerank scores against real
+	// vectors instead of the all-zero fallback.
+	FetchVectorsByCortexIDs(ctx context.Context, class string, cortexIDs []string) (map[string][]float32, error)
 }
 
 // SearchResult is a single hit returned by NearestNeighbors.
@@ -394,6 +402,114 @@ func (c *HTTPClient) NearestNeighbors(ctx context.Context, class string, vector 
 		})
 		if len(out) >= k {
 			break
+		}
+	}
+	return out, nil
+}
+
+// FetchVectorsByCortexIDs runs a single GraphQL Get query that pulls
+// the cortex_id property and the _additional.vector for every object
+// in `class` whose cortex_id is in the supplied set. The result is a
+// map from cortex_id to the dense embedding vector. cortex_ids absent
+// from Weaviate (cold cache, never written, evicted) are absent from
+// the returned map; the caller treats absence as "no vector"
+// rather than as an error.
+//
+// Implementation note: Weaviate's GraphQL `where` filter on a text
+// property uses ContainsAny / Equal operators. We build an Or chain of
+// Equal terms — small id sets (typically the recall candidate window)
+// keep this query well under the GraphQL parser limits.
+func (c *HTTPClient) FetchVectorsByCortexIDs(ctx context.Context, class string, cortexIDs []string) (map[string][]float32, error) {
+	if len(cortexIDs) == 0 {
+		return map[string][]float32{}, nil
+	}
+	if !isSafeClassName(class) {
+		return nil, fmt.Errorf("weaviate: unsafe class name %q", class)
+	}
+	ctx, cancel := c.ctxWithDefault(ctx)
+	defer cancel()
+
+	// Build the filter: { operator: Or, operands: [ {Equal cortex_id=<id>} ... ] }.
+	// Each Equal term carries a JSON-encoded valueText so a cortex_id
+	// containing a quote (it should not, but defense-in-depth) cannot
+	// break out of the query string.
+	var ops []string
+	for _, id := range cortexIDs {
+		quoted, err := json.Marshal(id)
+		if err != nil {
+			return nil, fmt.Errorf("weaviate: marshal cortex_id: %w", err)
+		}
+		ops = append(ops,
+			fmt.Sprintf(`{path:["cortex_id"], operator:Equal, valueText:%s}`, string(quoted)))
+	}
+	where := fmt.Sprintf(`{operator:Or, operands:[%s]}`, strings.Join(ops, ","))
+
+	// limit must accommodate the full id set; oversize is harmless.
+	query := fmt.Sprintf(
+		`{ Get { %s(where: %s, limit: %d) { cortex_id _additional { vector } } } }`,
+		class, where, len(cortexIDs),
+	)
+
+	buf, err := json.Marshal(graphqlRequest{Query: query})
+	if err != nil {
+		return nil, fmt.Errorf("weaviate: marshal graphql: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/graphql", bytes.NewReader(buf))
+	if err != nil {
+		return nil, fmt.Errorf("weaviate: build graphql request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("weaviate: graphql: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("weaviate: read graphql response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("weaviate: graphql returned HTTP %d: %s",
+			resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var env graphqlResponse
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("weaviate: decode graphql envelope: %w", err)
+	}
+	if len(env.Errors) > 0 {
+		return nil, fmt.Errorf("weaviate: graphql error: %s", env.Errors[0].Message)
+	}
+
+	var outer struct {
+		Get map[string][]map[string]any `json:"Get"`
+	}
+	if err := json.Unmarshal(env.Data, &outer); err != nil {
+		return nil, fmt.Errorf("weaviate: decode graphql data: %w", err)
+	}
+
+	out := make(map[string][]float32, len(cortexIDs))
+	for _, row := range outer.Get[class] {
+		cortexID, _ := row["cortex_id"].(string)
+		if cortexID == "" {
+			continue
+		}
+		add, _ := row["_additional"].(map[string]any)
+		rawVec, _ := add["vector"].([]any)
+		if len(rawVec) == 0 {
+			continue
+		}
+		vec := make([]float32, 0, len(rawVec))
+		for _, x := range rawVec {
+			f, ok := toFloat64(x)
+			if !ok {
+				continue
+			}
+			vec = append(vec, float32(f))
+		}
+		if len(vec) > 0 {
+			out[cortexID] = vec
 		}
 	}
 	return out, nil
