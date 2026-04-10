@@ -355,15 +355,4 @@ func newIngestCmd() *cobra.Command {
 	return cmd
 }
 
-func newAnalyzeCmd() *cobra.Command {
-	var findPatterns, includeMigrated, dryRun bool
-	cmd := &cobra.Command{
-		Use:   "analyze",
-		Short: "Run cross-project pattern analysis",
-		RunE:  notImplemented("cortex analyze"),
-	}
-	cmd.Flags().BoolVar(&findPatterns, "find-patterns", false, "enable cross-project pattern finding")
-	cmd.Flags().BoolVar(&includeMigrated, "include-migrated", false, "include migrated entries in cluster selection")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "do not write any frames")
-	return cmd
-}
+func newAnalyzeCmd() *cobra.Command { return newAnalyzeCmdReal() }
