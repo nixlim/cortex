@@ -33,12 +33,16 @@ import (
 // They are used when the operator has not overridden them in config.
 const (
 	defaultEmbeddingModel = "nomic-embed-text"
-	// Qwen3-4B-Instruct-2507 (Alibaba, Jul 2025): the non-thinking
-	// instruct sibling of qwen3:4b, 2.5 GB on disk, 256K context
-	// window. Replaces the phantom "llama3.1:8b-instruct" tag that
-	// never existed on the Ollama registry and blocked fresh-machine
-	// `cortex up` runs (bead cortex-3z1).
-	defaultGenerationModel = "qwen3:4b-instruct-2507"
+	// qwen3:4b-instruct is Alibaba's Qwen3 4B pure-instruct variant,
+	// distinct from the default `qwen3:4b` tag which is the hybrid
+	// thinking model (the two have different digests on the Ollama
+	// registry; verified via direct manifest probe). The pure-instruct
+	// variant avoids <think> tags in responses, keeping the JSON
+	// parser in ollamaLinkProposer stable. Replaces the phantom
+	// "llama3.1:8b-instruct" tag that never existed on the Ollama
+	// registry and blocked fresh-machine `cortex up` runs (bead
+	// cortex-3z1).
+	defaultGenerationModel = "qwen3:4b-instruct"
 )
 
 // runUp is the RunE for `cortex up`. It is wired in commands.go

@@ -108,7 +108,7 @@ func newOpts(t *testing.T) UpOptions {
 		StartupBudget:   2 * time.Second,
 		ProbeInterval:   5 * time.Millisecond,
 		EmbeddingModel:  "nomic-embed-text",
-		GenerationModel: "qwen3:4b-instruct-2507",
+		GenerationModel: "qwen3:4b-instruct",
 	}
 }
 
@@ -138,7 +138,7 @@ func TestRunHappyPath(t *testing.T) {
 	opts.Neo4j = &fakeNeo4j{readyAfter: 2, gdsAvail: true}
 	opts.Ollama = &fakeOllama{
 		pingAfter: 1,
-		models:    []string{"nomic-embed-text:latest", "qwen3:4b-instruct-2507"},
+		models:    []string{"nomic-embed-text:latest", "qwen3:4b-instruct"},
 	}
 
 	if err := Run(context.Background(), opts); err != nil {
@@ -167,7 +167,7 @@ func TestRunBudgetExceededOnNeo4j(t *testing.T) {
 	opts.Docker = &fakeDocker{}
 	opts.Weaviate = &fakeWeaviate{readyAfter: 1}
 	opts.Neo4j = &fakeNeo4j{readyAfter: 1_000_000, gdsAvail: true} // never ready
-	opts.Ollama = &fakeOllama{pingAfter: 1, models: []string{"nomic-embed-text", "qwen3:4b-instruct-2507"}}
+	opts.Ollama = &fakeOllama{pingAfter: 1, models: []string{"nomic-embed-text", "qwen3:4b-instruct"}}
 
 	err := Run(context.Background(), opts)
 	e := requireErrorCode(t, err, CodeStartupBudgetExceeded)
@@ -275,7 +275,7 @@ func TestRunDockerUnreachable(t *testing.T) {
 	opts.Docker = &fakeDocker{pingErr: errors.New("cannot connect to daemon")}
 	opts.Weaviate = &fakeWeaviate{readyAfter: 1}
 	opts.Neo4j = &fakeNeo4j{readyAfter: 1, gdsAvail: true}
-	opts.Ollama = &fakeOllama{pingAfter: 1, models: []string{"nomic-embed-text", "qwen3:4b-instruct-2507"}}
+	opts.Ollama = &fakeOllama{pingAfter: 1, models: []string{"nomic-embed-text", "qwen3:4b-instruct"}}
 
 	err := Run(context.Background(), opts)
 	requireErrorCode(t, err, CodeDockerUnreachable)
@@ -286,7 +286,7 @@ func TestRunComposeFailedShortCircuits(t *testing.T) {
 	opts.Docker = &fakeDocker{composeErr: errors.New("compose: port in use")}
 	opts.Weaviate = &fakeWeaviate{readyAfter: 1}
 	opts.Neo4j = &fakeNeo4j{readyAfter: 1, gdsAvail: true}
-	opts.Ollama = &fakeOllama{pingAfter: 1, models: []string{"nomic-embed-text", "qwen3:4b-instruct-2507"}}
+	opts.Ollama = &fakeOllama{pingAfter: 1, models: []string{"nomic-embed-text", "qwen3:4b-instruct"}}
 
 	err := Run(context.Background(), opts)
 	requireErrorCode(t, err, CodeComposeFailed)
@@ -297,7 +297,7 @@ func TestRunGDSUnavailable(t *testing.T) {
 	opts.Docker = &fakeDocker{}
 	opts.Weaviate = &fakeWeaviate{readyAfter: 1}
 	opts.Neo4j = &fakeNeo4j{readyAfter: 1, gdsAvail: false}
-	opts.Ollama = &fakeOllama{pingAfter: 1, models: []string{"nomic-embed-text", "qwen3:4b-instruct-2507"}}
+	opts.Ollama = &fakeOllama{pingAfter: 1, models: []string{"nomic-embed-text", "qwen3:4b-instruct"}}
 
 	err := Run(context.Background(), opts)
 	requireErrorCode(t, err, CodeGDSNotAvailable)
@@ -345,8 +345,8 @@ func TestContainsModelAcceptsTagVariants(t *testing.T) {
 	}{
 		{[]string{"nomic-embed-text:latest"}, "nomic-embed-text", true},
 		{[]string{"nomic-embed-text"}, "nomic-embed-text", true},
-		{[]string{"qwen3:4b-instruct-2507"}, "qwen3:4b-instruct-2507", true},
-		{[]string{"llama3.1:8b"}, "qwen3:4b-instruct-2507", false},
+		{[]string{"qwen3:4b-instruct"}, "qwen3:4b-instruct", true},
+		{[]string{"llama3.1:8b"}, "qwen3:4b-instruct", false},
 		{[]string{}, "nomic-embed-text", false},
 	}
 	for _, tc := range cases {

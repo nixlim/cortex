@@ -259,9 +259,9 @@ func (f *fakeOllamaReady) ListModels(context.Context) ([]string, error) {
 }
 
 func TestOllamaModelCheckMissing(t *testing.T) {
-	ollama := &fakeOllamaReady{models: []string{"qwen3:4b-instruct-2507"}}
+	ollama := &fakeOllamaReady{models: []string{"qwen3:4b-instruct"}}
 
-	r := OllamaModelCheck(ollama, "nomic-embed-text", "qwen3:4b-instruct-2507").Run(context.Background())
+	r := OllamaModelCheck(ollama, "nomic-embed-text", "qwen3:4b-instruct").Run(context.Background())
 	if r.Status != CheckFail {
 		t.Errorf("status = %q, want fail", r.Status)
 	}
@@ -274,9 +274,9 @@ func TestOllamaModelCheckMissing(t *testing.T) {
 }
 
 func TestOllamaModelCheckAllPresent(t *testing.T) {
-	ollama := &fakeOllamaReady{models: []string{"nomic-embed-text:latest", "qwen3:4b-instruct-2507"}}
+	ollama := &fakeOllamaReady{models: []string{"nomic-embed-text:latest", "qwen3:4b-instruct"}}
 
-	r := OllamaModelCheck(ollama, "nomic-embed-text", "qwen3:4b-instruct-2507").Run(context.Background())
+	r := OllamaModelCheck(ollama, "nomic-embed-text", "qwen3:4b-instruct").Run(context.Background())
 	if r.Status != CheckPass {
 		t.Errorf("status = %q, want pass", r.Status)
 	}
