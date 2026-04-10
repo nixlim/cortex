@@ -10,8 +10,15 @@
 # Silent no-op on any failure path (cortex down, commit failed, jq
 # missing, parse error) — this hook must never break a commit.
 #
+# Frame kind: Observation (the only agent-writable kind appropriate for
+# a commit — Decision is a reflection-only semantic frame per the Phase 1
+# Frame Type Registry, populated by `cortex reflect`, never by direct
+# observe writes; attempting --kind=Decision fails with UNKNOWN_KIND).
+# The "decision-ness" of a commit is encoded in facets instead.
+#
 # Facet convention:
-#   kind          = Decision
+#   kind          = Observation
+#   kind-of-record = commit
 #   domain        = Repo
 #   project       = cortex
 #   commit        = <sha>
@@ -98,8 +105,8 @@ if (( ${#observation} > max )); then
   observation="${observation:0:$max}…"
 fi
 
-facets="domain:Repo,project:cortex,commit:${sha}"
+facets="domain:Repo,project:cortex,kind-of-record:commit,commit:${sha}"
 [[ -n "$branch" ]] && facets+=",branch:${branch}"
 
-"$CORTEX" observe "$observation" --kind=Decision --facets="$facets" >/dev/null 2>&1 || true
+"$CORTEX" observe "$observation" --kind=Observation --facets="$facets" >/dev/null 2>&1 || true
 exit 0

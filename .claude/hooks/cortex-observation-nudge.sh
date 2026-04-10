@@ -46,7 +46,7 @@ count=$(cat "$edit_counter" 2>/dev/null || echo 0)
 # after Claude observes isn't blocked a second time.
 rm -f "$pending" "$edit_counter"
 
-reason="You made ${count} code edit(s) this turn but wrote no cortex observation. Per .claude/skills/cortex/cortex-guide, you MUST record root causes, decisions, surprising behaviour, and benchmark results to cortex before stopping so future sessions can retrieve them. Write one or more observations now with: ./cortex observe \"<one-sentence claim>\" --kind=<Observation|Decision|ObservedRace> --facets=domain:<area>,project:cortex,subsystem:<name>. If the edits were pure busywork (renames, formatting, dependency bumps) with no persistent fact worth recording, say so in one line and stop."
+reason="You made ${count} code or docs edit(s) this turn but wrote no cortex observation. Per .claude/skills/cortex/cortex-guide, you MUST record root causes, decisions, surprising behaviour, benchmark results, docs intent, and config invariants to cortex before stopping so future sessions can retrieve them. Write one or more observations now with: ./cortex observe \"<one-sentence claim>\" --kind=<Observation|SessionReflection|ObservedRace> --facets=domain:<area>,project:cortex,subsystem:<name>. Only those three kinds are valid for direct writes — the semantic frames (design_decision, architecture_note, bug_pattern, etc.) are populated by cortex reflect, not by observe. To tag a record as a decision use --kind=Observation with facet kind-of-record:decision. If the edits were pure busywork (renames, formatting, dependency bumps, typo fixes) with no persistent fact worth recording, say so in one line and stop."
 
 jq -n --arg reason "$reason" '{
   decision: "block",

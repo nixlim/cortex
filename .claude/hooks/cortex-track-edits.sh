@@ -31,19 +31,54 @@ tool=$(printf '%s' "$payload" | jq -r '.tool_name // empty')
 
 case "$tool" in
   Write|Edit|MultiEdit|NotebookEdit)
-    # Skip edits to paths that are trivially not code. Docs updates,
-    # CLAUDE.md churn, and log/cache writes don't need an observation
-    # nudge. The check is heuristic — anything under cmd/, internal/,
-    # pkg/, .claude/hooks/ counts as code; everything else is ignored.
+    # Count edits to any file that could plausibly carry intent,
+    # invariants, or design decisions worth observing. This covers:
+    #   - source code (*.go, *.sh, *.py, *.rs, *.ts, *.js, *.proto, ...)
+    #   - docs and specs (*.md, *.mdx, *.rst, *.txt under docs/)
+    #   - configuration (*.yaml, *.yml, *.toml, *.json, *.ini, Dockerfile)
+    #   - agent-facing surfaces (CLAUDE.md, AGENTS.md, .claude/**)
+    #
+    # Docs and config are included deliberately (user request): writing
+    # a design doc forces articulation of intent, and writing a config
+    # often surfaces undocumented invariants — both are high-signal
+    # observation triggers.
+    #
+    # Explicit noise exclusions: lockfiles, caches, generated output,
+    # ephemeral stores. These are never worth observing even in bulk.
     target=$(printf '%s' "$payload" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty')
     [[ -z "$target" ]] && exit 0
+
+    # Exclude first — a path under a noise directory is never counted
+    # regardless of its extension.
     case "$target" in
-      */cmd/*|*/internal/*|*/pkg/*|*/.claude/hooks/*|*.go|*.sh)
-        touch "$pending"
-        count=$(cat "$edit_counter" 2>/dev/null || echo 0)
-        echo $((count + 1)) > "$edit_counter"
-        ;;
+      */node_modules/*|*/vendor/*|*/dist/*|*/build/*|*/.cache/*|*/.gitnexus/*|*/.beads/*|*/.cortex/*|*/.venv/*|*/__pycache__/*|*/.next/*|*/target/*)
+        exit 0 ;;
+      *.lock|*go.sum|*package-lock.json|*yarn.lock|*Cargo.lock|*.log|*.tmp|*.bak|*.swp|*.DS_Store)
+        exit 0 ;;
     esac
+
+    should_count=0
+    case "$target" in
+      # Source code
+      *.go|*.sh|*.bash|*.zsh|*.py|*.rs|*.ts|*.tsx|*.js|*.jsx|*.mjs|*.java|*.kt|*.swift|*.c|*.cc|*.cpp|*.h|*.hpp|*.rb|*.proto|*.sql)
+        should_count=1 ;;
+      # Docs and specs
+      *.md|*.mdx|*.rst|*.adoc|*/docs/*.txt|*/docs/*)
+        should_count=1 ;;
+      # Config / ops surfaces
+      *.yaml|*.yml|*.toml|*.json|*.ini|*.cfg|*Dockerfile*|*Makefile*|*.mk|*.tf|*.hcl)
+        should_count=1 ;;
+      # Agent surfaces — always track so the agent's own playbook
+      # changes get observed.
+      *CLAUDE.md|*AGENTS.md|*/.claude/*)
+        should_count=1 ;;
+    esac
+
+    if (( should_count == 1 )); then
+      touch "$pending"
+      count=$(cat "$edit_counter" 2>/dev/null || echo 0)
+      echo $((count + 1)) > "$edit_counter"
+    fi
     ;;
   Bash)
     cmd=$(printf '%s' "$payload" | jq -r '.tool_input.command // empty')

@@ -58,7 +58,7 @@ preserves the diff, not the reasoning.
 ```bash
 ./cortex observe \
   "<one-sentence claim stating the fact>" \
-  --kind=<Observation|Decision|ObservedRace|SessionReflection> \
+  --kind=<Observation|ObservedRace|SessionReflection> \
   --facets=domain:<X>,project:cortex,subsystem:<Y>
 ```
 
@@ -68,7 +68,11 @@ before moving on:
 - **Root cause found.** You identified why a bug happened. Observe the
   root cause as `--kind=Observation`, not the symptom.
 - **Decision made.** You chose approach A over approach B, with reasons.
-  Observe as `--kind=Decision` with the trade-off in the body.
+  Observe as `--kind=Observation` with `kind-of-record:decision` in
+  the facets. `Decision` is NOT a valid `--kind` value — the `design_decision`
+  frame exists but is reflection-only and is populated automatically
+  when `cortex reflect` finds enough exemplars to promote a pattern.
+  Put the trade-off in the body.
 - **Bug fixed.** The fix isn't in the commit message — the bug's invariant
   is. Observe the invariant.
 - **Benchmark run.** You measured performance (p50/p95/p99, envelope, n).
@@ -79,6 +83,17 @@ before moving on:
   after Y because of Z. Observe the constraint.
 - **Failing path identified.** You reproduced a race, a deadlock, an
   edge case. Observe it as `--kind=ObservedRace`.
+- **Docs or spec written.** Writing a README section, spec, ADR, or
+  design doc forces articulation of intent and frequently surfaces
+  gaps the code didn't expose. Observe the intent you articulated (as
+  `--kind=Decision` if it codifies a decision, `--kind=Observation` if
+  it captures an invariant) AND any missed items or inconsistencies
+  the writing exposed (`--kind=Observation`, one per item). Docs work
+  is often more observation-rich than code work — treat it that way.
+- **Config changed.** Edits to `docker-compose.yaml`, `config.yaml`,
+  Dockerfiles, Makefiles, CI definitions, or `.claude/settings.json`
+  usually encode an invariant ("this envelope", "this timeout",
+  "this hook order"). Observe the invariant, not the diff.
 
 A good observation is one sentence that states a claim a future agent can
 act on without reading the source.
@@ -173,9 +188,10 @@ minutes; a re-ingest after small edits is near-instant.
 
 The repo has a post-commit hook that auto-observes every `git commit`
 you make during this session. The hook extracts the commit SHA, subject,
-and body and writes one `Decision` entry with `domain:Repo,project:cortex,
-commit:<sha>` facets. You do **not** need to observe the fact that you
-committed — the hook handles that.
+and body and writes one `Observation` entry with
+`domain:Repo,project:cortex,kind-of-record:commit,commit:<sha>` facets.
+You do **not** need to observe the fact that you committed — the hook
+handles that.
 
 You **do** still need to observe:
 
