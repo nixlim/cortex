@@ -213,6 +213,94 @@ cortex down --purge      # interactive prompt: also remove volumes (data lost)
 
 ---
 
+## Trails and `CORTEX_TRAIL_ID`
+
+A **trail** is the envelope that groups a work session's observations into
+a single replayable bundle. `cortex trail end` asks the host generation
+model to synthesize a short narrative summary over the trail's entries,
+which gives future recalls a thread to follow instead of a scatter of
+individual datoms. Trails are optional — standalone `cortex observe`
+calls work fine — but they are the right tool any time you expect the
+work you are about to do to produce more than a single persistent fact.
+
+### The contract
+
+`cortex trail begin` prints a new `trail:<ulid>` to stdout **and nothing
+else**, so you capture it into a shell variable named `CORTEX_TRAIL_ID`.
+From that moment on:
+
+- Every `cortex observe` in the same environment auto-attaches to the
+  trail via the `--trail` fallback — you do not pass the flag.
+- `cortex trail end` reads `CORTEX_TRAIL_ID` from the environment,
+  materializes the trail's entries, runs the summary prompt, and writes
+  `ended_at` + `summary` datoms. If the variable is unset it exits `2`
+  with code `NO_ACTIVE_TRAIL`.
+- `CORTEX_TRAIL_ID` is the **only** environment variable Cortex reads.
+
+```bash
+export CORTEX_TRAIL_ID=$(cortex trail begin \
+  --agent=claude-code \
+  --name="debug retry storm")
+
+cortex observe "Saw thundering herd at 09:42"        --kind=ObservedRace --facets=domain:Reliability,project:pay-gw
+cortex observe "Root cause: no jitter on client retry" --kind=Observation  --facets=domain:Reliability,project:pay-gw
+
+cortex trail end
+unset CORTEX_TRAIL_ID
+```
+
+You can override the trail attachment on any single `observe` by passing
+`--trail=<id>` explicitly; the flag wins over the environment variable.
+
+### When to begin a trail
+
+Begin a trail when the work you are about to do is likely to produce
+**multiple related observations** that a future query should surface
+together. Good triggers:
+
+- Debugging a non-trivial bug (root cause + attempted fixes + final fix).
+- Implementing a feature where the design rationale and the concrete
+  implementation choices should stay bundled.
+- Running a spike, audit, or benchmark that you want future agents to
+  find as one coherent thread.
+- A task that will span more than a few minutes of active work.
+
+Do **not** begin a trail when:
+
+- You are recording a single standalone observation. Just run
+  `cortex observe` on its own.
+- The work is pure exploration with nothing worth persisting.
+- A trail is already active in the environment — check `echo
+  $CORTEX_TRAIL_ID` first. Nested trails are not supported.
+- You cannot guarantee you will call `cortex trail end` (e.g. inside a
+  short-lived CI step where the process may exit abruptly).
+
+### When to end a trail
+
+Run `cortex trail end` before:
+
+- Claiming the task you opened the trail for is complete.
+- Switching to an unrelated task.
+- The end of a working session.
+
+A trail that is never ended is still valid data — the datoms are in the
+log — but the LLM narrative summary only runs at end time, so un-ended
+trails never appear in recall with their trail-level context. Always end
+trails you open.
+
+### Inspecting trails
+
+```bash
+cortex trail list                    # reverse-chronological list of trails
+cortex trail show trail:<ulid>       # one trail, with its member entries
+```
+
+`cortex recall` surfaces the trail summary automatically when any of the
+trail's member entries scores high enough, via the `TrailContext` field
+on each result.
+
+---
+
 ## Commands
 
 | Command           | What it does                                                    |
