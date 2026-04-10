@@ -217,16 +217,8 @@ func newUnevictCmd() *cobra.Command {
 // newRebuildCmd delegates to the real implementation in rebuild.go.
 func newRebuildCmd() *cobra.Command { return newRebuildCmdReal() }
 
-func newExportCmd() *cobra.Command {
-	var out string
-	cmd := &cobra.Command{
-		Use:   "export",
-		Short: "Merge all segments into one tx-sorted stream",
-		RunE:  notImplemented("cortex export"),
-	}
-	cmd.Flags().StringVar(&out, "out", "", "output path for the merged stream (default stdout)")
-	return cmd
-}
+// newExportCmd delegates to the real implementation in export.go.
+func newExportCmd() *cobra.Command { return newExportCmdReal() }
 
 func newMergeCmd() *cobra.Command {
 	cmd := &cobra.Command{
