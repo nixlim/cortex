@@ -17,13 +17,21 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
+	"github.com/oklog/ulid/v2"
 	"github.com/spf13/cobra"
 
 	"github.com/nixlim/cortex/internal/analyze"
+	"github.com/nixlim/cortex/internal/community"
+	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/errs"
+	"github.com/nixlim/cortex/internal/infra"
+	"github.com/nixlim/cortex/internal/log"
+	"github.com/nixlim/cortex/internal/neo4j"
 )
 
 // newAnalyzeCmdReal returns the production-wired `cortex analyze`
@@ -50,16 +58,11 @@ func newAnalyzeCmdReal() *cobra.Command {
 					"cortex analyze requires --find-patterns in Phase 1", nil), jsonFlag)
 			}
 
-			// Build the pipeline. In Phase 1 the ClusterSource and
-			// FrameProposer need Neo4j + Ollama adapters. When those
-			// land (adapter-dev wiring), buildAnalyzePipeline returns a
-			// fully functional pipeline. Until then it returns an
-			// operational error so the user knows which adapter is
-			// missing rather than getting a nil-pointer crash.
-			pipeline, err := buildAnalyzePipeline()
+			pipeline, cleanup, err := buildAnalyzePipeline()
 			if err != nil {
 				return emitAndExit(cmd, err, jsonFlag)
 			}
+			defer cleanup()
 
 			opts := analyze.RunOptions{
 				DryRun:          dryRun,
@@ -86,19 +89,80 @@ func newAnalyzeCmdReal() *cobra.Command {
 	return cmd
 }
 
-// buildAnalyzePipeline constructs the analyze.Pipeline from config and
-// live adapters. Phase 1 returns an operational error until the Neo4j
-// cluster source and Ollama proposer adapters are wired.
-func buildAnalyzePipeline() (*analyze.Pipeline, error) {
-	// TODO(adapter-dev): wire Neo4j ClusterSource, Ollama FrameProposer,
-	// log.Writer, and CommunityRefresher here. The pipeline shape and
-	// all thresholds are ready in internal/analyze. This function will
-	// mirror buildObservePipeline's pattern: load config, open log,
-	// build adapters, return pipeline + cleanup.
-	return nil, errs.Operational("ANALYZE_NOT_WIRED",
-		"cortex analyze --find-patterns requires Neo4j and Ollama adapters "+
-			"that are not yet wired in the CLI; the pipeline is fully "+
-			"exercised by internal/analyze unit tests", nil)
+// buildAnalyzePipeline constructs the analyze.Pipeline from config
+// and live Neo4j / Ollama / log adapters. The bridge adapter types
+// live in analyze_adapters.go. The returned cleanup closes the Bolt
+// client and the log writer.
+func buildAnalyzePipeline() (*analyze.Pipeline, func(), error) {
+	cfgPath := defaultConfigPath()
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return nil, func() {}, errs.Operational("CONFIG_LOAD_FAILED",
+			"could not load ~/.cortex/config.yaml", err)
+	}
+
+	password, _, _ := infra.EnsureNeo4jPassword(cfgPath)
+	bolt, err := neo4j.NewBoltClient(neo4j.Config{
+		BoltEndpoint: cfg.Endpoints.Neo4jBolt,
+		Username:     "neo4j",
+		Password:     password,
+		Timeout:      10 * time.Second,
+		MaxPoolSize:  4,
+	})
+	if err != nil {
+		return nil, func() {}, errs.Operational("NEO4J_UNAVAILABLE",
+			"could not open Neo4j Bolt client", err)
+	}
+
+	segDir := expandHome(cfg.Log.SegmentDir)
+	writer, err := log.NewWriter(segDir)
+	if err != nil {
+		_ = bolt.Close(context.Background())
+		return nil, func() {}, errs.Operational("LOG_OPEN_FAILED",
+			"could not open segment directory", err)
+	}
+
+	cleanup := func() {
+		_ = writer.Close()
+		_ = bolt.Close(context.Background())
+	}
+
+	ollamaClient := newOllamaClient(cfg)
+
+	// Community refresher: Leiden preferred, Louvain fallback, with
+	// the Ollama-backed summariser for any regenerated summaries.
+	detector := &community.Detector{
+		Neo4j:        bolt,
+		LeidenQuery:  neo4j.LeidenStreamQuery,
+		LouvainQuery: neo4j.LouvainStreamQuery,
+		TopNodeCount: 32,
+	}
+	refresher := &community.Refresher{
+		Neo4j:      bolt,
+		Summarizer: &ollamaCommunitySummarizer{client: ollamaClient},
+	}
+	refreshBridge := &communityRefresherBridge{
+		detector:  detector,
+		refresher: refresher,
+		graphName: semanticGraphName,
+		cfg: community.Config{
+			GraphName:     semanticGraphName,
+			Resolutions:   []float64{1.0, 0.5, 0.1},
+			Levels:        3,
+			MaxIterations: 10,
+			Tolerance:     0.0001,
+		},
+	}
+
+	pipeline := &analyze.Pipeline{
+		Source:       &neo4jAnalyzeClusterSource{client: bolt},
+		Proposer:     &ollamaFrameProposer{client: ollamaClient, source: "analyze"},
+		Log:          writer,
+		Community:    refreshBridge,
+		Actor:        defaultActor(),
+		InvocationID: ulid.Make().String(),
+	}
+	return pipeline, cleanup, nil
 }
 
 func renderAnalyzeJSON(cmd *cobra.Command, res *analyze.Result) error {
