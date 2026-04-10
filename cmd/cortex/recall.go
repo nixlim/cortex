@@ -22,8 +22,10 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/nixlim/cortex/internal/config"
+	"github.com/nixlim/cortex/internal/datom"
 	"github.com/nixlim/cortex/internal/errs"
 	"github.com/nixlim/cortex/internal/infra"
+	"github.com/nixlim/cortex/internal/log"
 	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/recall"
 )
@@ -49,7 +51,7 @@ func newRecallCmdReal() *cobra.Command {
 				return emitAndExit(cmd, errs.Validation("EMPTY_QUERY",
 					"cortex recall requires a non-empty query", nil), jsonFlag)
 			}
-			pipeline, cleanup, err := buildRecallPipeline()
+			pipeline, writer, cleanup, err := buildRecallPipeline()
 			if err != nil {
 				return emitAndExit(cmd, err, jsonFlag)
 			}
@@ -62,7 +64,22 @@ func newRecallCmdReal() *cobra.Command {
 			if err != nil {
 				return emitAndExit(cmd, err, jsonFlag)
 			}
-			return renderRecallResult(cmd, res, jsonFlag)
+			if err := renderRecallResult(cmd, res, jsonFlag); err != nil {
+				return err
+			}
+			// FR-015: every recall reinforces the surfaced entries.
+			// The pipeline emits the reinforcement datoms unsealed; the
+			// CLI is the owner of the log writer (per the recall package
+			// contract that "the pipeline never opens its own log
+			// handle"), so sealing + appending happens here, after the
+			// response is rendered. A reinforcement-append failure does
+			// NOT roll back the rendered response — the user already saw
+			// the results, and self-heal will retry the apply on the
+			// next command.
+			if err := appendReinforcementDatoms(writer, res); err != nil {
+				return emitAndExit(cmd, err, jsonFlag)
+			}
+			return nil
 		},
 	}
 	cmd.Flags().IntVar(&limit, "limit", 0, "override retrieval.default_limit (10)")
@@ -74,14 +91,16 @@ func newRecallCmdReal() *cobra.Command {
 // adapters. The six bridge types live in recall_adapters.go; this
 // function is the single place that knows how to load config, open
 // the Neo4j / Ollama / Weaviate clients, and hand them to the
-// pipeline. The returned cleanup closes the Bolt client; the Ollama
-// and Weaviate clients are stateless stdlib http.Client wrappers and
-// do not need explicit teardown.
-func buildRecallPipeline() (*recall.Pipeline, func(), error) {
+// pipeline. It also opens the segment writer the CLI uses to append
+// the FR-015 reinforcement datoms after the response is rendered.
+// The returned cleanup closes both the Bolt client and the writer.
+// The Ollama and Weaviate clients are stateless stdlib http.Client
+// wrappers and do not need explicit teardown.
+func buildRecallPipeline() (*recall.Pipeline, *log.Writer, func(), error) {
 	cfgPath := defaultConfigPath()
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		return nil, func() {}, errs.Operational("CONFIG_LOAD_FAILED",
+		return nil, nil, func() {}, errs.Operational("CONFIG_LOAD_FAILED",
 			"could not load ~/.cortex/config.yaml", err)
 	}
 
@@ -94,10 +113,21 @@ func buildRecallPipeline() (*recall.Pipeline, func(), error) {
 		MaxPoolSize:  4,
 	})
 	if err != nil {
-		return nil, func() {}, errs.Operational("NEO4J_UNAVAILABLE",
+		return nil, nil, func() {}, errs.Operational("NEO4J_UNAVAILABLE",
 			"could not open Neo4j Bolt client", err)
 	}
-	cleanup := func() { _ = bolt.Close(context.Background()) }
+
+	segDir := expandHome(cfg.Log.SegmentDir)
+	writer, err := log.NewWriter(segDir)
+	if err != nil {
+		_ = bolt.Close(context.Background())
+		return nil, nil, func() {}, errs.Operational("LOG_OPEN_FAILED",
+			"could not open segment directory", err)
+	}
+	cleanup := func() {
+		_ = writer.Close()
+		_ = bolt.Close(context.Background())
+	}
 
 	ollamaClient := newOllamaClient(cfg)
 	weaviateClient := newWeaviateClient(cfg)
@@ -115,7 +145,33 @@ func buildRecallPipeline() (*recall.Pipeline, func(), error) {
 		Actor:        defaultActor(),
 		InvocationID: ulid.Make().String(),
 	}
-	return pipeline, cleanup, nil
+	return pipeline, writer, cleanup, nil
+}
+
+// appendReinforcementDatoms seals every datom in res.ReinforcementDatoms
+// and appends them as a single transaction group to the supplied
+// writer. The pipeline emits the datoms unsealed (so callers can
+// stamp their own tx/invocation fields), so the CLI must Seal each
+// one immediately before Append. A nil response or empty slice is a
+// no-op.
+func appendReinforcementDatoms(writer *log.Writer, res *recall.Response) error {
+	if res == nil || len(res.ReinforcementDatoms) == 0 {
+		return nil
+	}
+	group := make([]datom.Datom, 0, len(res.ReinforcementDatoms))
+	for i := range res.ReinforcementDatoms {
+		d := res.ReinforcementDatoms[i]
+		if err := d.Seal(); err != nil {
+			return errs.Operational("REINFORCEMENT_SEAL_FAILED",
+				"could not seal recall reinforcement datom", err)
+		}
+		group = append(group, d)
+	}
+	if _, err := writer.Append(group); err != nil {
+		return errs.Operational("REINFORCEMENT_APPEND_FAILED",
+			"could not append recall reinforcement datoms", err)
+	}
+	return nil
 }
 
 // renderRecallResult prints the surfaced entries as either a
