@@ -1,36 +1,23 @@
 // Package main: ops/CLI surface.
 //
 // This file wires every Cortex subcommand documented in docs/spec/cortex-spec.md
-// as a cobra.Command under the root. Each command currently returns a
-// "not implemented" error so the surface compiles and so that features-dev,
-// adapter-dev, and the ops-dev commands below can be filled in without having
-// to chase cobra boilerplate.
+// as a cobra.Command under the root. Each verb is registered here as a one-
+// line shim that delegates to the *Real constructor in its dedicated file
+// (cmd/cortex/<verb>.go), keeping the cobra tree's shape in one place while
+// the implementation lives next to its tests.
 //
 // Subcommand groups (trail, community, subject, ingest) are real parent
-// commands so `cortex trail begin` etc. resolve today. Flags that map onto
-// acceptance criteria are declared now so the stub shape matches the spec.
+// commands so `cortex trail begin` etc. resolve today.
 //
 // Owned by ops-dev (cortex-4kq.22/.26/.27/.30/.33/.34/.31/.43/.45/.46/.50/
-// .40/.49/.37/.38/.54/.55) plus stub placeholders for features-dev commands
-// (observe/recall/reflect/ingest/analyze) that will be replaced by real
-// implementations once the log layer lands.
+// .40/.49/.37/.38/.54/.55) plus features-dev / adapter-dev verbs
+// (observe/recall/reflect/ingest/analyze) that delegate to their own
+// dedicated files in cmd/cortex/.
 package main
 
 import (
-	"fmt"
-
 	"github.com/spf13/cobra"
 )
-
-// notImplemented returns a RunE that reports the command is not yet wired.
-// It satisfies the team-lead instruction to keep every documented subcommand
-// addressable immediately, so that downstream beads can swap in real logic
-// without having to re-register the cobra node.
-func notImplemented(name string) func(*cobra.Command, []string) error {
-	return func(_ *cobra.Command, _ []string) error {
-		return fmt.Errorf("not implemented: %s", name)
-	}
-}
 
 // addOpsCommands registers every Phase 1 subcommand on the root command.
 // It is called from newRootCmd() in main.go.
@@ -56,9 +43,8 @@ func addOpsCommands(root *cobra.Command) {
 	root.AddCommand(newMigrateCmd())
 	root.AddCommand(newBenchCmd())
 
-	// features-dev territory — stubbed here so the root CLI compiles with
-	// every documented verb present. features-dev will replace the RunE
-	// with real implementations.
+	// features-dev / adapter-dev verbs — wired to their own *Real
+	// constructors in cmd/cortex/<verb>.go.
 	root.AddCommand(newObserveCmd())
 	root.AddCommand(newRecallCmd())
 	root.AddCommand(newReflectCmd())
