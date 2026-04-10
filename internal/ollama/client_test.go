@@ -42,17 +42,30 @@ func newFakeOllama() *fakeOllama {
 	}
 
 	mux := http.NewServeMux()
+	// /api/tags is the canonical source of per-model digests on the
+	// real Ollama HTTP API, so both Ping and Show hit this endpoint.
+	// The handler returns an empty models array when showName is
+	// blank (Ping-only scenario) and a single-model payload otherwise
+	// (Show-path scenario).
 	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(int(atomic.LoadInt32(&f.tagsStatus)))
-		_, _ = io.WriteString(w, `{"models":[]}`)
-	})
-
-	mux.HandleFunc("/api/show", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&f.showCalls, 1)
+		status := int(atomic.LoadInt32(&f.tagsStatus))
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(showResponse{
-			Name:   f.showName,
-			Digest: f.showDigest,
+		w.WriteHeader(status)
+		if status != http.StatusOK {
+			return
+		}
+		if f.showName == "" {
+			_, _ = io.WriteString(w, `{"models":[]}`)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(tagsResponse{
+			Models: []struct {
+				Name   string `json:"name"`
+				Digest string `json:"digest"`
+			}{
+				{Name: f.showName, Digest: f.showDigest},
+			},
 		})
 	})
 

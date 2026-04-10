@@ -93,21 +93,27 @@ type ModelInfo struct {
 
 // Config is the subset of Cortex config fields this adapter needs.
 type Config struct {
-	Endpoint                    string        // e.g. "localhost:11434"
-	EmbeddingModel              string        // e.g. "nomic-embed-text"
-	GenerationModel             string        // e.g. "qwen3:4b-instruct"
-	EmbeddingTimeout            time.Duration // timeouts.embedding_seconds
-	LinkDerivationTimeout       time.Duration // timeouts.link_derivation_seconds
+	Endpoint              string        // e.g. "localhost:11434"
+	EmbeddingModel        string        // e.g. "nomic-embed-text"
+	GenerationModel       string        // e.g. "qwen3:4b-instruct"
+	EmbeddingTimeout      time.Duration // timeouts.embedding_seconds
+	LinkDerivationTimeout time.Duration // timeouts.link_derivation_seconds
+	// NumCtx overrides Ollama's default num_ctx (2048) for every
+	// /api/generate request. Zero means "don't send options.num_ctx"
+	// and the server's default wins. See bead cortex-w5u for why
+	// cortex cares about this.
+	NumCtx int
 }
 
 // HTTPClient is the live implementation of Client.
 type HTTPClient struct {
-	baseURL         string
-	embeddingModel  string
-	generationModel string
-	embeddingBudget time.Duration
+	baseURL          string
+	embeddingModel   string
+	generationModel  string
+	embeddingBudget  time.Duration
 	generationBudget time.Duration
-	http            *http.Client
+	numCtx           int
+	http             *http.Client
 
 	// showOnce + cachedInfo back the "Show is called exactly once per
 	// invocation" guarantee. sync.Once gives us at-most-once
@@ -138,6 +144,7 @@ func NewHTTPClient(cfg Config) *HTTPClient {
 		generationModel:  cfg.GenerationModel,
 		embeddingBudget:  cfg.EmbeddingTimeout,
 		generationBudget: cfg.LinkDerivationTimeout,
+		numCtx:           cfg.NumCtx,
 		http:             &http.Client{},
 	}
 }
@@ -192,24 +199,28 @@ func (c *HTTPClient) Ping(ctx context.Context) error {
 	return nil
 }
 
-// showResponse is the subset of the Ollama /api/show shape we decode.
-type showResponse struct {
-	License     string         `json:"license"`
-	Modelfile   string         `json:"modelfile"`
-	Parameters  string         `json:"parameters"`
-	Template    string         `json:"template"`
-	Details     map[string]any `json:"details"`
-	Digest      string         `json:"digest"`
-	ModifiedAt  string         `json:"modified_at"`
-	Name        string         `json:"name"`
+// tagsResponse is the subset of the Ollama /api/tags shape we decode.
+// Unlike /api/show (which omits the digest in Ollama >= 0.1.x), /api/tags
+// is the canonical source of per-model digests on the Ollama HTTP API.
+type tagsResponse struct {
+	Models []struct {
+		Name   string `json:"name"`
+		Digest string `json:"digest"`
+	} `json:"models"`
 }
 
-// Show is the at-most-once wrapper around the /api/show POST. The
-// cached result is returned on subsequent calls. If the first call
-// fails, its error is cached and returned on every subsequent call
-// too — that keeps the "exactly once network call" semantics strict
-// and prevents a flaky failure from causing a cascade of retries
-// that would produce non-deterministic digests on the wire.
+// Show is the at-most-once wrapper that resolves the embedding model's
+// name and digest from Ollama's /api/tags endpoint. The cached result
+// is returned on subsequent calls. If the first call fails, its error
+// is cached and returned on every subsequent call too — that keeps
+// the "exactly once network call" semantics strict and prevents a
+// flaky failure from causing a cascade of retries that would produce
+// non-deterministic digests on the wire.
+//
+// The method name stays "Show" for compatibility with the Client
+// interface and historical call sites; the underlying endpoint moved
+// from /api/show to /api/tags because real Ollama does not emit a
+// top-level digest on /api/show (bead cortex-c09).
 func (c *HTTPClient) Show(ctx context.Context) (ModelInfo, error) {
 	c.showOnce.Do(func() {
 		c.cachedInfo, c.showErr = c.doShow(ctx)
@@ -219,43 +230,47 @@ func (c *HTTPClient) Show(ctx context.Context) (ModelInfo, error) {
 
 // doShow performs the actual network call. It is separate from Show
 // so sync.Once can call it while still counting invocations through
-// the atomic counter.
+// the atomic counter. It fetches /api/tags, finds the entry whose
+// name matches the configured embedding model (with a ":latest"
+// fallback because Ollama canonicalises unqualified names by
+// appending ":latest" in the tags listing), and returns that entry's
+// digest.
 func (c *HTTPClient) doShow(ctx context.Context) (ModelInfo, error) {
 	atomic.AddInt32(&c.showCalls, 1)
 	ctx, cancel := ctxWithDefault(ctx, DefaultTimeout)
 	defer cancel()
 
-	body, err := json.Marshal(map[string]any{"name": c.embeddingModel})
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/tags", nil)
 	if err != nil {
-		return ModelInfo{}, fmt.Errorf("ollama: marshal show body: %w", err)
+		return ModelInfo{}, fmt.Errorf("ollama: build tags request: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/show", bytes.NewReader(body))
-	if err != nil {
-		return ModelInfo{}, fmt.Errorf("ollama: build show request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return ModelInfo{}, fmt.Errorf("ollama: show: %w", err)
+		return ModelInfo{}, fmt.Errorf("ollama: tags: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return ModelInfo{}, fmt.Errorf("ollama: show returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return ModelInfo{}, fmt.Errorf("ollama: tags returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
-	var sr showResponse
-	if err := json.Unmarshal(raw, &sr); err != nil {
-		return ModelInfo{}, fmt.Errorf("ollama: decode show response: %w", err)
+	var tr tagsResponse
+	if err := json.Unmarshal(raw, &tr); err != nil {
+		return ModelInfo{}, fmt.Errorf("ollama: decode tags response: %w", err)
 	}
-	// Some Ollama versions echo the name only in the request; fall
-	// back to the configured name if the response omits it.
-	name := sr.Name
-	if name == "" {
-		name = c.embeddingModel
+
+	// Match the configured embedding model against the tags list,
+	// accepting either the exact name or the canonical ":latest"
+	// variant Ollama appends for unqualified tags.
+	wantExact := c.embeddingModel
+	wantLatest := c.embeddingModel + ":latest"
+	for _, m := range tr.Models {
+		if m.Name == wantExact || m.Name == wantLatest {
+			return ModelInfo{Name: m.Name, Digest: m.Digest}, nil
+		}
 	}
-	return ModelInfo{Name: name, Digest: sr.Digest}, nil
+	return ModelInfo{}, fmt.Errorf("ollama: embedding model %q not present in /api/tags", c.embeddingModel)
 }
 
 // embedRequest / embedResponse are the Ollama /api/embeddings shapes.
@@ -335,11 +350,15 @@ func (c *HTTPClient) Embed(ctx context.Context, text string) ([]float32, error) 
 // We set stream=false so the response is a single JSON object rather
 // than a stream of ndjson frames — the write and reflect pipelines
 // don't need incremental tokens and materialising a single response
-// simplifies call sites.
+// simplifies call sites. Options carries per-call tunables like
+// num_ctx; it is omitempty so a zero-value Options block doesn't
+// appear on the wire (Ollama rejects some empty blocks on older
+// versions).
 type generateRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
-	Stream bool   `json:"stream"`
+	Model   string         `json:"model"`
+	Prompt  string         `json:"prompt"`
+	Stream  bool           `json:"stream"`
+	Options map[string]any `json:"options,omitempty"`
 }
 
 type generateResponse struct {
@@ -352,15 +371,23 @@ type generateResponse struct {
 // Configuration Defaults table), so reflection and link derivation
 // share one budget. Callers that want a shorter or longer budget
 // should pass a context with an explicit deadline.
+//
+// If the client was configured with a non-zero NumCtx, options.num_ctx
+// is included in the request body so Ollama allocates a larger KV
+// cache than its 2048-token default. See bead cortex-w5u.
 func (c *HTTPClient) Generate(ctx context.Context, prompt string) (string, error) {
 	ctx, cancel := ctxWithDefault(ctx, c.generationBudget)
 	defer cancel()
 
-	body, err := json.Marshal(generateRequest{
+	reqBody := generateRequest{
 		Model:  c.generationModel,
 		Prompt: prompt,
 		Stream: false,
-	})
+	}
+	if c.numCtx > 0 {
+		reqBody.Options = map[string]any{"num_ctx": c.numCtx}
+	}
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", fmt.Errorf("ollama: marshal generate body: %w", err)
 	}
