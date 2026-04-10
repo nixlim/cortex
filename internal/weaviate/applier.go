@@ -83,6 +83,7 @@ type BackendApplier struct {
 
 	mu      sync.Mutex
 	pending map[string]map[string]any // entity id → accumulated property bag
+	vectors map[string][]float32      // entity id → cached embedding vector
 }
 
 // NewBackendApplier wraps an *HTTPClient (or any compatible
@@ -97,6 +98,7 @@ func newBackendApplierFor(w objectUpserter) *BackendApplier {
 	return &BackendApplier{
 		w:       w,
 		pending: make(map[string]map[string]any),
+		vectors: make(map[string][]float32),
 	}
 }
 
@@ -115,7 +117,39 @@ func (a *BackendApplier) Name() string { return "weaviate" }
 //     hit back to the prefixed ULID.
 //   - OpRetract sets `retracted = true` rather than deleting; recall's
 //     visibility filter handles default invisibility.
+//   - If a prior ApplyWithVector cached an embedding for this entity,
+//     Apply opportunistically forwards the cached vector on every
+//     subsequent Upsert so a once-vectored entity stays vectored even
+//     when later property datoms flow through plain Apply. This is
+//     the round-3 CRIT-009 fix: features-dev's write pipeline calls
+//     ApplyWithVector once on the body datom; every other datom in
+//     the same group then picks up the cached vector automatically
+//     and the entity row stays searchable by cosine.
 func (a *BackendApplier) Apply(ctx context.Context, d datom.Datom) error {
+	return a.applyWithOptionalVector(ctx, d, nil)
+}
+
+// ApplyWithVector is the variant the write pipeline calls when it
+// has a fresh embedding for the entity (the body datom is the
+// canonical trigger). It seeds the per-entity vector cache so any
+// later Apply call for the same entity automatically reuses the
+// vector — features-dev only has to call ApplyWithVector once per
+// observe transaction (on the body datom that just got embedded)
+// and the rest of the property datoms in the same group inherit the
+// vector through Apply via the cache.
+func (a *BackendApplier) ApplyWithVector(ctx context.Context, d datom.Datom, vector []float32) error {
+	return a.applyWithOptionalVector(ctx, d, vector)
+}
+
+// applyWithOptionalVector is the shared implementation behind Apply
+// and ApplyWithVector. The vector argument is the "fresh" vector the
+// caller wants to attach to this Upsert (or nil if Apply was called).
+// The applier's per-entity vector cache is updated when a non-nil
+// vector arrives, and consulted as a fallback when nil arrives, so
+// a write-pipeline call ordering of (ApplyWithVector body, Apply
+// other-prop-1, Apply other-prop-2…) keeps the vector attached on
+// every Upsert.
+func (a *BackendApplier) applyWithOptionalVector(ctx context.Context, d datom.Datom, vector []float32) error {
 	if d.E == "" {
 		return nil
 	}
@@ -144,6 +178,20 @@ func (a *BackendApplier) Apply(ctx context.Context, d datom.Datom) error {
 			bag[key] = v
 		}
 	}
+	// Vector cache: a fresh vector replaces any prior cached vector
+	// for this entity (re-embeds win); a nil vector falls back to the
+	// cached vector so a previously-vectored entity stays vectored on
+	// every subsequent Apply. This is the CRIT-009 fix.
+	effectiveVector := vector
+	if vector != nil {
+		// Defensive copy so a caller mutating its slice after the
+		// call doesn't bleed into the cache.
+		cached := make([]float32, len(vector))
+		copy(cached, vector)
+		a.vectors[d.E] = cached
+	} else if cached, ok := a.vectors[d.E]; ok {
+		effectiveVector = cached
+	}
 	// Snapshot the bag under the lock so the HTTP call below sees a
 	// stable view even if a concurrent Apply mutates the same entity
 	// after we release.
@@ -154,50 +202,7 @@ func (a *BackendApplier) Apply(ctx context.Context, d datom.Datom) error {
 	a.mu.Unlock()
 
 	uuid := deriveUUID(d.E)
-	// Vector is empty here: the Phase 1 write pipeline does not yet
-	// hand the float32 vector to Apply (the embedding lives in the
-	// pipeline's local var, see internal/write/pipeline.go:309). When
-	// that wiring lands, the vector will flow through ApplyWithVector
-	// below; until then the row exists with vectorizer=none and an
-	// absent vector field.
-	if err := a.w.Upsert(ctx, class, uuid, nil, snapshot); err != nil {
-		return fmt.Errorf("weaviate: apply %s/%s: %w", d.E, d.A, err)
-	}
-	return nil
-}
-
-// ApplyWithVector is the variant the write pipeline calls when it
-// has a fresh embedding for the entity (the body datom is the
-// canonical trigger). It is intentionally additive — features-dev can
-// switch the pipeline to call this method without breaking the
-// generic Apply seam used by self-heal.
-func (a *BackendApplier) ApplyWithVector(ctx context.Context, d datom.Datom, vector []float32) error {
-	if d.E == "" {
-		return nil
-	}
-	class, ok := classForEntity(d.E)
-	if !ok {
-		return nil
-	}
-	a.mu.Lock()
-	bag, exists := a.pending[d.E]
-	if !exists {
-		bag = map[string]any{"cortex_id": d.E}
-		a.pending[d.E] = bag
-	}
-	key := propertyName(d.A)
-	delete(bag, key)
-	if v := decodeValue(d.V); v != nil {
-		bag[key] = v
-	}
-	snapshot := make(map[string]any, len(bag))
-	for k, v := range bag {
-		snapshot[k] = v
-	}
-	a.mu.Unlock()
-
-	uuid := deriveUUID(d.E)
-	if err := a.w.Upsert(ctx, class, uuid, vector, snapshot); err != nil {
+	if err := a.w.Upsert(ctx, class, uuid, effectiveVector, snapshot); err != nil {
 		return fmt.Errorf("weaviate: apply %s/%s: %w", d.E, d.A, err)
 	}
 	return nil
@@ -210,6 +215,7 @@ func (a *BackendApplier) ApplyWithVector(ctx context.Context, d datom.Datom, vec
 func (a *BackendApplier) Forget(entityID string) {
 	a.mu.Lock()
 	delete(a.pending, entityID)
+	delete(a.vectors, entityID)
 	a.mu.Unlock()
 }
 

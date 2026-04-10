@@ -92,6 +92,20 @@ type BackendApplier interface {
 	Apply(ctx context.Context, d datom.Datom) error
 }
 
+// VectorApplier is an optional capability a BackendApplier may also
+// implement when it can persist a fresh embedding vector alongside the
+// usual property bag (Weaviate's BackendApplier does this via
+// ApplyWithVector). The pipeline type-asserts on this interface for
+// the entry-body datom in Stage 7 so the just-embedded float32 slice
+// reaches Weaviate without forcing self-heal (which has no vector
+// available) to grow a new method on the shared BackendApplier
+// interface. Adapters that do not need the vector simply ignore it by
+// not implementing this interface; the pipeline silently falls back to
+// plain Apply for them.
+type VectorApplier interface {
+	ApplyWithVector(ctx context.Context, d datom.Datom, vector []float32) error
+}
+
 // NeighborFinder is the narrow interface the pipeline uses to pull
 // candidate neighbors for A-MEM link derivation. Production wraps a
 // Weaviate NearestNeighbors call against the just-embedded body
@@ -337,9 +351,24 @@ func (p *Pipeline) Observe(ctx context.Context, req ObserveRequest) (*ObserveRes
 		}
 	}
 	if p.Weaviate != nil {
+		// If the Weaviate applier supports the optional VectorApplier
+		// capability AND the pipeline has a fresh embedding to hand
+		// over, route the entry-body datom through ApplyWithVector so
+		// the float32 vector reaches Weaviate as part of the same
+		// Upsert that lands the body. Self-heal still uses plain
+		// Apply (it has no vector), so the per-entity scratch bag the
+		// applier maintains converges on the same property set.
+		vecApplier, vectorCapable := p.Weaviate.(VectorApplier)
 		for i := range group {
-			if err := p.Weaviate.Apply(ctx, group[i]); err != nil {
-				applyErrs = append(applyErrs, fmt.Errorf("weaviate apply %s: %w", group[i].A, err))
+			d := group[i]
+			var err error
+			if vectorCapable && len(embedding) > 0 && d.A == "body" {
+				err = vecApplier.ApplyWithVector(ctx, d, embedding)
+			} else {
+				err = p.Weaviate.Apply(ctx, d)
+			}
+			if err != nil {
+				applyErrs = append(applyErrs, fmt.Errorf("weaviate apply %s: %w", d.A, err))
 			}
 		}
 	}

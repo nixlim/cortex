@@ -462,3 +462,60 @@ type failingBackend struct {
 
 func (f *failingBackend) Name() string                           { return f.name }
 func (f *failingBackend) Apply(context.Context, datom.Datom) error { return f.err }
+
+// vectorBackend is a fakeBackend that ALSO implements VectorApplier so
+// the pipeline's Stage 7 vector-routing branch is exercised. The
+// captured vector is asserted by TestObserve_RoutesEmbeddingThroughVectorApplier.
+type vectorBackend struct {
+	fakeBackend
+	vectorCalls int
+	lastVector  []float32
+	lastDatomA  string
+}
+
+func (v *vectorBackend) ApplyWithVector(_ context.Context, d datom.Datom, vec []float32) error {
+	v.vectorCalls++
+	v.lastVector = append([]float32(nil), vec...)
+	v.lastDatomA = d.A
+	v.seen = append(v.seen, d)
+	return nil
+}
+
+// TestObserve_RoutesEmbeddingThroughVectorApplier covers CRIT-009: when
+// the Weaviate applier implements the optional VectorApplier
+// interface and the pipeline has a fresh embedding from Stage 6, the
+// entry-body datom must reach the backend via ApplyWithVector with the
+// vector attached. Non-body datoms still flow through plain Apply, and
+// the vector value end-to-end is byte-equal to the embedder's output.
+func TestObserve_RoutesEmbeddingThroughVectorApplier(t *testing.T) {
+	p, _ := newTestPipeline(t)
+	p.Embedder = &fakeEmbedder{
+		vec:    []float32{0.11, 0.22, 0.33, 0.44},
+		model:  "nomic-embed-text",
+		digest: "sha256:cafef00d",
+	}
+	vb := &vectorBackend{fakeBackend: fakeBackend{name: "weaviate"}}
+	p.Weaviate = vb
+
+	if _, err := p.Observe(context.Background(), validRequest()); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if vb.vectorCalls != 1 {
+		t.Fatalf("ApplyWithVector calls: got %d want 1", vb.vectorCalls)
+	}
+	if vb.lastDatomA != "body" {
+		t.Errorf("vector routed through datom %q, want body", vb.lastDatomA)
+	}
+	if len(vb.lastVector) != 4 ||
+		vb.lastVector[0] != 0.11 || vb.lastVector[1] != 0.22 ||
+		vb.lastVector[2] != 0.33 || vb.lastVector[3] != 0.44 {
+		t.Errorf("vector mismatch: got %v want [0.11 0.22 0.33 0.44]", vb.lastVector)
+	}
+	// The non-body datoms (kind, facet.*, encoding_at, base_activation,
+	// embedding_model_name, embedding_model_digest) must still have
+	// landed on the backend via plain Apply, so the total seen count
+	// should match the full group size.
+	if len(vb.seen) < 9 {
+		t.Errorf("backend saw %d datoms, expected >= 9 (1 vector + non-body via Apply)", len(vb.seen))
+	}
+}

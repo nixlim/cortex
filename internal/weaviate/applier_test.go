@@ -223,6 +223,87 @@ func TestDeriveUUID_StableAndWellFormed(t *testing.T) {
 	}
 }
 
+// TestApply_ReusesCachedVectorAfterApplyWithVector is the round-3
+// CRIT-009 regression guard. The write pipeline calls
+// ApplyWithVector once on the body datom (when it has the embedding
+// in hand) and then iterates the rest of the transaction group
+// through plain Apply. Without the cache, those subsequent Upserts
+// would clobber the vector with nil and the entity row would lose
+// its embedding — which is exactly the bug round 3 caught (cosine
+// rerank inert, link derivation Neighbors empty). This test asserts
+// every Upsert after the seeding ApplyWithVector still carries the
+// vector.
+func TestApply_ReusesCachedVectorAfterApplyWithVector(t *testing.T) {
+	f := &fakeUpserter{}
+	a := newBackendApplierFor(f)
+	vec := []float32{0.1, 0.2, 0.3}
+	body := datom.Datom{Tx: "T1", Op: datom.OpAdd, E: "entry:01ARZ", A: "body", V: mustRaw(t, "hello")}
+	if err := a.ApplyWithVector(context.Background(), body, vec); err != nil {
+		t.Fatalf("ApplyWithVector: %v", err)
+	}
+	kind := datom.Datom{Tx: "T1", Op: datom.OpAdd, E: "entry:01ARZ", A: "kind", V: mustRaw(t, "note")}
+	if err := a.Apply(context.Background(), kind); err != nil {
+		t.Fatalf("Apply (cached): %v", err)
+	}
+	facet := datom.Datom{Tx: "T1", Op: datom.OpAdd, E: "entry:01ARZ", A: "facet.domain", V: mustRaw(t, "auth")}
+	if err := a.Apply(context.Background(), facet); err != nil {
+		t.Fatalf("Apply (cached 2): %v", err)
+	}
+	if len(f.calls) != 3 {
+		t.Fatalf("expected 3 upserts, got %d", len(f.calls))
+	}
+	for i, c := range f.calls {
+		if len(c.vector) != 3 || c.vector[0] != 0.1 || c.vector[1] != 0.2 || c.vector[2] != 0.3 {
+			t.Errorf("call %d lost vector: got %v", i, c.vector)
+		}
+	}
+}
+
+// TestApply_NilVectorWithoutCacheStillUpserts verifies that an Apply
+// for an entity that was never vectored still flows through (with
+// nil vector). This is the self-heal / replay path: a fresh applier
+// processing a log full of property datoms should not block on the
+// missing vector.
+func TestApply_NilVectorWithoutCacheStillUpserts(t *testing.T) {
+	f := &fakeUpserter{}
+	a := newBackendApplierFor(f)
+	d := datom.Datom{Tx: "T1", Op: datom.OpAdd, E: "entry:01ARZ", A: "body", V: mustRaw(t, "hello")}
+	if err := a.Apply(context.Background(), d); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(f.calls) != 1 {
+		t.Fatalf("expected 1 upsert, got %d", len(f.calls))
+	}
+	if f.calls[0].vector != nil {
+		t.Errorf("expected nil vector, got %v", f.calls[0].vector)
+	}
+}
+
+// TestApplyWithVector_RefreshReplacesCachedVector verifies that a
+// second ApplyWithVector with a different vector replaces the cache
+// (re-embeds win). Without this property a model_rebind on an
+// entity would silently keep serving the old vector.
+func TestApplyWithVector_RefreshReplacesCachedVector(t *testing.T) {
+	f := &fakeUpserter{}
+	a := newBackendApplierFor(f)
+	d := datom.Datom{Tx: "T1", Op: datom.OpAdd, E: "entry:01ARZ", A: "body", V: mustRaw(t, "hello")}
+	if err := a.ApplyWithVector(context.Background(), d, []float32{0.1, 0.2}); err != nil {
+		t.Fatalf("ApplyWithVector v1: %v", err)
+	}
+	if err := a.ApplyWithVector(context.Background(), d, []float32{0.9, 0.8}); err != nil {
+		t.Fatalf("ApplyWithVector v2: %v", err)
+	}
+	// Subsequent Apply must see the v2 vector, not v1.
+	d2 := datom.Datom{Tx: "T1", Op: datom.OpAdd, E: "entry:01ARZ", A: "kind", V: mustRaw(t, "note")}
+	if err := a.Apply(context.Background(), d2); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	last := f.calls[len(f.calls)-1].vector
+	if len(last) != 2 || last[0] != 0.9 || last[1] != 0.8 {
+		t.Errorf("expected v2 vector reused, got %v", last)
+	}
+}
+
 func TestForget_DropsScratchState(t *testing.T) {
 	f := &fakeUpserter{}
 	a := newBackendApplierFor(f)
