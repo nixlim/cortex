@@ -1,55 +1,73 @@
 // cmd/cortex/staging_backends.go is the live StagingBackends used by
 // `cortex rebuild`. It replaces the no-op stubStagingBackends in
-// rebuild.go (CRIT-001 fix per docs/spec/cortex-spec-code-review.md).
+// rebuild.go (CRIT-001 + MAJ-008 fixes per
+// docs/spec/cortex-spec-code-review.md).
 //
 // Scope of "real" today:
 //
 //   - Create / Cleanup hit Neo4j for real and write/clear nodes under
-//     a dedicated :CortexStaging label, so the active graph (which is
-//     unlabeled or carries the live label set the write pipeline uses)
-//     is never touched.
+//     a dedicated :CortexStaging label, so the active graph (which
+//     uses the live label set the write pipeline writes — :Entry,
+//     :Frame, :Subject, :Trail, :Community, :PSI) is never touched
+//     during the staging phase.
 //
 //   - ApplyDatom translates each replayed datom into a Cypher MERGE
 //     against a :CortexStaging node keyed by the datom's entity id,
-//     setting the attribute name as a property and the JSON-encoded
-//     value as another property. This is intentionally a flat mirror
-//     rather than a structural translation: the goal is to prove the
-//     rebuild loop touches a real backend with the actual datom shape,
-//     not to reach perfect parity with the live write pipeline's
-//     graph schema (which is a separate, larger bead).
+//     setting each datom attribute as a real property on the staging
+//     node so the bag of properties accumulates per entity instead of
+//     being overwritten on every call. The translation mirrors
+//     internal/neo4j/applier.go (cypherProperty rewrite, OpRetract
+//     REMOVEs the property) so the staging mirror is structurally
+//     promotable in Swap.
 //
-//   - ApplyEmbedding stores the float32 vector as a property string
-//     on the matching staging node. We don't use Weaviate's vector
-//     index here yet — see the staging-Weaviate follow-up note below.
+//   - ApplyEmbedding stores a small fingerprint of the float32 vector
+//     (dim, first, last) on the matching staging node so cortex doctor
+//     can verify a re-embed happened. The full vector is *not* held
+//     in :CortexStaging because the graph is not the right home for
+//     it; a true Weaviate-staging adapter is the follow-up bead and
+//     is documented in the Swap doc comment below.
 //
-//   - Swap returns a clear NOT_IMPLEMENTED operational error. Atomic
-//     promotion of staging to active requires (a) a Weaviate-side
-//     staging class with a documented swap dance and (b) a graph
-//     reconciliation step that the rebuild package contract permits
-//     but does not yet exercise. Both are tracked as follow-up beads.
-//     The honest minimum the team-lead asked for in the round-1 grill
-//     review was: "if full swap semantics aren't ready, at minimum
-//     implement ApplyDatom that actually writes something to the real
-//     backends in a separate staging namespace." That is what this
-//     adapter delivers.
+//   - Swap promotes the :CortexStaging mirror to the live label set
+//     in a deterministic order. Cypher does not allow dynamic labels
+//     so the promotion walks a static (prefix → live label) map and
+//     issues one (demote, promote) statement pair per prefix. The
+//     demote step DETACH-deletes any live node whose id collides with
+//     a staging entity for that prefix; the promote step relabels the
+//     staging node in place (`SET s:Entry`, `REMOVE s:CortexStaging`,
+//     and renames `entity` → `id`). After all known prefixes have
+//     been promoted, a catch-all promotes any remaining staging node
+//     under :CortexEntity so a malformed log row is never silently
+//     dropped, and the rebuild marker is removed last so cortex doctor
+//     can confirm a successful swap by absence.
 //
-// Staging-Weaviate follow-up note: a true rebuild must also stage a
-// fresh Weaviate Entry/Frame class so vector retrieval is rebuilt
-// alongside the graph. That work is intentionally out of scope of
-// the CRIT-001 minimum because it requires schema additions to
-// internal/weaviate (ClassEntryStaging, EnsureStagingSchema, a
-// safe DeleteClass) plus an end-to-end staging-class swap. The
-// errStagingSwapNotWired sentinel surfaces that gap to the operator
-// instead of silently succeeding.
+// Atomicity caveat. The promotion plan is multi-statement; each
+// WriteEntries call is its own Bolt transaction. A failure midway
+// leaves the graph in a half-promoted state with both :CortexStaging
+// and live nodes coexisting. The rebuild package's Cleanup is the
+// recovery path: it DETACH-deletes everything still labelled
+// :CortexStaging, which is the safe direction for a half-swap (the
+// already-promoted live nodes survive; the still-staged ones go
+// back to "needs rebuild"). A truly atomic swap requires a single
+// multi-statement transaction with explicit BEGIN/COMMIT — that is
+// blocked on the BoltClient gaining a transactional execution seam
+// and is tracked as a follow-up bead.
+//
+// Weaviate-side staging is intentionally out of scope of this fix:
+// the Weaviate write pipeline targets the live ClassEntry/ClassFrame
+// directly, and the rebuild loop calls ApplyEmbedding (graph-only).
+// A full rebuild that also re-vectorizes the corpus needs a staging
+// class, a class-swap dance, and a copy-on-success step in
+// internal/weaviate. That work is deferred to the staging-Weaviate
+// adapter bead; the spec acceptance criteria SC-002/SC-019/SC-020
+// are satisfied for the graph dimension by this commit.
 package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/nixlim/cortex/internal/datom"
-	"github.com/nixlim/cortex/internal/errs"
 	"github.com/nixlim/cortex/internal/neo4j"
 )
 
@@ -58,15 +76,21 @@ import (
 // active graph is invisibly partitioned from staging.
 const stagingLabel = "CortexStaging"
 
-// errStagingSwapNotWired is the sentinel returned by Swap. It is
-// surfaced to the operator as STAGING_SWAP_NOT_WIRED so the rebuild
-// CLI can render a precise next-step message instead of the generic
-// "STAGING_SWAP_FAILED" the rebuild package would otherwise emit.
-var errStagingSwapNotWired = errors.New(
-	"rebuild swap is not yet wired: this build can populate the staging " +
-		"namespace but cannot atomically promote it to active. Inspect the " +
-		":CortexStaging nodes via `cypher-shell` and rerun once the " +
-		"staging-Weaviate adapter lands")
+// stagingPromotions is the static (prefix → live label) map Swap
+// walks. The order is deterministic so the resulting Cypher trace is
+// reproducible across runs (helpful when debugging a half-swap from
+// the operational logs).
+var stagingPromotions = []struct {
+	prefix string
+	label  string
+}{
+	{"entry:", "Entry"},
+	{"frame:", "Frame"},
+	{"subject:", "Subject"},
+	{"trail:", "Trail"},
+	{"community:", "Community"},
+	{"psi:", "PSI"},
+}
 
 // realStagingBackends is the live StagingBackends implementation. It
 // holds a single neo4j.Client (typed as the interface so tests can
@@ -121,40 +145,54 @@ func (s *realStagingBackends) Create(ctx context.Context) error {
 }
 
 // ApplyDatom mirrors one datom into the staging namespace. We MERGE
-// the staging node by entity id (so multiple datoms touching the
-// same entity collapse onto one node) and set the datom's attribute
-// as a Cypher property. The value is stored as the raw JSON string
-// the datom carries — staging is a flat mirror, not a typed graph,
-// because the goal is to prove the loop touches a real backend with
-// the actual datom shape.
+// the staging node by entity id (so multiple datoms touching the same
+// entity collapse onto one node) and set the datom attribute as a
+// real Cypher property — not a flat last_attribute slot — so the
+// staging bag accumulates the full per-entity property set the way
+// the live BackendApplier would. Swap relies on this shape: a
+// promotion that just relabels the node lifts the entire property
+// bag in one step.
+//
+// OpRetract REMOVEs the property to match the live applier semantics
+// (Cortex never deletes from history, but the live state should not
+// observe a stale assertion).
 //
 // Datoms with an empty entity id (a malformed log row) are skipped
 // rather than failing the run. The replay loop guards against this
 // case earlier in the rebuild package; we mirror that tolerance so
-// a single malformed datom does not abort an otherwise-clean
-// rebuild.
+// a single malformed datom does not abort an otherwise-clean rebuild.
 func (s *realStagingBackends) ApplyDatom(ctx context.Context, d datom.Datom) error {
 	if d.E == "" {
 		return nil
 	}
-	// Use string keys derived from the datom attribute name. We
-	// pass the value as a JSON string ([]byte → string) because
-	// json.RawMessage round-trips through the Bolt driver as
-	// []byte and most Neo4j Phase 1 indexes are string-based.
+	prop := stagingProperty(d.A)
+	if d.Op == datom.OpRetract {
+		cypher := fmt.Sprintf(
+			"MERGE (n:%s {entity: $entity}) "+
+				"REMOVE n.%s "+
+				"SET n.last_op = $op, n.last_tx = $tx",
+			stagingLabel, prop,
+		)
+		if err := s.graph.WriteEntries(ctx, cypher, map[string]any{
+			"entity": d.E,
+			"op":     string(d.Op),
+			"tx":     d.Tx,
+		}); err != nil {
+			return fmt.Errorf("staging: retract %s/%s: %w", d.E, d.A, err)
+		}
+		s.applied++
+		return nil
+	}
 	cypher := fmt.Sprintf(
 		"MERGE (n:%s {entity: $entity}) "+
-			"SET n.last_attribute = $attribute, "+
-			"    n.last_value = $value, "+
-			"    n.last_op = $op, "+
-			"    n.last_tx = $tx",
-		stagingLabel,
+			"SET n.%s = $value, n.last_op = $op, n.last_tx = $tx",
+		stagingLabel, prop,
 	)
 	params := map[string]any{
-		"entity":    d.E,
-		"attribute": d.A,
-		"value":     string(d.V),
-		"op":        string(d.Op),
-		"tx":        d.Tx,
+		"entity": d.E,
+		"value":  string(d.V),
+		"op":     string(d.Op),
+		"tx":     d.Tx,
 	}
 	if err := s.graph.WriteEntries(ctx, cypher, params); err != nil {
 		return fmt.Errorf("staging: apply datom %s/%s: %w", d.E, d.A, err)
@@ -195,18 +233,87 @@ func (s *realStagingBackends) ApplyEmbedding(ctx context.Context, entryID string
 	return nil
 }
 
-// Swap is the explicit gap. Returning errStagingSwapNotWired causes
-// rebuild.Run to surface STAGING_SWAP_FAILED with this sentinel as
-// the cause; the CLI catches it in renderRebuildError and prints the
-// precise next-step message.
-func (s *realStagingBackends) Swap(_ context.Context) error {
-	return errStagingSwapNotWired
+// Swap promotes the :CortexStaging mirror to the live label set. See
+// the file-level doc comment for the atomicity caveat and the per-
+// prefix walk rationale.
+func (s *realStagingBackends) Swap(ctx context.Context) error {
+	for _, p := range stagingPromotions {
+		if err := s.demoteLive(ctx, p.prefix, p.label); err != nil {
+			return err
+		}
+		if err := s.promoteStaging(ctx, p.prefix, p.label); err != nil {
+			return err
+		}
+	}
+	// Catch-all: any remaining :CortexStaging node that didn't match
+	// a known prefix is promoted under :CortexEntity so the loop
+	// never silently drops a row.
+	catchAll := fmt.Sprintf(
+		"MATCH (s:%s) "+
+			"WHERE NOT s:CortexStagingMarker "+
+			"SET s:CortexEntity, s.id = s.entity "+
+			"REMOVE s:%s, s.entity",
+		stagingLabel, stagingLabel,
+	)
+	if err := s.graph.WriteEntries(ctx, catchAll, nil); err != nil {
+		return fmt.Errorf("staging: promote fallback :CortexEntity: %w", err)
+	}
+	// Drop the rebuild marker last so doctor can confirm a successful
+	// swap by absence of any :CortexStagingMarker node.
+	dropMarker := "MATCH (m:CortexStagingMarker) DETACH DELETE m"
+	if err := s.graph.WriteEntries(ctx, dropMarker, nil); err != nil {
+		return fmt.Errorf("staging: drop marker: %w", err)
+	}
+	return nil
+}
+
+// demoteLive removes any live nodes whose id collides with a staging
+// entity for the given prefix, so the subsequent promotion does not
+// produce a duplicate id. We delete the old live node rather than
+// merging properties because the rebuild semantics are "the staging
+// mirror is the new authoritative state" — anything in the live node
+// that wasn't reproduced by replay is by definition divergent and
+// should not survive the swap.
+func (s *realStagingBackends) demoteLive(ctx context.Context, prefix, label string) error {
+	cypher := fmt.Sprintf(
+		"MATCH (s:%s) "+
+			"WHERE s.entity STARTS WITH $prefix AND NOT s:CortexStagingMarker "+
+			"WITH collect(s.entity) AS ids "+
+			"MATCH (live:%s) WHERE live.id IN ids "+
+			"DETACH DELETE live",
+		stagingLabel, label,
+	)
+	if err := s.graph.WriteEntries(ctx, cypher, map[string]any{"prefix": prefix}); err != nil {
+		return fmt.Errorf("staging: demote live :%s: %w", label, err)
+	}
+	return nil
+}
+
+// promoteStaging relabels matching staging nodes in place: it adds
+// the live label, drops the staging label, and renames the `entity`
+// property to `id` so the live read path (which keys on `id`) finds
+// them. Cypher does not allow dynamic labels so the live label is
+// formatted into the Cypher string at construction time.
+func (s *realStagingBackends) promoteStaging(ctx context.Context, prefix, label string) error {
+	cypher := fmt.Sprintf(
+		"MATCH (s:%s) "+
+			"WHERE s.entity STARTS WITH $prefix AND NOT s:CortexStagingMarker "+
+			"SET s:%s, s.id = s.entity "+
+			"REMOVE s:%s, s.entity",
+		stagingLabel, label, stagingLabel,
+	)
+	if err := s.graph.WriteEntries(ctx, cypher, map[string]any{"prefix": prefix}); err != nil {
+		return fmt.Errorf("staging: promote staging :%s: %w", label, err)
+	}
+	return nil
 }
 
 // Cleanup removes every staging node so an aborted rebuild does not
 // leave the graph littered. The rebuild package calls Cleanup on
 // every error path *after* Create, so this is the safety net for
-// any failure between Create and Swap.
+// any failure between Create and Swap. After a successful Swap, the
+// promote step has already removed the :CortexStaging label from
+// every node we created, so this query is a no-op.
 func (s *realStagingBackends) Cleanup(ctx context.Context) error {
 	clear := fmt.Sprintf("MATCH (n:%s) DETACH DELETE n", stagingLabel)
 	if err := s.graph.WriteEntries(ctx, clear, nil); err != nil {
@@ -215,19 +322,30 @@ func (s *realStagingBackends) Cleanup(ctx context.Context) error {
 	return nil
 }
 
-// classifyStagingError is a helper for the rebuild CLI: it inspects
-// an error returned from rebuild.Run and, if it traces back to the
-// staging-swap gap, rewrites it into a precise STAGING_SWAP_NOT_WIRED
-// envelope. Other errors pass through unchanged.
-func classifyStagingError(err error) error {
-	if err == nil {
-		return nil
+// stagingProperty rewrites a datom attribute name into a safe Cypher
+// property identifier. Mirrors internal/neo4j/applier.go's
+// cypherProperty so the promote step doesn't need a translation
+// table at swap time.
+func stagingProperty(a string) string {
+	if a == "" {
+		return "value"
 	}
-	if errors.Is(err, errStagingSwapNotWired) {
-		return errs.Operational("STAGING_SWAP_NOT_WIRED",
-			"rebuild populated the :CortexStaging namespace but cannot atomically "+
-				"promote it to active in this build; staging-Weaviate adapter is the "+
-				"follow-up bead", err)
+	var b strings.Builder
+	b.Grow(len(a))
+	for i, r := range a {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r == '_':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			if i == 0 {
+				b.WriteByte('_')
+			}
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
 	}
-	return err
+	return b.String()
 }

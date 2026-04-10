@@ -5,10 +5,10 @@
 //   - constructs an ollama-backed DigestSource so the pinned-model
 //     drift check uses the live model digest
 //   - constructs a real, Neo4j-backed StagingBackends (see
-//     staging_backends.go). The staging-Weaviate side and the
-//     atomic-promotion swap are explicit follow-ups; the swap path
-//     surfaces a precise STAGING_SWAP_NOT_WIRED operational error
-//     instead of pretending success.
+//     staging_backends.go). The staging-Weaviate side is an explicit
+//     follow-up; the graph staging path now performs a real promote-
+//     in-place swap (MAJ-008 fix) so SC-002/SC-019/SC-020 are
+//     satisfied for the graph dimension.
 //   - calls rebuild.Run and renders the result
 //
 // Replaces the notImplemented stub in commands.go and the no-op
@@ -18,7 +18,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
@@ -125,13 +124,6 @@ func newRebuildCmdReal() *cobra.Command {
 
 			res, err := rebuild.Run(cmd.Context(), runCfg)
 			if err != nil {
-				// rebuild wraps Swap failures in STAGING_SWAP_FAILED;
-				// rewrite the staging-not-wired sentinel into a more
-				// precise envelope so the operator sees the real next
-				// step instead of the generic "swap failed" header.
-				if errors.Is(err, errStagingSwapNotWired) {
-					return emitAndExit(cmd, classifyStagingError(err), jsonFlag)
-				}
 				return emitAndExit(cmd, err, jsonFlag)
 			}
 			if jsonFlag {

@@ -92,6 +92,16 @@ type BackendApplier interface {
 	Apply(ctx context.Context, d datom.Datom) error
 }
 
+// NeighborFinder is the narrow interface the pipeline uses to pull
+// candidate neighbors for A-MEM link derivation. Production wraps a
+// Weaviate NearestNeighbors call against the just-embedded body
+// vector; tests supply a fake. The candidates returned must already
+// carry the cortex_id and cosine similarity in the shape DeriveLinks
+// expects.
+type NeighborFinder interface {
+	Neighbors(ctx context.Context, vector []float32, k int) ([]LinkCandidate, error)
+}
+
 // Pipeline orchestrates a single write. Zero values are not usable
 // for real writes — at minimum a LogAppender and a clock source must
 // be supplied — but tests that exercise only the validation stages
@@ -129,6 +139,31 @@ type Pipeline struct {
 	// warning.
 	Neo4j    BackendApplier
 	Weaviate BackendApplier
+
+	// Neighbors is the optional nearest-neighbor source used during
+	// A-MEM link derivation (FR-011 / cortex-4kq.41). When nil, the
+	// pipeline skips the link derivation pass entirely. Production
+	// wires this to a Weaviate-backed adapter; tests can drop in a
+	// fake.
+	Neighbors NeighborFinder
+
+	// LinkProposer is the LLM-backed link scorer. When nil, the
+	// pipeline skips link derivation regardless of Neighbors. The
+	// proposer's Propose method is called outside the log flock so
+	// AC4 ("link derivation runs as a separate transaction group")
+	// holds by construction.
+	LinkProposer LinkProposer
+
+	// LinkConfig holds the confidence and cosine floors enforced by
+	// DeriveLinks. The zero value is intentionally strict (nothing
+	// passes) so a caller that forgets to populate it emits zero
+	// links rather than flooding the graph.
+	LinkConfig LinkDerivationConfig
+
+	// LinkTopK is the number of nearest neighbors to ask the
+	// NeighborFinder for. A zero or negative value disables link
+	// derivation. Production callers pass 5 per the A-MEM defaults.
+	LinkTopK int
 
 	// Now returns the wall-clock timestamp used in every datom's Ts
 	// field. Tests pin it to make datom content deterministic.
@@ -301,14 +336,59 @@ func (p *Pipeline) Observe(ctx context.Context, req ObserveRequest) (*ObserveRes
 			}
 		}
 	}
-	// Embedding is held as an attribute of the pipeline result even
-	// though this phase-1 pipeline does not yet attach it to a
-	// separate vector row; cortex-4kq.41 (A-MEM link scoring) will
-	// consume it from a neighbouring pipeline invocation. Silencing
-	// the unused-variable warning here keeps the seam obvious.
-	_ = embedding
+	// --- Stage 8: A-MEM link derivation (FR-011 / cortex-4kq.41).
+	// This stage runs ONLY after the main append flock has been
+	// released (Stage 6) and after the backend apply phase, so the
+	// links.go AC4 invariant ("link derivation executes outside the
+	// log flock") holds by construction. Every failure mode here is
+	// swallowed: a missing neighbor source, an embedding-less write,
+	// a Weaviate hiccup, an unparseable LLM response, or even a
+	// failed second log append must NOT roll back the source entry
+	// the user already saw committed.
+	if p.LinkProposer != nil && p.Neighbors != nil && p.LinkTopK > 0 && len(embedding) > 0 {
+		p.deriveAndAppendLinks(ctx, entryID, req.Body, embedding, now)
+	}
 
 	return result, nil
+}
+
+// deriveAndAppendLinks runs the post-commit A-MEM scoring pass and
+// appends accepted link datoms as a SEPARATE transaction group. All
+// errors are swallowed: link derivation is best-effort and must never
+// affect the source entry's committed state. The function still takes
+// p.Log for the second Append, but the call happens after Stage 6 has
+// returned, so the flock has already been released.
+func (p *Pipeline) deriveAndAppendLinks(ctx context.Context, entryID, sourceBody string, embedding []float32, now func() time.Time) {
+	candidates, err := p.Neighbors.Neighbors(ctx, embedding, p.LinkTopK)
+	if err != nil || len(candidates) == 0 {
+		return
+	}
+	// Filter the just-written entry out of its own neighbor set —
+	// Weaviate will happily return it as the top hit otherwise.
+	filtered := candidates[:0]
+	for _, c := range candidates {
+		if c.TargetEntryID == "" || c.TargetEntryID == entryID {
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	if len(filtered) == 0 {
+		return
+	}
+	accepted := DeriveLinks(ctx, p.LinkProposer, sourceBody, filtered, p.LinkConfig)
+	if len(accepted) == 0 {
+		return
+	}
+	linkTx := ulid.Make().String()
+	linkTs := now().UTC().Format(time.RFC3339Nano)
+	linkGroup, err := BuildLinkDatoms(entryID, linkTx, linkTs, p.Actor, p.InvocationID, accepted)
+	if err != nil || len(linkGroup) == 0 {
+		return
+	}
+	if p.Log == nil {
+		return
+	}
+	_, _ = p.Log.Append(linkGroup)
 }
 
 // validateFacets enforces the spec-mandated facet keys. Every observe
