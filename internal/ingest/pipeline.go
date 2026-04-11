@@ -32,8 +32,10 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nixlim/cortex/internal/errs"
@@ -181,17 +183,54 @@ type ModuleError struct {
 
 // Pipeline orchestrates one cortex ingest invocation.
 type Pipeline struct {
-	Walker         WalkerFunc // nil → real walker.Walk
-	Matrix         languages.Matrix
-	Summarizer     Summarizer
-	Writer         EntryWriter
-	TrailAppender  TrailAppender
-	StateStore     StateStore
-	PostReflect    PostReflect
-	Now            func() time.Time
-	Logger         walker.Logger
-	Concurrency    int
+	Walker          WalkerFunc // nil → real walker.Walk
+	Matrix          languages.Matrix
+	Summarizer      Summarizer
+	Writer          EntryWriter
+	TrailAppender   TrailAppender
+	StateStore      StateStore
+	PostReflect     PostReflect
+	Now             func() time.Time
+	Logger          walker.Logger
+	Concurrency     int
 	SkipPostReflect bool // honored when true; otherwise DefaultPostIngestReflect
+	// Progress is an optional per-module completion callback. nil =
+	// silent (preserves Phase 1 behavior). When set, Ingest invokes
+	// it from the worker goroutine exactly once per module after all
+	// summarize + write work for that module has completed, passing a
+	// ProgressEvent with a monotonic DoneCount relative to TotalCount.
+	// Callback code should be cheap; it runs inline on the worker
+	// goroutine and blocks the slot until it returns. See cortex-so5.
+	Progress func(ProgressEvent)
+}
+
+// ProgressEvent carries one per-module completion signal from the
+// ingest pipeline to a Progress callback. Fields:
+//
+//   - ModuleID / Language:        identify the module
+//   - FileCount / ByteCount:      module source size fed to the summarizer
+//   - Elapsed:                    wall-clock from Summarize call start to
+//                                 the end of the write step (or to the
+//                                 failure point, if Err != nil)
+//   - Err:                        nil on success, the specific error
+//                                 returned by the summarizer or writer
+//                                 otherwise. Matches the ModuleError
+//                                 that would be attached to Result
+//                                 for the same module.
+//   - DoneCount / TotalCount:     monotonic progress against the todo
+//                                 set. DoneCount is incremented under
+//                                 an atomic counter so two concurrent
+//                                 workers never see the same value.
+//                                 TotalCount is len(todo) for this run.
+type ProgressEvent struct {
+	ModuleID   string
+	Language   languages.Language
+	FileCount  int
+	ByteCount  int64
+	Elapsed    time.Duration
+	Err        error
+	DoneCount  int
+	TotalCount int
 }
 
 // WalkerFunc is the seam used by tests to replace the filesystem
@@ -277,6 +316,11 @@ func (p *Pipeline) Ingest(ctx context.Context, req Request) (*Result, error) {
 	}
 	sem := make(chan struct{}, p.Concurrency)
 	out := make([]moduleResult, len(todo))
+	totalCount := len(todo)
+	// doneCount is an atomic monotonic counter so every ProgressEvent
+	// that fires from the worker pool sees a distinct DoneCount value.
+	// It is incremented right before the callback is invoked.
+	var doneCount int64
 	var wg sync.WaitGroup
 	for i := range todo {
 		i := i
@@ -286,6 +330,43 @@ func (p *Pipeline) Ingest(ctx context.Context, req Request) (*Result, error) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			// Measure both the wall-clock elapsed time and the source
+			// byte count for the Progress callback. Stat'ing the files
+			// up-front is cheap compared to the summarizer call and
+			// reports the actual module size (not what the summarizer
+			// elected to trim). A single failed stat just contributes
+			// zero bytes for that file — the ProgressEvent is still
+			// emitted.
+			start := p.Now()
+			var byteCount int64
+			for _, f := range m.Files {
+				if st, err := os.Stat(f.AbsPath); err == nil {
+					byteCount += st.Size()
+				}
+			}
+
+			// emitProgress fires the callback (if set) with the
+			// current module's outcome. Safe to call exactly once per
+			// worker. The monotonic counter bump happens here so the
+			// user-visible DoneCount is "number of modules that have
+			// finished so far" at the moment the line is printed.
+			emitProgress := func(mErr error) {
+				if p.Progress == nil {
+					return
+				}
+				next := atomic.AddInt64(&doneCount, 1)
+				p.Progress(ProgressEvent{
+					ModuleID:   m.ID,
+					Language:   m.Language,
+					FileCount:  len(m.Files),
+					ByteCount:  byteCount,
+					Elapsed:    p.Now().Sub(start),
+					Err:        mErr,
+					DoneCount:  int(next),
+					TotalCount: totalCount,
+				})
+			}
+
 			body, sErr := p.Summarizer.Summarize(ctx, SummaryRequest{
 				ProjectName: req.ProjectName,
 				Module:      m,
@@ -296,6 +377,7 @@ func (p *Pipeline) Ingest(ctx context.Context, req Request) (*Result, error) {
 					Reason:   "SUMMARIZER_FAILED",
 					Err:      sErr,
 				}}
+				emitProgress(sErr)
 				return
 			}
 			if body == "" {
@@ -303,10 +385,12 @@ func (p *Pipeline) Ingest(ctx context.Context, req Request) (*Result, error) {
 					ModuleID: m.ID,
 					Reason:   "SUMMARIZER_EMPTY",
 				}}
+				emitProgress(fmt.Errorf("SUMMARIZER_EMPTY"))
 				return
 			}
 			if req.DryRun {
 				out[i] = moduleResult{module: m, entryID: "dry-run:" + m.ID}
+				emitProgress(nil)
 				return
 			}
 			entryID, wErr := p.Writer.WriteModule(ctx, EntryRequest{
@@ -321,9 +405,11 @@ func (p *Pipeline) Ingest(ctx context.Context, req Request) (*Result, error) {
 					Reason:   "WRITE_FAILED",
 					Err:      wErr,
 				}}
+				emitProgress(wErr)
 				return
 			}
 			out[i] = moduleResult{module: m, entryID: entryID}
+			emitProgress(nil)
 		}()
 	}
 	wg.Wait()

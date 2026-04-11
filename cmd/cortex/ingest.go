@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -45,6 +46,7 @@ import (
 	"github.com/nixlim/cortex/internal/log"
 	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/ollama"
+	"github.com/nixlim/cortex/internal/opslog"
 	"github.com/nixlim/cortex/internal/prompts"
 	"github.com/nixlim/cortex/internal/psi"
 	"github.com/nixlim/cortex/internal/security/secrets"
@@ -63,6 +65,7 @@ func newIngestCmdReal() *cobra.Command {
 		dryRun   bool
 		resume   bool
 		jsonFlag bool
+		quiet    bool
 	)
 	cmd := &cobra.Command{
 		Use:   "ingest <path>",
@@ -91,6 +94,8 @@ func newIngestCmdReal() *cobra.Command {
 			}
 			defer cleanup()
 
+			pipeline.Progress = newIngestProgressReporter(cmd.ErrOrStderr(), quiet)
+
 			res, err := pipeline.Ingest(cmd.Context(), ingest.Request{
 				ProjectRoot: args[0],
 				ProjectName: project,
@@ -109,6 +114,7 @@ func newIngestCmdReal() *cobra.Command {
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "walk + summarize without writing entries")
 	cmd.Flags().BoolVar(&resume, "resume", false, "resume an earlier interrupted run (same as a plain re-run)")
 	cmd.Flags().BoolVar(&jsonFlag, "json", false, "emit machine-readable JSON output")
+	cmd.Flags().BoolVar(&quiet, "quiet", false, "suppress per-module stderr progress lines")
 
 	cmd.AddCommand(newIngestStatusCmd())
 	cmd.AddCommand(newIngestResumeCmd())
@@ -180,6 +186,7 @@ func newIngestResumeCmd() *cobra.Command {
 	var (
 		project  string
 		jsonFlag bool
+		quiet    bool
 	)
 	cmd := &cobra.Command{
 		Use:   "resume <path>",
@@ -204,6 +211,8 @@ func newIngestResumeCmd() *cobra.Command {
 			}
 			defer cleanup()
 
+			pipeline.Progress = newIngestProgressReporter(cmd.ErrOrStderr(), quiet)
+
 			res, err := pipeline.Ingest(cmd.Context(), ingest.Request{
 				ProjectRoot: args[0],
 				ProjectName: project,
@@ -217,7 +226,70 @@ func newIngestResumeCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&project, "project", "", "required project name")
 	cmd.Flags().BoolVar(&jsonFlag, "json", false, "emit machine-readable JSON output")
+	cmd.Flags().BoolVar(&quiet, "quiet", false, "suppress per-module stderr progress lines")
 	return cmd
+}
+
+// newIngestProgressReporter builds an ingest.Pipeline Progress callback
+// that prints a single stderr line per module completion and, when an
+// ops.log writer is available, also writes a structured INGEST_MODULE_DONE
+// record through internal/opslog. When quiet is true the stderr side is
+// silenced but the opslog side still fires — the assumption is that
+// operators who set --quiet still want durable structured telemetry.
+// See cortex-so5.
+func newIngestProgressReporter(stderr io.Writer, quiet bool) func(ingest.ProgressEvent) {
+	opsWriter := tryOpenOpsLogWriter()
+	return func(ev ingest.ProgressEvent) {
+		if !quiet {
+			tag := "ok  "
+			if ev.Err != nil {
+				tag = "fail"
+			}
+			fmt.Fprintf(stderr,
+				"[%3d/%-3d] %s  %-8s  %s  (%4.1fs, %dB)\n",
+				ev.DoneCount, ev.TotalCount, tag,
+				ev.Language, ev.ModuleID,
+				ev.Elapsed.Seconds(), ev.ByteCount)
+			if ev.Err != nil {
+				fmt.Fprintf(stderr, "           error: %v\n", ev.Err)
+			}
+		}
+		if opsWriter != nil {
+			level := opslog.LevelInfo
+			errStr := ""
+			if ev.Err != nil {
+				level = opslog.LevelError
+				errStr = ev.Err.Error()
+			}
+			_ = opsWriter.Write(opslog.Event{
+				Level:     level,
+				Component: "ingest",
+				Message: fmt.Sprintf("INGEST_MODULE_DONE module=%s lang=%s done=%d total=%d elapsed_ms=%d bytes=%d",
+					ev.ModuleID, ev.Language, ev.DoneCount, ev.TotalCount, ev.Elapsed.Milliseconds(), ev.ByteCount),
+				Error: errStr,
+			})
+		}
+	}
+}
+
+// tryOpenOpsLogWriter opens ~/.cortex/ops.log through the internal/opslog
+// writer and returns nil on any failure (no home dir, no permission, bad
+// config). The ingest CLI treats opslog as best-effort telemetry: if the
+// file cannot be opened, per-module progress still prints to stderr and
+// the run proceeds.
+func tryOpenOpsLogWriter() *opslog.Writer {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	w, err := opslog.New(opslog.Options{
+		Path:         filepath.Join(home, ".cortex", "ops.log"),
+		InvocationID: ulid.Make().String(),
+	})
+	if err != nil {
+		return nil
+	}
+	return w
 }
 
 // loadIngestConfig centralizes the config load + segment dir expansion

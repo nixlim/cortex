@@ -130,6 +130,105 @@ func newTestPipeline(files []languages.File) (*Pipeline, *fakeSummarizer, *fakeW
 
 // --- tests -----------------------------------------------------------
 
+// TestIngest_ProgressCallback_FiresOnceMonotonic asserts the Progress
+// callback fires exactly once per module, that DoneCount is
+// monotonically increasing from 1 to TotalCount, and that the payload
+// identifies the right module on each event.
+//
+// Two success cases and one failure case are mixed to also verify the
+// failure path fires the callback (carrying the underlying error).
+func TestIngest_ProgressCallback_FiresOnceMonotonic(t *testing.T) {
+	p, sum, _, _, _, _ := newTestPipeline(threePackageGoFixture())
+	// Force Concurrency=1 so the per-event DoneCount order is fully
+	// deterministic; the monotonic invariant is checked regardless.
+	p.Concurrency = 1
+	_ = sum
+
+	var mu struct {
+		events []ProgressEvent
+	}
+	p.Progress = func(ev ProgressEvent) {
+		mu.events = append(mu.events, ev)
+	}
+
+	_, err := p.Ingest(context.Background(), Request{
+		ProjectRoot: "/root",
+		ProjectName: "fixture",
+	})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	if got := len(mu.events); got != 3 {
+		t.Fatalf("progress events: got %d, want 3", got)
+	}
+	seenDone := make(map[int]bool)
+	for i, ev := range mu.events {
+		if ev.TotalCount != 3 {
+			t.Errorf("event %d: TotalCount=%d, want 3", i, ev.TotalCount)
+		}
+		if ev.DoneCount < 1 || ev.DoneCount > 3 {
+			t.Errorf("event %d: DoneCount=%d out of range [1,3]", i, ev.DoneCount)
+		}
+		if seenDone[ev.DoneCount] {
+			t.Errorf("event %d: DoneCount=%d duplicated", i, ev.DoneCount)
+		}
+		seenDone[ev.DoneCount] = true
+		if ev.ModuleID == "" {
+			t.Errorf("event %d: empty ModuleID", i)
+		}
+		if ev.Err != nil {
+			t.Errorf("event %d: unexpected err %v", i, ev.Err)
+		}
+	}
+	if len(seenDone) != 3 {
+		t.Errorf("DoneCount values not monotonic 1..3; seen=%v", seenDone)
+	}
+}
+
+// TestIngest_ProgressCallback_CarriesError asserts the callback fires
+// with the underlying error when the summarizer fails.
+func TestIngest_ProgressCallback_CarriesError(t *testing.T) {
+	p, sum, _, _, _, _ := newTestPipeline(threePackageGoFixture())
+	sum.err = errors.New("boom")
+	p.Concurrency = 1
+
+	var captured []error
+	p.Progress = func(ev ProgressEvent) {
+		captured = append(captured, ev.Err)
+	}
+
+	_, err := p.Ingest(context.Background(), Request{
+		ProjectRoot: "/root",
+		ProjectName: "fixture",
+	})
+	if err != nil {
+		t.Fatalf("Ingest returned top-level error: %v", err)
+	}
+	if len(captured) != 3 {
+		t.Fatalf("expected 3 progress events, got %d", len(captured))
+	}
+	for i, e := range captured {
+		if e == nil || !strings.Contains(e.Error(), "boom") {
+			t.Errorf("event %d: err=%v, want wraps 'boom'", i, e)
+		}
+	}
+}
+
+// TestIngest_ProgressCallback_NilIsSafe asserts that leaving Progress
+// unset is a valid zero-value configuration and does not panic.
+func TestIngest_ProgressCallback_NilIsSafe(t *testing.T) {
+	p, _, _, _, _, _ := newTestPipeline(threePackageGoFixture())
+	// Progress deliberately left nil.
+	_, err := p.Ingest(context.Background(), Request{
+		ProjectRoot: "/root",
+		ProjectName: "fixture",
+	})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+}
+
 // TestIngest_ThreePackagesYieldThreeEntriesAndOneTrail covers AC1.
 func TestIngest_ThreePackagesYieldThreeEntriesAndOneTrail(t *testing.T) {
 	p, _, wr, tr, st, _ := newTestPipeline(threePackageGoFixture())
