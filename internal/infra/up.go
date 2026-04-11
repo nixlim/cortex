@@ -21,6 +21,7 @@ const (
 	CodeDockerUnreachable     = "DOCKER_UNREACHABLE"
 	CodeComposeFailed         = "COMPOSE_FAILED"
 	CodeWeaviateNotReady      = "WEAVIATE_NOT_READY"
+	CodeWeaviateSchemaFailed  = "WEAVIATE_SCHEMA_FAILED"
 	CodeNeo4jNotReady         = "NEO4J_NOT_READY"
 	CodeGDSNotAvailable       = "GDS_NOT_AVAILABLE"
 	CodeOllamaNotReachable    = "OLLAMA_NOT_REACHABLE"
@@ -31,9 +32,14 @@ const (
 )
 
 // WeaviateReady is the minimum surface Run needs from the Weaviate
-// adapter. internal/weaviate.HTTPClient satisfies it via Ready.
+// adapter. internal/weaviate.HTTPClient satisfies it via Ready and
+// EnsureSchema. EnsureSchema is idempotent — it swallows
+// already-exists errors — so it is safe to call on every cortex up,
+// which is what fixes the "cortex down --purge leaves Weaviate without
+// Entry/Frame classes" regression (cortex-0u5).
 type WeaviateReady interface {
 	Ready(ctx context.Context) error
+	EnsureSchema(ctx context.Context) error
 }
 
 // Neo4jReady is the minimum surface Run needs from the Neo4j adapter.
@@ -206,6 +212,18 @@ func Run(ctx context.Context, opts UpOptions) error {
 				CodeWeaviateNotReady,
 				"weaviate never became ready within the startup budget",
 				err))
+			return
+		}
+		// Bootstrap Entry/Frame classes. Idempotent on a populated
+		// volume; required on a fresh/purged volume because nothing
+		// else in the runtime creates the schema, and Weaviate's
+		// auto-schema produces unusable classes (cortex-0u5).
+		if err := opts.Weaviate.EnsureSchema(probeCtx); err != nil {
+			if siblingCanceled(budgetCtx, probeCtx) {
+				return
+			}
+			fail(errs.Operational(CodeWeaviateSchemaFailed,
+				"failed to ensure weaviate Entry/Frame schema", err))
 		}
 	}()
 

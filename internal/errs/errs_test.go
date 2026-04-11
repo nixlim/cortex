@@ -80,6 +80,54 @@ func TestExitCodeMapping(t *testing.T) {
 	}
 }
 
+func TestOperationalJSONIncludesScrubbedCause(t *testing.T) {
+	cause := errors.New("dial tcp 127.0.0.1:7687: connection refused at /Users/alice/secret")
+	err := Operational("NEO4J_UNREACHABLE", "Neo4j is not reachable", cause)
+	var buf bytes.Buffer
+	code := Emit(&buf, err, true)
+	if code != 1 {
+		t.Errorf("exit code: got %d want 1", code)
+	}
+	var env Envelope
+	if e := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &env); e != nil {
+		t.Fatalf("not JSON: %v\nraw=%s", e, buf.String())
+	}
+	gotCause, _ := env.Error.Details["cause"].(string)
+	if gotCause == "" {
+		t.Fatalf("envelope missing details.cause: %s", buf.String())
+	}
+	if !strings.Contains(gotCause, "dial tcp") {
+		t.Errorf("expected cause substring in details.cause, got: %q", gotCause)
+	}
+	if strings.Contains(gotCause, "/Users/alice") {
+		t.Errorf("home path leaked into details.cause: %q", gotCause)
+	}
+}
+
+func TestOperationalCauseSurfacesUnderCortexDebug(t *testing.T) {
+	t.Setenv("CORTEX_DEBUG", "1")
+	cause := errors.New("dial tcp 127.0.0.1:7687: connection refused")
+	err := Operational("NEO4J_UNREACHABLE", "Neo4j is not reachable", cause)
+	var buf bytes.Buffer
+	Emit(&buf, err, false)
+	out := buf.String()
+	if !strings.Contains(out, "dial tcp") {
+		t.Errorf("CORTEX_DEBUG should surface cause to stderr; got: %q", out)
+	}
+}
+
+func TestOperationalCauseScrubbedWhenDebugOn(t *testing.T) {
+	t.Setenv("CORTEX_DEBUG", "1")
+	cause := errors.New("panic: runtime.goroutine 1 at /Users/alice/secret")
+	err := Operational("X", "boom", cause)
+	var buf bytes.Buffer
+	Emit(&buf, err, false)
+	out := buf.String()
+	if strings.Contains(out, "/Users/alice") || strings.Contains(out, "panic:") {
+		t.Errorf("forbidden substring leaked through CORTEX_DEBUG path: %q", out)
+	}
+}
+
 func TestUnknownErrorIsOperational(t *testing.T) {
 	var buf bytes.Buffer
 	code := Emit(&buf, errors.New("plain error"), true)

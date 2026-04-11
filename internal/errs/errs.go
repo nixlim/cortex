@@ -11,16 +11,21 @@
 //
 //	{"error":{"code":"<CODE>","message":"<message>","details":{...}}}
 //
-// to stderr. Operational errors never include raw backend messages, stack
-// traces, or host file paths in stderr or the JSON envelope — those details
-// live only in ops.log. The package is the single sanctioned write path
-// for stderr error output to make that invariant enforceable.
+// to stderr. Operational errors include the scrubbed Cause chain under
+// `details.cause` so operators can diagnose dependency failures without
+// rebuilding the binary; in human mode the cause is suppressed by default
+// and surfaced as a second stderr line only when CORTEX_DEBUG=1 is set.
+// Stack traces, host file paths, and panic/runtime markers are redacted
+// by the shared scrubber in both paths. The package is the single
+// sanctioned write path for stderr error output to make that invariant
+// enforceable.
 package errs
 
 import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 )
 
@@ -139,16 +144,31 @@ func Emit(stderr io.Writer, err error, jsonMode bool) int {
 			fmt.Fprintf(stderr, "cortex: %s: %s\n", e.Code, scrub(e.Message))
 		}
 	default:
-		// Operational. Never include Cause on stderr.
+		// Operational. The Cause chain is included in scrubbed form so
+		// operators can diagnose dependency failures without rebuilding
+		// the binary. In JSON mode it lives under details.cause; in
+		// human mode it is withheld by default and surfaced as a second
+		// stderr line only when CORTEX_DEBUG=1 is set. The shared
+		// scrubber strips home paths, panic/runtime/goroutine markers,
+		// so credentials embedded in those forms are redacted in both
+		// paths.
+		var details map[string]any
+		if e.Cause != nil {
+			details = map[string]any{"cause": scrub(e.Cause.Error())}
+		}
 		if jsonMode {
 			env := Envelope{envelopeBody{
 				Code:    e.Code,
 				Message: scrub(e.Message),
+				Details: details,
 			}}
 			b, _ := json.Marshal(env)
 			fmt.Fprintln(stderr, string(b))
 		} else {
 			fmt.Fprintf(stderr, "cortex: %s: %s\n", e.Code, scrub(e.Message))
+			if e.Cause != nil && os.Getenv("CORTEX_DEBUG") == "1" {
+				fmt.Fprintf(stderr, "cortex: cause: %s\n", scrub(e.Cause.Error()))
+			}
 		}
 	}
 	return e.Kind.ExitCode()

@@ -45,8 +45,10 @@ func (f *fakeDocker) Build(context.Context, string, string, string) error { retu
 // fakeWeaviate becomes ready on the Nth Ready call (readyAfter). A
 // value of 1 means "ready on first call".
 type fakeWeaviate struct {
-	readyAfter int
-	calls      int32
+	readyAfter       int
+	calls            int32
+	ensureCalls      int32
+	ensureSchemaErr  error
 }
 
 func (f *fakeWeaviate) Ready(ctx context.Context) error {
@@ -55,6 +57,11 @@ func (f *fakeWeaviate) Ready(ctx context.Context) error {
 		return nil
 	}
 	return errors.New("weaviate: not ready yet")
+}
+
+func (f *fakeWeaviate) EnsureSchema(ctx context.Context) error {
+	atomic.AddInt32(&f.ensureCalls, 1)
+	return f.ensureSchemaErr
 }
 
 type fakeNeo4j struct {
@@ -155,6 +162,51 @@ func TestRunHappyPath(t *testing.T) {
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("config file mode = %v, want 0600", perm)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression (cortex-0u5): After cortex down --purge wipes the Weaviate
+// volume, the next cortex up must re-create the Entry/Frame classes so
+// that the first non-lifecycle command does not fail with "import into
+// non-existing index". Run is required to call EnsureSchema on the
+// Weaviate adapter once readiness has been reached, and to surface a
+// schema failure as WEAVIATE_SCHEMA_FAILED.
+// ---------------------------------------------------------------------------
+
+func TestRunEnsuresWeaviateSchemaOnHappyPath(t *testing.T) {
+	opts := newOpts(t)
+	opts.Docker = &fakeDocker{}
+	fw := &fakeWeaviate{readyAfter: 1}
+	opts.Weaviate = fw
+	opts.Neo4j = &fakeNeo4j{readyAfter: 1, gdsAvail: true}
+	opts.Ollama = &fakeOllama{
+		pingAfter: 1,
+		models:    []string{"nomic-embed-text:latest", "qwen3:4b-instruct"},
+	}
+
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatalf("Run: unexpected error: %v", err)
+	}
+	if got := atomic.LoadInt32(&fw.ensureCalls); got != 1 {
+		t.Errorf("EnsureSchema call count = %d, want 1", got)
+	}
+}
+
+func TestRunSurfacesSchemaFailure(t *testing.T) {
+	opts := newOpts(t)
+	opts.Docker = &fakeDocker{}
+	opts.Weaviate = &fakeWeaviate{readyAfter: 1, ensureSchemaErr: errors.New("schema boom")}
+	opts.Neo4j = &fakeNeo4j{readyAfter: 1, gdsAvail: true}
+	opts.Ollama = &fakeOllama{
+		pingAfter: 1,
+		models:    []string{"nomic-embed-text:latest", "qwen3:4b-instruct"},
+	}
+
+	err := Run(context.Background(), opts)
+	if err == nil {
+		t.Fatalf("expected schema failure to surface, got nil")
+	}
+	requireErrorCode(t, err, CodeWeaviateSchemaFailed)
 }
 
 // ---------------------------------------------------------------------------
