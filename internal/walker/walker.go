@@ -88,6 +88,15 @@ type Options struct {
 	// touching the walker's API.
 	DenyList []string
 
+	// ExtraIgnoreFiles is a list of additional gitignore-syntax files
+	// whose rules are merged into the same matcher the walker builds
+	// from the project-root .gitignore. Paths are absolute. Files that
+	// do not exist are silently skipped (unlike the .gitignore path
+	// itself, a missing extra-ignore file is a first-run condition the
+	// caller typically handles by creating the file). Used by the
+	// ingest CLI to pass the project-root .cortexignore. See cortex-8rk.
+	ExtraIgnoreFiles []string
+
 	// CortexHome is the path that must be excluded unconditionally. When
 	// empty, it is resolved from $HOME/.cortex.
 	CortexHome string
@@ -162,6 +171,19 @@ func Walk(opts Options, fn func(FileMeta) error) error {
 			"path":  filepath.Join(rootCanonical, ".gitignore"),
 			"error": err.Error(),
 		})
+	}
+	// Merge any caller-supplied extra ignore files (e.g. .cortexignore)
+	// into the same matcher. A missing file is silently skipped — the
+	// first-run bootstrap that creates the file is the caller's
+	// responsibility. Other read errors are surfaced via the logger but
+	// do not abort the walk. See cortex-8rk.
+	for _, extra := range opts.ExtraIgnoreFiles {
+		if err := ignore.loadFromFile(extra); err != nil && !errors.Is(err, os.ErrNotExist) {
+			logger.Warn("WALKER_EXTRA_IGNORE_READ_ERROR", map[string]any{
+				"path":  extra,
+				"error": err.Error(),
+			})
+		}
 	}
 
 	return filepath.WalkDir(rootCanonical, func(path string, d fs.DirEntry, walkErr error) error {

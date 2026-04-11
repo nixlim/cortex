@@ -204,6 +204,60 @@ func TestGitignorePatternsAreSkipped(t *testing.T) {
 	}
 }
 
+// TestExtraIgnoreFilesAreMerged asserts that rules from a file passed
+// in Options.ExtraIgnoreFiles are combined with the project-root
+// .gitignore rules into the same matcher — neither set overrides the
+// other. Used by the ingest CLI to honour both .gitignore and a
+// project-root .cortexignore without introducing a second matcher.
+func TestExtraIgnoreFilesAreMerged(t *testing.T) {
+	tmp := t.TempDir()
+	writeFile(t, filepath.Join(tmp, ".gitignore"), []byte("*.log\n"))
+	writeFile(t, filepath.Join(tmp, ".cortexignore"), []byte(".idea/\n.claude/\n"))
+	writeFile(t, filepath.Join(tmp, "keep.go"), []byte("package x"))
+	writeFile(t, filepath.Join(tmp, "drop.log"), []byte("noisy"))
+	writeFile(t, filepath.Join(tmp, ".idea", "workspace.xml"), []byte("ide"))
+	writeFile(t, filepath.Join(tmp, ".claude", "settings.json"), []byte("agent"))
+
+	files, _ := collect(t, Options{
+		ProjectRoot:      tmp,
+		ExtraIgnoreFiles: []string{filepath.Join(tmp, ".cortexignore")},
+	})
+
+	if contains(files, "drop.log") {
+		t.Errorf(".gitignore rule should still apply; files=%v", files)
+	}
+	if contains(files, ".idea/workspace.xml") {
+		t.Errorf(".cortexignore rule should prune .idea/; files=%v", files)
+	}
+	if contains(files, ".claude/settings.json") {
+		t.Errorf(".cortexignore rule should prune .claude/; files=%v", files)
+	}
+	if !contains(files, "keep.go") {
+		t.Errorf("keep.go should remain; files=%v", files)
+	}
+}
+
+// TestExtraIgnoreFiles_MissingIsSilent asserts that a caller pointing
+// at a nonexistent extra-ignore file does not break the walk — the
+// walker silently skips it. This matches the first-run scenario where
+// the ingest CLI bootstraps .cortexignore asynchronously and the walk
+// may still execute before the file exists.
+func TestExtraIgnoreFiles_MissingIsSilent(t *testing.T) {
+	tmp := t.TempDir()
+	writeFile(t, filepath.Join(tmp, "keep.go"), []byte("package x"))
+
+	files, logger := collect(t, Options{
+		ProjectRoot:      tmp,
+		ExtraIgnoreFiles: []string{filepath.Join(tmp, ".cortexignore-does-not-exist")},
+	})
+	if !contains(files, "keep.go") {
+		t.Errorf("keep.go should remain; files=%v", files)
+	}
+	if logger.has("WALKER_EXTRA_IGNORE_READ_ERROR") {
+		t.Errorf("missing extra-ignore should not warn; events=%+v", logger.events)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Acceptance: "~/.cortex/ and deny-list paths never appear in the iterator."
 // ---------------------------------------------------------------------------

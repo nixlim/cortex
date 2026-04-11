@@ -9,6 +9,67 @@ import (
 	"github.com/nixlim/cortex/internal/languages"
 )
 
+// TestEnsureCortexIgnore_CreatesOnFirstRun asserts that calling
+// ensureCortexIgnore on a project root that has no .cortexignore
+// writes the default body. Subsequent calls must be no-ops so
+// operator edits survive re-runs.
+func TestEnsureCortexIgnore_CreatesOnFirstRun(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := ensureCortexIgnore(dir); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	path := filepath.Join(dir, cortexIgnoreFilename)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after first call: %v", err)
+	}
+	if string(data) != defaultCortexIgnoreBody {
+		t.Errorf("first-run body does not match defaults\nwant:\n%s\ngot:\n%s", defaultCortexIgnoreBody, string(data))
+	}
+
+	// Second call must not rewrite the file — overwrite with a
+	// custom marker, call again, verify the marker survives.
+	custom := []byte("# operator override\ncustom-dir/\n")
+	if err := os.WriteFile(path, custom, 0o644); err != nil {
+		t.Fatalf("operator overwrite: %v", err)
+	}
+	if err := ensureCortexIgnore(dir); err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after second call: %v", err)
+	}
+	if string(data) != string(custom) {
+		t.Errorf("second call clobbered operator edits\nwant:\n%s\ngot:\n%s", string(custom), string(data))
+	}
+}
+
+// TestDefaultCortexIgnoreBody_ExpectedEntries asserts the default
+// body contains the entries the operator asked for in cortex-8rk:
+// .idea, .vscode, .claude, .beads must be excluded; docs, *.md,
+// README.md must NOT be in the exclude list.
+func TestDefaultCortexIgnoreBody_ExpectedEntries(t *testing.T) {
+	mustExclude := []string{".idea/", ".vscode/", ".claude/", ".beads/", "node_modules/", "vendor/"}
+	for _, s := range mustExclude {
+		if !strings.Contains(defaultCortexIgnoreBody, s) {
+			t.Errorf("default .cortexignore missing expected exclude %q", s)
+		}
+	}
+	mustNotExclude := []string{"docs/", "*.md", "README.md", "eval/"}
+	for _, s := range mustNotExclude {
+		// Conservative substring check: fail only if the entry appears
+		// as a standalone line (start of line / end of line). We don't
+		// want a false positive from something like "coverage.out".
+		for _, line := range strings.Split(defaultCortexIgnoreBody, "\n") {
+			if strings.TrimSpace(line) == s {
+				t.Errorf("default .cortexignore unexpectedly excludes %q", s)
+			}
+		}
+	}
+}
+
 // TestBuildModuleSourceBody_FitsWithinBudget asserts that when the
 // combined source fits inside the byte budget, every file is included
 // verbatim — no truncation marker appears and each file's full

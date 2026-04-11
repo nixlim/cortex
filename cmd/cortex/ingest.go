@@ -77,6 +77,10 @@ func newIngestCmdReal() *cobra.Command {
 				return emitAndExit(cmd, errs.Validation("MISSING_PROJECT_NAME",
 					"cortex ingest requires --project", nil), jsonFlag)
 			}
+			if err := ensureCortexIgnore(args[0]); err != nil {
+				return emitAndExit(cmd, errs.Operational("CORTEXIGNORE_INIT_FAILED",
+					"could not create .cortexignore at project root", err), jsonFlag)
+			}
 			cfg, segDir, err := loadIngestConfig()
 			if err != nil {
 				return emitAndExit(cmd, err, jsonFlag)
@@ -185,6 +189,10 @@ func newIngestResumeCmd() *cobra.Command {
 			if project == "" {
 				return emitAndExit(cmd, errs.Validation("MISSING_PROJECT_NAME",
 					"cortex ingest resume requires --project", nil), jsonFlag)
+			}
+			if err := ensureCortexIgnore(args[0]); err != nil {
+				return emitAndExit(cmd, errs.Operational("CORTEXIGNORE_INIT_FAILED",
+					"could not create .cortexignore at project root", err), jsonFlag)
 			}
 			cfg, segDir, err := loadIngestConfig()
 			if err != nil {
@@ -388,17 +396,77 @@ func renderIngestResult(cmd *cobra.Command, res *ingest.Result, jsonFlag bool) e
 
 // walkerWalk adapts walker.Walk to ingest.WalkerFunc. It converts each
 // walker.FileMeta into a languages.File, which is the unit
-// languages.Group consumes.
+// languages.Group consumes. The project-root .cortexignore is
+// automatically merged into the walker's ignore matcher alongside the
+// project's .gitignore (cortex-8rk). The file is expected to exist by
+// the time walkerWalk runs — the cobra RunE handler bootstraps it via
+// ensureCortexIgnore before invoking pipeline.Ingest.
 func walkerWalk(root string, fn func(languages.File) error) error {
 	return walker.Walk(walker.Options{
-		ProjectRoot: root,
-		Logger:      walker.NopLogger{},
+		ProjectRoot:      root,
+		ExtraIgnoreFiles: []string{filepath.Join(root, cortexIgnoreFilename)},
+		Logger:           walker.NopLogger{},
 	}, func(fm walker.FileMeta) error {
 		return fn(languages.File{
 			AbsPath: fm.AbsPath,
 			RelPath: fm.RelPath,
 		})
 	})
+}
+
+// cortexIgnoreFilename is the per-project ignore file cortex ingest
+// honours alongside .gitignore. Same syntax as .gitignore.
+const cortexIgnoreFilename = ".cortexignore"
+
+// defaultCortexIgnoreBody is the starter content written to
+// <projectRoot>/.cortexignore on first run. Operators own the file
+// once it exists; cortex ingest will not overwrite it. The defaults
+// deliberately KEEP docs/, *.md, and README.md in scope (they answer
+// recall questions about architecture and spec) and exclude IDE
+// metadata, local caches, build outputs, and the beads issue tracker
+// (which stores tracker state, not source). See cortex-8rk.
+const defaultCortexIgnoreBody = `# .cortexignore — paths cortex ingest skips, in addition to .gitignore.
+# Syntax: one glob/prefix per line, same rules as .gitignore.
+# Edit to taste; this file is operator-owned once it exists.
+
+# IDE / editor metadata
+.idea/
+.vscode/
+.cursor/
+
+# Agent / tooling state
+.claude/
+.beads/
+
+# Language / package artifacts
+node_modules/
+vendor/
+target/
+dist/
+build/
+
+# Test + profile output
+coverage.out
+*.log
+*.tmp
+`
+
+// ensureCortexIgnore writes a default .cortexignore at the project
+// root if no file is present. An existing file (even a zero-byte one)
+// is left untouched so operator customisations survive re-runs. All
+// other filesystem errors are surfaced so the caller can decide
+// whether to abort the ingest.
+func ensureCortexIgnore(projectRoot string) error {
+	path := filepath.Join(projectRoot, cortexIgnoreFilename)
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if err := os.WriteFile(path, []byte(defaultCortexIgnoreBody), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
 }
 
 // ollamaSummarizer implements ingest.Summarizer by actually reading
