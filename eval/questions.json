@@ -72,7 +72,7 @@
   {"id": 71, "q": "what is the Recall request and result structure",                     "kw": ["query","limit","score","ppr","similarity"]},
   {"id": 72, "q": "what cobra command is the root entry point",                          "kw": ["cobra","root","newRootCmd","command","main"]},
   {"id": 73, "q": "what is the Ollama generation model default",                         "kw": ["qwen","generation","model","ollama","default"]},
-  {"id": 74, "q": "what is the Ollama num_ctx default",                                  "kw": ["num_ctx","8192","context","ollama","window"]},
+  {"id": 74, "q": "what is the Ollama num_ctx default",                                  "kw": ["num_ctx","32768","context","ollama","window"]},
   {"id": 75, "q": "what graph algorithms does Neo4j GDS run in cortex",                  "kw": ["gds","pagerank","leiden","louvain","neo4j"]},
   {"id": 76, "q": "how does fsync work in the log append path",                          "kw": ["fsync","once","append","segment","durability"]},
   {"id": 77, "q": "what does the WhySurfaced field in a recall result indicate",         "kw": ["whysurfaced","ppr","similarity","explanation","reason"]},

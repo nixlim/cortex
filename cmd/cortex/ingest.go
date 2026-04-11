@@ -389,33 +389,176 @@ func walkerWalk(root string, fn func(languages.File) error) error {
 	})
 }
 
-// ollamaSummarizer implements ingest.Summarizer using a rendered
-// module_summary prompt and the Ollama Generate endpoint. The summary
-// body is the concatenated list of relative file paths followed by a
-// short "files:" preamble — the current Phase 1 shape the prompts
-// template is designed for (opaque code block). File contents are not
-// streamed to the LLM in Phase 1 because module_summary.tmpl renders
-// a single USER_CONTENT block; a follow-up can include trimmed file
-// bodies once the prompts layer supports multi-file rendering.
+// ollamaSummarizer implements ingest.Summarizer by actually reading
+// each file in the module (up to a byte budget), handing the
+// concatenated source to Ollama via the structured-output
+// /api/generate path, and formatting the resulting five-field JSON
+// object into a markdown entry body.
+//
+// The byte budget is chosen so the prompt plus source plus the model's
+// response fit inside the configured num_ctx (32K by default for
+// qwen3:4b-instruct). At ~3-4 chars per token, ~100KB of code plus
+// ~2KB of prompt boilerplate plus ~2KB of expected output leaves
+// comfortable headroom. Modules that exceed the budget get each file
+// proportionally truncated with a "[truncated N bytes]" marker so the
+// model knows the input is incomplete.
+//
+// See bead cortex-dww for the rationale and cortex-v41 for the eval
+// failure mode this replaces.
 type ollamaSummarizer struct {
 	client *ollama.HTTPClient
 }
 
+// moduleSourceBudget caps the combined source bytes a single module
+// contributes to the summarization prompt. Chosen for 32K num_ctx on
+// 4-8B q4 models; raise once we verify VRAM on the larger
+// configurations. Not a config knob yet — when it becomes one, move
+// this to internal/config.
+const moduleSourceBudget = 100_000
+
+// moduleSummaryPayload mirrors prompts.ModuleSummarySchema. It is the
+// shape Ollama is constrained to emit when GenerateStructured is
+// called with that schema; the summarizer unmarshals into this struct
+// and then formats the fields into the markdown entry body.
+type moduleSummaryPayload struct {
+	Summary      string   `json:"summary"`
+	Identifiers  []string `json:"identifiers"`
+	Algorithms   []string `json:"algorithms"`
+	Dependencies []string `json:"dependencies"`
+	Searchable   []string `json:"searchable"`
+}
+
 func (s *ollamaSummarizer) Summarize(ctx context.Context, req ingest.SummaryRequest) (string, error) {
-	var b strings.Builder
-	fmt.Fprintf(&b, "module: %s\nlanguage: %s\nfiles:\n", req.Module.ID, req.Module.Language)
-	for _, f := range req.Module.Files {
-		fmt.Fprintf(&b, "  - %s\n", f.RelPath)
+	body, err := buildModuleSourceBody(req.Module, moduleSourceBudget)
+	if err != nil {
+		return "", fmt.Errorf("read module source: %w", err)
 	}
-	prompt, err := prompts.Render(prompts.NameModuleSummary, prompts.Data{Body: b.String()})
+	prompt, err := prompts.Render(prompts.NameModuleSummary, prompts.Data{Body: body})
 	if err != nil {
 		return "", fmt.Errorf("render module_summary: %w", err)
 	}
-	out, err := s.client.Generate(ctx, prompt)
+	out, err := s.client.GenerateStructured(ctx, prompt, prompts.ModuleSummarySchema)
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(out), nil
+	var payload moduleSummaryPayload
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		return "", fmt.Errorf("decode module_summary response: %w", err)
+	}
+	return formatModuleSummaryBody(req.Module, payload), nil
+}
+
+// buildModuleSourceBody reads each file in the module and concatenates
+// them into a single USER_CONTENT block for the summarizer prompt.
+// Each file is preceded by a "=== FILE: <relpath> ===" header so the
+// model can attribute identifiers back to their file. When the
+// combined source would exceed budget, each file's contribution is
+// scaled proportionally to its share of the total, and the tail of
+// each truncated file is replaced with a clear "... [truncated N
+// bytes]" marker. Files that fail to read are recorded inline as
+// "=== FILE: <relpath> === (unreadable: <err>)" rather than aborting
+// the whole module — a single unreadable file shouldn't black out a
+// multi-file module summary.
+func buildModuleSourceBody(m languages.Module, budget int) (string, error) {
+	type fileRead struct {
+		rel  string
+		data []byte
+		err  error
+	}
+	reads := make([]fileRead, 0, len(m.Files))
+	total := 0
+	for _, f := range m.Files {
+		data, err := os.ReadFile(f.AbsPath)
+		if err != nil {
+			reads = append(reads, fileRead{rel: f.RelPath, err: err})
+			continue
+		}
+		reads = append(reads, fileRead{rel: f.RelPath, data: data})
+		total += len(data)
+	}
+
+	// Allocate a per-file byte cap. If total fits inside the budget,
+	// every file is included whole. Otherwise each file gets a share
+	// proportional to its original size, floor 256 bytes so tiny
+	// files in a huge module still contribute a header and a few
+	// lines.
+	var caps []int
+	if total <= budget {
+		caps = make([]int, len(reads))
+		for i, r := range reads {
+			caps[i] = len(r.data)
+		}
+	} else {
+		caps = make([]int, len(reads))
+		const minPerFile = 256
+		for i, r := range reads {
+			share := int(float64(len(r.data)) / float64(total) * float64(budget))
+			if share < minPerFile {
+				share = minPerFile
+			}
+			if share > len(r.data) {
+				share = len(r.data)
+			}
+			caps[i] = share
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "module: %s\nlanguage: %s\n\n", m.ID, m.Language)
+	for i, r := range reads {
+		fmt.Fprintf(&b, "=== FILE: %s ===\n", r.rel)
+		if r.err != nil {
+			fmt.Fprintf(&b, "(unreadable: %v)\n\n", r.err)
+			continue
+		}
+		cap := caps[i]
+		if cap >= len(r.data) {
+			b.Write(r.data)
+		} else {
+			b.Write(r.data[:cap])
+			fmt.Fprintf(&b, "\n... [truncated %d bytes]\n", len(r.data)-cap)
+		}
+		b.WriteString("\n\n")
+	}
+	return b.String(), nil
+}
+
+// formatModuleSummaryBody renders the five-field payload into the
+// markdown entry body that write.Pipeline.Observe will embed and
+// concept-extract. The body leads with the prose summary (so the
+// embedding picks up natural language) and follows with one section
+// per list, each bullet pulled from the model's output. Empty lists
+// are omitted so short modules don't carry empty headings.
+//
+// Section order is fixed: Identifiers → Algorithms → Dependencies →
+// Searchable. Keep it stable so the entry body is diffable across
+// re-ingests and recall results are visually consistent.
+func formatModuleSummaryBody(m languages.Module, p moduleSummaryPayload) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Module %s (%s).\n\n", m.ID, m.Language)
+	if s := strings.TrimSpace(p.Summary); s != "" {
+		b.WriteString(s)
+		b.WriteString("\n\n")
+	}
+	writeSection := func(heading string, items []string) {
+		if len(items) == 0 {
+			return
+		}
+		fmt.Fprintf(&b, "## %s\n", heading)
+		for _, it := range items {
+			it = strings.TrimSpace(it)
+			if it == "" {
+				continue
+			}
+			fmt.Fprintf(&b, "- %s\n", it)
+		}
+		b.WriteString("\n")
+	}
+	writeSection("Identifiers", p.Identifiers)
+	writeSection("Algorithms", p.Algorithms)
+	writeSection("Dependencies", p.Dependencies)
+	writeSection("Searchable", p.Searchable)
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // writePipelineEntryWriter implements ingest.EntryWriter by delegating

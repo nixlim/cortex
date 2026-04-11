@@ -49,6 +49,27 @@ const (
 	NameModuleSummary     = "module_summary"
 )
 
+// ModuleSummarySchema is the JSON schema Ollama enforces when the
+// ingest summarizer calls GenerateStructured with the module_summary
+// prompt. The five fields are all required so the summarizer never
+// has to handle a partially-populated object; empty arrays are valid.
+//
+// The schema is stored as a raw JSON message rather than a Go struct
+// so it can be passed through to the Ollama /api/generate "format"
+// field verbatim. Keep the schema colocated with the template — both
+// describe the module_summary contract.
+var ModuleSummarySchema = []byte(`{
+  "type": "object",
+  "properties": {
+    "summary":      { "type": "string" },
+    "identifiers":  { "type": "array", "items": { "type": "string" } },
+    "algorithms":   { "type": "array", "items": { "type": "string" } },
+    "dependencies": { "type": "array", "items": { "type": "string" } },
+    "searchable":   { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["summary","identifiers","algorithms","dependencies","searchable"]
+}`)
+
 var all = []string{
 	NameConceptExtraction,
 	NameTrailSummary,

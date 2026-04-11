@@ -353,12 +353,16 @@ func (c *HTTPClient) Embed(ctx context.Context, text string) ([]float32, error) 
 // simplifies call sites. Options carries per-call tunables like
 // num_ctx; it is omitempty so a zero-value Options block doesn't
 // appear on the wire (Ollama rejects some empty blocks on older
-// versions).
+// versions). Format, when non-nil, is Ollama's structured-output
+// knob — either the string "json" or a JSON schema object that
+// constrains the decoder to emit schema-conformant JSON. It is
+// omitempty so unstructured callers (Generate) never send it.
 type generateRequest struct {
-	Model   string         `json:"model"`
-	Prompt  string         `json:"prompt"`
-	Stream  bool           `json:"stream"`
-	Options map[string]any `json:"options,omitempty"`
+	Model   string          `json:"model"`
+	Prompt  string          `json:"prompt"`
+	Stream  bool            `json:"stream"`
+	Options map[string]any  `json:"options,omitempty"`
+	Format  json.RawMessage `json:"format,omitempty"`
 }
 
 type generateResponse struct {
@@ -376,6 +380,28 @@ type generateResponse struct {
 // is included in the request body so Ollama allocates a larger KV
 // cache than its 2048-token default. See bead cortex-w5u.
 func (c *HTTPClient) Generate(ctx context.Context, prompt string) (string, error) {
+	return c.doGenerate(ctx, prompt, nil)
+}
+
+// GenerateStructured is the same as Generate except it passes a JSON
+// schema via Ollama's /api/generate "format" field. Ollama enforces
+// the schema at decode time, so the returned string is guaranteed to
+// be valid JSON conforming to the schema (caller still unmarshals).
+// The schema must be a JSON object per the Ollama structured-output
+// contract; callers typically keep it as a package-level constant in
+// internal/prompts so the schema lives next to the template.
+//
+// See cortex-dww: the ingest summarizer uses this to obtain a
+// five-field object (summary, identifiers, algorithms, dependencies,
+// searchable) that the pipeline formats into a markdown entry body.
+func (c *HTTPClient) GenerateStructured(ctx context.Context, prompt string, schema json.RawMessage) (string, error) {
+	return c.doGenerate(ctx, prompt, schema)
+}
+
+// doGenerate is the shared implementation for Generate and
+// GenerateStructured. A nil schema omits the format field on the
+// wire; a non-nil schema is sent as the format object verbatim.
+func (c *HTTPClient) doGenerate(ctx context.Context, prompt string, schema json.RawMessage) (string, error) {
 	ctx, cancel := ctxWithDefault(ctx, c.generationBudget)
 	defer cancel()
 
@@ -386,6 +412,9 @@ func (c *HTTPClient) Generate(ctx context.Context, prompt string) (string, error
 	}
 	if c.numCtx > 0 {
 		reqBody.Options = map[string]any{"num_ctx": c.numCtx}
+	}
+	if len(schema) > 0 {
+		reqBody.Format = schema
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
