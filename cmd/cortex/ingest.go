@@ -39,15 +39,18 @@ import (
 	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/datom"
 	"github.com/nixlim/cortex/internal/errs"
+	"github.com/nixlim/cortex/internal/infra"
 	"github.com/nixlim/cortex/internal/ingest"
 	"github.com/nixlim/cortex/internal/languages"
 	"github.com/nixlim/cortex/internal/log"
+	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/ollama"
 	"github.com/nixlim/cortex/internal/prompts"
 	"github.com/nixlim/cortex/internal/psi"
 	"github.com/nixlim/cortex/internal/security/secrets"
 	"github.com/nixlim/cortex/internal/trail"
 	"github.com/nixlim/cortex/internal/walker"
+	"github.com/nixlim/cortex/internal/weaviate"
 	"github.com/nixlim/cortex/internal/write"
 )
 
@@ -221,18 +224,18 @@ func loadIngestConfig() (config.Config, string, error) {
 }
 
 // buildIngestPipeline constructs an ingest.Pipeline with the production
-// adapters. The cleanup closure closes the log writer.
+// adapters. The cleanup closure closes the log writer and the Neo4j
+// bolt client.
 func buildIngestPipeline(cfg config.Config, segDir string) (*ingest.Pipeline, func(), error) {
 	writer, err := log.NewWriter(segDir)
 	if err != nil {
 		return nil, func() {}, errs.Operational("LOG_OPEN_FAILED",
 			"could not open segment directory", err)
 	}
-	cleanup := func() { _ = writer.Close() }
 
 	detector, err := secrets.LoadBuiltin(0)
 	if err != nil {
-		cleanup()
+		_ = writer.Close()
 		return nil, func() {}, errs.Operational("SECRETS_INIT_FAILED",
 			"could not initialize secret detector", err)
 	}
@@ -246,19 +249,67 @@ func buildIngestPipeline(cfg config.Config, segDir string) (*ingest.Pipeline, fu
 		NumCtx:                cfg.Ollama.NumCtx,
 	})
 
+	weaviateClient := newWeaviateClient(cfg)
+
+	// Open a Bolt client for the Neo4j BackendApplier so the ingest
+	// write pipeline mirrors observe: concept extraction (cortex-v4g),
+	// link derivation, and entry-node materialization all require
+	// Neo4j. Failure here degrades to "no neo4j applier" and the
+	// log commit remains authoritative — self-heal will replay the
+	// missing rows on the next command (FR-004).
+	cfgPath := defaultConfigPath()
+	password, _, _ := infra.EnsureNeo4jPassword(cfgPath)
+	bolt, boltErr := neo4j.NewBoltClient(neo4j.Config{
+		BoltEndpoint: cfg.Endpoints.Neo4jBolt,
+		Username:     "neo4j",
+		Password:     password,
+		Timeout:      10 * time.Second,
+		MaxPoolSize:  4,
+	})
+
+	cleanup := func() {
+		_ = writer.Close()
+		if bolt != nil {
+			_ = bolt.Close(context.Background())
+		}
+	}
+
+	var neoApplier write.BackendApplier
+	if boltErr == nil {
+		neoApplier = neo4j.NewBackendApplier(bolt)
+	}
+	weaviateApplier := weaviate.NewBackendApplier(weaviateClient)
+
 	// The underlying write.Pipeline shares the log writer and runs one
 	// Observe per module. Reusing the same embedder adapter as
 	// cmd/cortex/observe.go so the FR-051 model-digest datoms appear
 	// on ingest entries as well.
+	//
+	// IMPORTANT: this field set MUST mirror buildObservePipeline in
+	// observe.go. Earlier this file omitted Neo4j/Weaviate/Neighbors/
+	// LinkProposer entirely, which left ingested entries without
+	// concept links (no MENTIONS edges) and without vectors in
+	// Weaviate, so cortex recall returned 0 results for everything.
+	// See bead cortex-v4g.
 	embedder := &observeEmbedder{c: ollamaClient, model: defaultEmbeddingModel}
 	writePipe := &write.Pipeline{
-		Detector:        detector,
-		Registry:        psi.NewRegistry(),
-		Log:             writer,
-		Embedder:        embedder,
-		Actor:           defaultActor(),
-		InvocationID:    ulid.Make().String(),
-		ConceptsEnabled: true,
+		Detector:     detector,
+		Registry:     psi.NewRegistry(),
+		Log:          writer,
+		Embedder:     embedder,
+		Actor:        defaultActor(),
+		InvocationID: ulid.Make().String(),
+		Neo4j:        neoApplier,
+		Weaviate:     weaviateApplier,
+		Neighbors:    &weaviateNeighborFinder{client: weaviateClient},
+		LinkProposer: &ollamaLinkProposer{client: ollamaClient},
+		LinkConfig: write.LinkDerivationConfig{
+			ConfidenceFloor:    cfg.LinkDerivation.ConfidenceFloor,
+			SimilarCosineFloor: cfg.LinkDerivation.SimilarToCosineFloor,
+		},
+		LinkTopK:             5,
+		ConceptsEnabled:      true,
+		ExpectedEmbeddingDim: cfg.Ollama.EmbeddingVectorDim,
 	}
 
 	entryWriter := &writePipelineEntryWriter{pipe: writePipe}

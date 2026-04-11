@@ -225,7 +225,14 @@ func Defaults() Config {
 				},
 			},
 			Forgetting: ForgettingConfig{
-				VisibilityThreshold: 0.05,
+				// 0.0005 keeps a freshly-encoded entry visible for ~30
+				// days under the default decay (1 * (1+age)^-0.5):
+				// solve 0.0005 = (1+age)^-0.5  ⟹ age ≈ 4·10^6 s ≈ 46d.
+				// The previous 0.05 threshold made unreinforced entries
+				// invisible after only ~399s (~6.7 minutes), which broke
+				// any cross-session recall and made `cortex ingest` look
+				// dead within minutes of finishing. See bead cortex-upp.
+				VisibilityThreshold: 0.0005,
 			},
 		},
 		Pagination: PaginationConfig{

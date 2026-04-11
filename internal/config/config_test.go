@@ -104,7 +104,7 @@ func TestDefaultsCompleteness(t *testing.T) {
 	if d.Retrieval.PPR.Damping != 0.85 {
 		t.Error("retrieval.ppr.damping default wrong")
 	}
-	if d.Retrieval.Forgetting.VisibilityThreshold != 0.05 {
+	if d.Retrieval.Forgetting.VisibilityThreshold != 0.0005 {
 		t.Error("visibility_threshold default wrong")
 	}
 	if d.LinkDerivation.ConfidenceFloor != 0.60 {

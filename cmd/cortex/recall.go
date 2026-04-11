@@ -144,6 +144,17 @@ func buildRecallPipeline() (*recall.Pipeline, *log.Writer, func(), error) {
 		Context:      &neo4jContextFetcher{client: bolt},
 		Actor:        defaultActor(),
 		InvocationID: ulid.Make().String(),
+		// Wire activation tunables from config so the loaded
+		// retrieval.forgetting.visibility_threshold and
+		// retrieval.activation.decay_exponent actually take effect.
+		// Without this, recall.Pipeline.fillDefaults silently falls
+		// back to the package-level activation constants (0.05 / 0.5)
+		// and any user override is ignored. See bead cortex-upp.
+		VisibilityThreshold: cfg.Retrieval.Forgetting.VisibilityThreshold,
+		DecayExponent:       cfg.Retrieval.Activation.DecayExponent,
+		SeedTopK:            cfg.Retrieval.PPR.SeedTopK,
+		Damping:             cfg.Retrieval.PPR.Damping,
+		MaxIterations:       cfg.Retrieval.PPR.MaxIterations,
 	}
 	return pipeline, writer, cleanup, nil
 }
