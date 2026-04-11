@@ -229,6 +229,64 @@ func TestIngest_ProgressCallback_NilIsSafe(t *testing.T) {
 	}
 }
 
+// TestIngest_IncrementalStateWrites asserts that StateStore.Write
+// fires more than twice during a run with three modules — once at
+// start-of-run (RunStartedAt stamp), once per module completion
+// (incremental), and once at end-of-run (finalize). The exact count
+// is 1 + modules + 1 = 5 but we only assert "> 2" to stay robust
+// against small refactors. Also asserts RunInProgress() transitions:
+// after the start-of-run write but before workers run, in-progress
+// is true; after end-of-run, in-progress is false.
+func TestIngest_IncrementalStateWrites(t *testing.T) {
+	p, _, _, _, st, _ := newTestPipeline(threePackageGoFixture())
+	_, err := p.Ingest(context.Background(), Request{
+		ProjectRoot: "/root",
+		ProjectName: "fixture",
+	})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	// Expect: 1 start-of-run + 3 incremental + 1 end-of-run = 5 writes.
+	if st.writes < 3 {
+		t.Errorf("expected incremental state writes > 2, got %d", st.writes)
+	}
+	final, ok, _ := st.Read(context.Background(), "fixture")
+	if !ok {
+		t.Fatal("final state should be present")
+	}
+	if final.RunInProgress() {
+		t.Errorf("expected RunInProgress=false after run completes; RunStartedAt=%v LastIngestedAt=%v",
+			final.RunStartedAt, final.LastIngestedAt)
+	}
+	if len(final.CompletedModuleIDs) != 3 {
+		t.Errorf("expected 3 completed modules, got %d", len(final.CompletedModuleIDs))
+	}
+}
+
+// TestProjectState_RunInProgress asserts the two obvious states:
+// zero-value = not in progress, RunStartedAt after LastIngestedAt =
+// in progress, RunStartedAt equal or before LastIngestedAt = not in
+// progress (the end-of-run finalize sets LastIngestedAt to a later
+// time than RunStartedAt, which is how "done" is expressed).
+func TestProjectState_RunInProgress(t *testing.T) {
+	zero := ProjectState{}
+	if zero.RunInProgress() {
+		t.Error("zero value should not be in progress")
+	}
+	now := time.Now()
+	running := ProjectState{RunStartedAt: now}
+	if !running.RunInProgress() {
+		t.Error("RunStartedAt set, LastIngestedAt zero → should be in progress")
+	}
+	done := ProjectState{
+		RunStartedAt:   now,
+		LastIngestedAt: now.Add(5 * time.Minute),
+	}
+	if done.RunInProgress() {
+		t.Error("LastIngestedAt > RunStartedAt → should NOT be in progress")
+	}
+}
+
 // TestIngest_ThreePackagesYieldThreeEntriesAndOneTrail covers AC1.
 func TestIngest_ThreePackagesYieldThreeEntriesAndOneTrail(t *testing.T) {
 	p, _, wr, tr, st, _ := newTestPipeline(threePackageGoFixture())

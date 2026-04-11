@@ -116,6 +116,13 @@ type TrailAppender interface {
 type ProjectState struct {
 	ProjectName         string
 	LastCommitSHA       string
+	// RunStartedAt records the wall-clock time the current (or most
+	// recent) Ingest call began. It is persisted incrementally as the
+	// run progresses so `cortex ingest status` in another terminal can
+	// tell the difference between "stale state from last night's run"
+	// and "run in progress right now". The run is considered in
+	// progress when RunStartedAt.After(LastIngestedAt). See cortex-so5.
+	RunStartedAt        time.Time
 	LastIngestedAt      time.Time
 	CompletedModuleIDs  []string // superset across all runs
 	LastTrailID         string
@@ -130,6 +137,18 @@ func (s ProjectState) Has(moduleID string) bool {
 		}
 	}
 	return false
+}
+
+// RunInProgress returns true when a run is currently executing. A run
+// is in progress once RunStartedAt has been set on the latest write
+// and LastIngestedAt has not yet caught up. Used by
+// `cortex ingest status` to show "N of M modules done" versus
+// "last completed at ...".
+func (s ProjectState) RunInProgress() bool {
+	if s.RunStartedAt.IsZero() {
+		return false
+	}
+	return s.RunStartedAt.After(s.LastIngestedAt)
 }
 
 // StateStore reads and writes per-project ingest state. Missing state
@@ -270,6 +289,16 @@ func (p *Pipeline) Ingest(ctx context.Context, req Request) (*Result, error) {
 		State:       state,
 	}
 
+	// Stamp the start-of-run marker and persist it immediately so
+	// `cortex ingest status` from another terminal can tell a run is
+	// in flight even before the first module completes. A best-effort
+	// write: if the state store is flaky, the run still proceeds. See
+	// cortex-so5.
+	state.RunStartedAt = started
+	if !req.DryRun {
+		_ = p.StateStore.Write(ctx, state)
+	}
+
 	// --- walk + group ---------------------------------------------------
 	files, err := p.collectFiles(req.ProjectRoot)
 	if err != nil {
@@ -321,6 +350,11 @@ func (p *Pipeline) Ingest(ctx context.Context, req Request) (*Result, error) {
 	// that fires from the worker pool sees a distinct DoneCount value.
 	// It is incremented right before the callback is invoked.
 	var doneCount int64
+	// stateMu guards the in-memory ProjectState against concurrent
+	// appends from worker goroutines. The workers persist incremental
+	// state writes (cortex-so5) so `cortex ingest status` in another
+	// terminal can observe progress without waiting for end-of-run.
+	var stateMu sync.Mutex
 	var wg sync.WaitGroup
 	for i := range todo {
 		i := i
@@ -409,19 +443,43 @@ func (p *Pipeline) Ingest(ctx context.Context, req Request) (*Result, error) {
 				return
 			}
 			out[i] = moduleResult{module: m, entryID: entryID}
+
+			// Incremental state persistence (cortex-so5): append the
+			// just-completed module and persist the state file so
+			// `cortex ingest status` reflects real-time progress.
+			// StateStore.Write failures are surfaced to stderr via
+			// the Logger but must not abort the run — the end-of-run
+			// authoritative write will also try to persist, and a
+			// resume is always idempotent on CompletedModuleIDs.
+			if !req.DryRun {
+				stateMu.Lock()
+				state.CompletedModuleIDs = append(state.CompletedModuleIDs, m.ID)
+				snapshot := state
+				stateMu.Unlock()
+				if err := p.StateStore.Write(ctx, snapshot); err != nil {
+					p.Logger.Warn("INGEST_STATE_WRITE_FAILED",
+						map[string]any{
+							"module": m.ID,
+							"error":  err.Error(),
+						})
+				}
+			}
+
 			emitProgress(nil)
 		}()
 	}
 	wg.Wait()
 
 	// Stable ordering: iterate todo (already sorted by languages.Group).
+	// Note: CompletedModuleIDs is appended incrementally by the worker
+	// goroutines under stateMu (cortex-so5), so we no longer touch it
+	// here — only collect per-module results into res.
 	for _, r := range out {
 		if r.err != nil {
 			res.SummaryErrors = append(res.SummaryErrors, *r.err)
 			continue
 		}
 		res.EntryIDs = append(res.EntryIDs, r.entryID)
-		state.CompletedModuleIDs = append(state.CompletedModuleIDs, r.module.ID)
 	}
 
 	// --- synthesize trail ----------------------------------------------

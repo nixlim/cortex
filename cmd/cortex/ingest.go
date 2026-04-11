@@ -148,12 +148,15 @@ func newIngestStatusCmd() *cobra.Command {
 			if err != nil {
 				return emitAndExit(cmd, err, jsonFlag)
 			}
+			inProgress := state.RunInProgress()
 			if jsonFlag {
 				enc := json.NewEncoder(cmd.OutOrStdout())
 				enc.SetIndent("", "  ")
 				return enc.Encode(map[string]any{
 					"project":               project,
 					"found":                 ok,
+					"in_progress":           inProgress,
+					"run_started_at":        state.RunStartedAt,
 					"last_commit_sha":       state.LastCommitSHA,
 					"last_ingested_at":      state.LastIngestedAt,
 					"last_trail_id":         state.LastTrailID,
@@ -163,6 +166,14 @@ func newIngestStatusCmd() *cobra.Command {
 			}
 			if !ok {
 				fmt.Fprintf(cmd.OutOrStdout(), "no ingest state for project %q\n", project)
+				return nil
+			}
+			if inProgress {
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"project=%s RUN IN PROGRESS started=%s completed=%d\n",
+					project,
+					state.RunStartedAt.Format(time.RFC3339),
+					len(state.CompletedModuleIDs))
 				return nil
 			}
 			fmt.Fprintf(cmd.OutOrStdout(),
