@@ -240,12 +240,19 @@ func buildIngestPipeline(cfg config.Config, segDir string) (*ingest.Pipeline, fu
 			"could not initialize secret detector", err)
 	}
 
+	// The ingest summarizer performs a 32K-context structured-output
+	// call per module, which on a local Ollama can take several minutes
+	// per request. We therefore use cfg.Timeouts.IngestSummarySeconds
+	// (not LinkDerivationSeconds) as the per-generation budget here —
+	// the underlying ollama.Config field is "LinkDerivationTimeout" for
+	// historical reasons but is really "generationBudget" and is fine
+	// to repurpose per command. See cortex-8rk.
 	ollamaClient := ollama.NewHTTPClient(ollama.Config{
 		Endpoint:              cfg.Endpoints.Ollama,
 		EmbeddingModel:        defaultEmbeddingModel,
 		GenerationModel:       defaultGenerationModel,
 		EmbeddingTimeout:      time.Duration(cfg.Timeouts.EmbeddingSeconds) * time.Second,
-		LinkDerivationTimeout: time.Duration(cfg.Timeouts.LinkDerivationSeconds) * time.Second,
+		LinkDerivationTimeout: time.Duration(cfg.Timeouts.IngestSummarySeconds) * time.Second,
 		NumCtx:                cfg.Ollama.NumCtx,
 	})
 
@@ -326,16 +333,21 @@ func buildIngestPipeline(cfg config.Config, segDir string) (*ingest.Pipeline, fu
 	}
 
 	p := &ingest.Pipeline{
-		Walker:          walkerWalk,
-		Matrix:          languages.DefaultMatrix(),
-		Summarizer:      summarizer,
-		Writer:          entryWriter,
-		TrailAppender:   appender,
-		StateStore:      stateStore,
-		PostReflect:     nil, // Phase 1: scoped reflection wired after cortex reflect lands
-		Now:             func() time.Time { return time.Now().UTC() },
-		Logger:          walker.NopLogger{},
-		Concurrency:     ingest.DefaultOllamaConcurrency,
+		Walker:        walkerWalk,
+		Matrix:        languages.DefaultMatrix(),
+		Summarizer:    summarizer,
+		Writer:        entryWriter,
+		TrailAppender: appender,
+		StateStore:    stateStore,
+		PostReflect:   nil, // Phase 1: scoped reflection wired after cortex reflect lands
+		Now:           func() time.Time { return time.Now().UTC() },
+		Logger:        walker.NopLogger{},
+		// Concurrency comes from cfg.Ingest.OllamaConcurrency (default 2
+		// since cortex-8rk; see internal/config/defaults.go for the
+		// rationale). ingest.DefaultOllamaConcurrency remains as the
+		// package fallback when the pipeline is constructed with a zero
+		// Concurrency.
+		Concurrency:     cfg.Ingest.OllamaConcurrency,
 		SkipPostReflect: true,
 	}
 	return p, cleanup, nil

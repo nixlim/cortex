@@ -267,7 +267,15 @@ func Defaults() Config {
 		},
 		Ingest: IngestConfig{
 			ModuleSizeLimitBytes: 262144,
-			OllamaConcurrency:    4,
+			// OllamaConcurrency bounds the number of module summary
+			// calls in flight against /api/generate. On a constrained
+			// local Ollama running qwen3:4b at NumCtx=32768, 4 concurrent
+			// calls overflow the model's single-request capacity and 3 of
+			// them queue past their per-request deadline. 2 matches what
+			// a consumer GPU can actually serve at 32K context. Raise
+			// this in config.yaml if your Ollama host has more VRAM or
+			// you're using a smaller model. See cortex-8rk.
+			OllamaConcurrency:    2,
 			PostIngestReflect:    true,
 			PostIngestAnalyze:    false,
 			DefaultStrategy: IngestDefaultStrategy{
@@ -311,7 +319,15 @@ func Defaults() Config {
 			LinkDerivationSeconds:    60,
 			TrailSummarySeconds:      60,
 			ReflectionSeconds:        60,
-			IngestSummarySeconds:     120,
+			// IngestSummarySeconds is the per-module wall clock for the
+			// ingest summarizer's structured-output call. At NumCtx=32768
+			// with a 100KB module prompt on a 4-8B q4 model running
+			// locally, a single /api/generate can take several minutes
+			// end-to-end (prompt processing + constrained decoding), so
+			// the default is generous. Raise it further if ingest logs
+			// SUMMARIZER_FAILED with 'context deadline exceeded'. See
+			// cortex-8rk.
+			IngestSummarySeconds: 600,
 		},
 		Ollama: OllamaConfig{
 			NumCtx:             32768,

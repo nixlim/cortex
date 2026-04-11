@@ -146,8 +146,11 @@ func TestDefaultsCompleteness(t *testing.T) {
 	if d.Migration.ExcludeFromCrossProject != true {
 		t.Error("migration.exclude_from_cross_project default wrong")
 	}
-	if d.Timeouts.IngestSummarySeconds != 120 {
+	if d.Timeouts.IngestSummarySeconds != 600 {
 		t.Error("timeouts.ingest_summary_seconds default wrong")
+	}
+	if d.Ingest.OllamaConcurrency != 2 {
+		t.Error("ingest.ollama_concurrency default wrong")
 	}
 	if d.CLI.ExitCode.Validation != 2 {
 		t.Error("cli.exit_code.validation default wrong")
