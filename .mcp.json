@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "cortex-trail": {
+      "command": "go",
+      "args": ["run", "./cmd/cortex-mcp"],
+      "env": {
+        "CORTEX_BIN": "./cortex"
+      }
+    }
+  }
+}
