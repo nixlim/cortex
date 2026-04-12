@@ -1,0 +1,42 @@
+# .cortexignore — paths cortex ingest skips, in addition to .gitignore.
+# Syntax: one glob/prefix per line, same rules as .gitignore.
+# Edit to taste; this file is operator-owned once it exists.
+
+# IDE / editor metadata
+.idea/
+.vscode/
+.cursor/
+
+# Agent / tooling state
+.claude/
+.beads/
+
+# Language / package artifacts
+node_modules/
+vendor/
+target/
+dist/
+build/
+
+# Test + profile output
+coverage.out
+*.log
+*.tmp
+
+# Eval fixtures and results — verbatim keyword lists act as lexical
+# magnets and dominate recall rank-1 (cortex-6dx). Keep source code
+# (eval/deep/runner/, eval/*/CLAUDE.md, READMEs); skip the data.
+eval/results.json
+eval/results.baseline.json
+eval/results.*.json
+eval/questions.json
+eval/run_eval.sh
+eval/deep/questions_deep.json
+eval/deep/run_deep_eval.sh
+eval/deep/runs/
+
+# Task planning artifacts — huge JSON blobs that act as lexical
+# magnets the same way eval fixtures do (see cortex-6dx). These
+# files contain every project concept in one document and dominated
+# rank 1-3 for ~15 of the 30 deep-eval queries at commit 4d34969.
+.tasks/

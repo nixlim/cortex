@@ -88,6 +88,18 @@ func newObserveCmdReal() *cobra.Command {
 				Facets:  facets,
 				Subject: subjectFlag,
 				TrailID: resolveTrailID(trailFlag),
+				// Session observations (cortex-7y4 / R3): seed at
+				// 0.3 instead of the FR-031 default 1.0 so agent-
+				// written observations do not dominate rank-1 for
+				// unrelated queries via w_base*B(e)=0.3. 0.3 keeps
+				// them visible for ~4 days of decay under the
+				// default 46-day visibility horizon, which covers
+				// the typical single-session reinforcement window;
+				// anything older than that is recoverable via
+				// normal ingest-path writes. Ingest itself still
+				// uses the 1.0 default (see ingest.go). See
+				// CORTEX_EVALUATION_2026-04-13.md R3.
+				InitialBaseActivation: 0.3,
 			}
 			res, err := pipeline.Observe(cmd.Context(), req)
 			if err != nil {

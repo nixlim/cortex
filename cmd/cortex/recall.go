@@ -155,6 +155,15 @@ func buildRecallPipeline() (*recall.Pipeline, *log.Writer, func(), error) {
 		SeedTopK:            cfg.Retrieval.PPR.SeedTopK,
 		Damping:             cfg.Retrieval.PPR.Damping,
 		MaxIterations:       cfg.Retrieval.PPR.MaxIterations,
+		// Relevance floor closes the "every query returns ~10 results
+		// at composite ~0.3" failure mode surfaced by deep eval
+		// negative queries. See bead cortex-7y4.
+		RelevanceFloor: cfg.Retrieval.RelevanceFloor,
+		// Pipeline default limit sourced from config so
+		// retrieval.default_limit actually flows through (bead
+		// cortex-voa). A positive --limit flag on Request overrides
+		// this value per-call.
+		Limit: cfg.Retrieval.DefaultLimit,
 	}
 	return pipeline, writer, cleanup, nil
 }

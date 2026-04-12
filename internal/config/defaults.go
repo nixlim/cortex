@@ -62,6 +62,11 @@ type RetrievalConfig struct {
 	PPR          PPRConfig        `yaml:"ppr"`
 	Activation   ActivationConfig `yaml:"activation"`
 	Forgetting   ForgettingConfig `yaml:"forgetting"`
+	// RelevanceFloor is the minimum max(similarity, ppr) a candidate
+	// must carry to survive reranking. See bead cortex-7y4: without a
+	// gate, every fresh entry keeps composite ~0.3 via w_base*B(e), so
+	// negative queries never return empty. Zero disables the gate.
+	RelevanceFloor float64 `yaml:"relevance_floor"`
 }
 
 type PPRConfig struct {
@@ -237,6 +242,19 @@ func Defaults() Config {
 				// dead within minutes of finishing. See bead cortex-upp.
 				VisibilityThreshold: 0.0005,
 			},
+			// 0.55 is calibrated from measured cosine similarity
+			// distributions in deep-eval dump 20260412T225007Z
+			// (commit 4d34969): real positive rank-1 hits sat at
+			// sim 0.65-0.70 and negative rank-1 hits sat at sim
+			// 0.53-0.60 on nomic-embed-text. The gate is now
+			// similarity-only (not max(sim,ppr)) because PPR always
+			// finds graph-connected neighbors regardless of semantic
+			// match. The previous 0.10 default never fired — cosine
+			// similarity between arbitrary cortex text pairs is
+			// routinely 0.5+. Re-tune after a clean re-ingest
+			// (CORTEX_EVALUATION_2026-04-13.md R1+R4). Target is
+			// deep-eval negative_triggered >= 0.8. See cortex-7y4.
+			RelevanceFloor: 0.55,
 		},
 		Pagination: PaginationConfig{
 			HumanDefaultLimit: 20,
@@ -324,10 +342,10 @@ func Defaults() Config {
 			// with a 100KB module prompt on a 4-8B q4 model running
 			// locally, a single /api/generate can take several minutes
 			// end-to-end (prompt processing + constrained decoding), so
-			// the default is generous. Raise it further if ingest logs
-			// SUMMARIZER_FAILED with 'context deadline exceeded'. See
-			// cortex-8rk.
-			IngestSummarySeconds: 600,
+			// the default is generous. Raised to 1800s after observing
+			// ~600s timeouts on large Go per-package summaries in the
+			// cortex self-ingest on a local qwen3:4b. See cortex-8rk.
+			IngestSummarySeconds: 1800,
 		},
 		Ollama: OllamaConfig{
 			NumCtx:             32768,

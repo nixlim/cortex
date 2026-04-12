@@ -183,6 +183,35 @@ type Pipeline struct {
 	VisibilityThreshold float64
 	DecayExponent       float64
 	Weights             actr.Weights
+
+	// RelevanceFloor is the minimum cosine similarity a candidate must
+	// carry to survive reranking. Without it, the composite is propped
+	// up by w_base*B(e)=0.3 for every fresh entry and queries with no
+	// real semantic match still return 10 results at composite ~0.3
+	// (see bead cortex-7y4).
+	//
+	// Why similarity alone, not max(similarity, ppr): PPR from seeds
+	// unavoidably touches graph-connected neighbors with nonzero score
+	// even when the query has no semantic match, so gating on max(sim,
+	// ppr) lets the PPR term alone keep irrelevant entries alive. The
+	// cortex-7y4 fix originally used max; the deep-eval verification
+	// at commit 4d34969 showed the max formulation did not fire on
+	// any of the five negative queries because ppr~0.15 is typical
+	// for any connected candidate. Requiring cosine similarity to
+	// clear the floor makes the gate a pure semantic relevance check.
+	//
+	// Tuning: 0.55 is calibrated against nomic-embed-text distributions
+	// measured in deep-eval dump 20260412T225007Z, where real positive
+	// rank-1 hits sat at sim 0.65-0.70 and negative rank-1 hits sat
+	// at sim 0.53-0.60. Conservative starting point — tune downward
+	// if legitimate queries are being dropped, upward if negatives
+	// still leak through. Re-run eval/deep/run_deep_eval.sh after a
+	// change and compare .retrievals[0].hits[0].similarity for
+	// negatives vs positives. Zero disables (preserves pre-cortex-7y4
+	// behavior for benchmarks and e2e tests that construct a pipeline
+	// directly). Production wiring in cmd/cortex/recall.go sources
+	// the value from retrieval.relevance_floor.
+	RelevanceFloor float64
 }
 
 // Recall runs the full default-mode pipeline. See the package doc for
@@ -195,6 +224,14 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Response, error) {
 			"cortex recall requires a non-empty query", nil)
 	}
 	p.fillDefaults()
+	// Per-request limit override. A positive req.Limit beats the
+	// pipeline default so `cortex recall --limit N` actually takes
+	// effect (bead cortex-voa). Non-positive values fall through to
+	// p.Limit (populated by fillDefaults from retrieval.default_limit).
+	effectiveLimit := p.Limit
+	if req.Limit > 0 {
+		effectiveLimit = req.Limit
+	}
 
 	// Stage 1: concept extraction.
 	concepts, err := p.Concepts.Extract(ctx, req.Query)
@@ -264,6 +301,17 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Response, error) {
 		base := e.Activation.Current(now, p.DecayExponent)
 		ppr := pprScores[e.EntryID]
 		sim := cosine(queryVec, e.Embedding)
+		// Relevance floor: without a semantic-match signal the
+		// composite collapses to w_base*B(e) — a constant ~0.3 for
+		// any fresh entry — so irrelevant queries still return 10
+		// results (cortex-7y4). The gate uses sim alone, not max(sim,
+		// ppr), because PPR touches graph-connected neighbors with
+		// nonzero score regardless of semantic match. Gate here
+		// rather than after ranking so suppressed candidates produce
+		// neither results nor reinforcement datoms.
+		if p.RelevanceFloor > 0 && sim < p.RelevanceFloor {
+			continue
+		}
 		imp := actr.ImportanceScore(actr.Importance{CrossProject: e.CrossProject})
 		composite := actr.Activation(actr.Inputs{
 			Base:       base,
@@ -285,8 +333,8 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Response, error) {
 	})
 
 	// Stage 8: truncate to limit.
-	if len(scoredAll) > p.Limit {
-		scoredAll = scoredAll[:p.Limit]
+	if len(scoredAll) > effectiveLimit {
+		scoredAll = scoredAll[:effectiveLimit]
 	}
 
 	// Stage 9: attach context + why-surfaced trace.

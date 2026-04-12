@@ -226,6 +226,17 @@ type ObserveRequest struct {
 	Facets  map[string]string
 	Subject string // canonical or alias PSI, optional
 	TrailID string // optional trail attachment
+
+	// InitialBaseActivation overrides the seeded base_activation for
+	// this entry. Zero means "use activation.InitialBaseActivation"
+	// (1.0) — the FR-031 default that makes ingest and replay-path
+	// writes immediately visible. Non-zero is used by the cortex
+	// observe CLI to seed session observations at a lower value
+	// (e.g. 0.3) so they do not compete with ingest content at
+	// rank-1. See bead cortex-7y4 / CORTEX_EVALUATION_2026-04-13.md
+	// R3. Must be in (0, 1]; out-of-range values are treated as
+	// zero and fall back to the default.
+	InitialBaseActivation float64
 }
 
 // ObserveResult is the successful-outcome payload. The EntryID is the
@@ -683,13 +694,21 @@ func buildObserveDatoms(
 		}
 	}
 	// FR-031: every freshly-written entry seeds an encoding_at and a
-	// base_activation=1.0 attribute. These two datoms make a brand-new
-	// entry visible to default recall (visibility threshold 0.05) and
-	// give the activation decay math a deterministic reference point.
+	// base_activation attribute. These two datoms make a brand-new
+	// entry visible to default recall and give the activation decay
+	// math a deterministic reference point. The default seed is
+	// activation.InitialBaseActivation (1.0); req.InitialBaseActivation
+	// lets callers (e.g. cortex observe for session observations) seed
+	// a lower value so they do not compete with ingest content at
+	// rank-1. See bead cortex-7y4 / CORTEX_EVALUATION_2026-04-13.md R3.
 	if err := add("encoding_at", encodingAt.UTC().Format(time.RFC3339Nano)); err != nil {
 		return nil, err
 	}
-	if err := add("base_activation", activation.InitialBaseActivation); err != nil {
+	seed := activation.InitialBaseActivation
+	if req.InitialBaseActivation > 0 && req.InitialBaseActivation <= 1 {
+		seed = req.InitialBaseActivation
+	}
+	if err := add("base_activation", seed); err != nil {
 		return nil, err
 	}
 	return group, nil

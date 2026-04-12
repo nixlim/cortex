@@ -252,6 +252,53 @@ func TestRecall_LimitTruncatesTo10(t *testing.T) {
 	}
 }
 
+// TestRecall_RequestLimitOverridesPipelineDefault covers cortex-voa:
+// a positive Request.Limit takes effect over the pipeline default.
+func TestRecall_RequestLimitOverridesPipelineDefault(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	entries := map[string]EntryState{}
+	ppr := map[string]float64{}
+	for i := 0; i < 15; i++ {
+		id := "entry:" + string(rune('A'+i))
+		entries[id] = makeEntry(id, 0.9, now, []float32{1, 0, 0})
+		ppr[id] = float64(i) / 15.0
+	}
+	p := newTestPipeline(entries, ppr)
+	resp, err := p.Recall(context.Background(), Request{Query: "q", Limit: 3})
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	if len(resp.Results) != 3 {
+		t.Fatalf("request limit not honored: got %d want 3", len(resp.Results))
+	}
+	// Reinforcement datoms must match the truncated result set, not the
+	// pre-truncation candidate pool.
+	if len(resp.ReinforcementDatoms) != 3*3 {
+		t.Fatalf("reinforcement datoms: got %d want 9", len(resp.ReinforcementDatoms))
+	}
+}
+
+// TestRecall_RequestLimitAboveCandidatesReturnsAll covers the capped
+// case: --limit 50 against 15 candidates returns all 15.
+func TestRecall_RequestLimitAboveCandidatesReturnsAll(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	entries := map[string]EntryState{}
+	ppr := map[string]float64{}
+	for i := 0; i < 15; i++ {
+		id := "entry:" + string(rune('A'+i))
+		entries[id] = makeEntry(id, 0.9, now, []float32{1, 0, 0})
+		ppr[id] = float64(i) / 15.0
+	}
+	p := newTestPipeline(entries, ppr)
+	resp, err := p.Recall(context.Background(), Request{Query: "q", Limit: 50})
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	if len(resp.Results) != 15 {
+		t.Fatalf("got %d results, want 15", len(resp.Results))
+	}
+}
+
 // TestRecall_OrderedByCompositeScore verifies the composite score
 // (w_base*B + w_ppr*PPR + w_sim*sim + w_imp*I) drives the final
 // ranking. Entry C has the highest PPR but a lower similarity — we
@@ -336,6 +383,79 @@ func TestRecall_WhySurfacedMentionsAllFourTerms(t *testing.T) {
 		if !strings.Contains(trace, token) {
 			t.Errorf("why_surfaced missing %q; got:\n%s", token, trace)
 		}
+	}
+}
+
+// TestRecall_RelevanceFloorDropsIrrelevantCandidates reproduces
+// cortex-7y4: without a relevance floor, a query that shares no
+// semantic match still surfaces entries because the composite is
+// propped up by w_base*B(e). The floor requires cosine similarity
+// >= RelevanceFloor; PPR does not rescue zero-similarity entries
+// (see the similarity-only rationale on Pipeline.RelevanceFloor).
+func TestRecall_RelevanceFloorDropsIrrelevantCandidates(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	// Both entries have a full base_activation (fresh writes) and
+	// embeddings orthogonal to the fake query vector {1,0,0}, so
+	// similarity is 0. PPR is non-trivial to prove the gate does
+	// not let PPR alone rescue a zero-similarity entry.
+	entries := map[string]EntryState{
+		"entry:IRR1": makeEntry("entry:IRR1", 1.0, now, []float32{0, 1, 0}),
+		"entry:IRR2": makeEntry("entry:IRR2", 1.0, now, []float32{0, 0, 1}),
+	}
+	p := newTestPipeline(entries, map[string]float64{
+		"entry:IRR1": 0.5,
+		"entry:IRR2": 0.3,
+	})
+	p.RelevanceFloor = 0.10
+
+	resp, err := p.Recall(context.Background(), Request{Query: "q"})
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	if len(resp.Results) != 0 {
+		t.Fatalf("relevance floor not honored: got %d results; first=%+v",
+			len(resp.Results), resp.Results[0])
+	}
+	if len(resp.ReinforcementDatoms) != 0 {
+		t.Fatalf("relevance floor did not suppress reinforcement: %d datoms",
+			len(resp.ReinforcementDatoms))
+	}
+}
+
+// TestRecall_RelevanceFloorGatesOnSimilarityOnly confirms the floor
+// is a similarity-only gate. PPR is not a rescue signal — an entry
+// with strong PPR but zero similarity is dropped, because PPR
+// touches graph-connected neighbors regardless of semantic match
+// and letting it override the semantic gate is the exact failure
+// mode cortex-7y4's verification caught.
+func TestRecall_RelevanceFloorGatesOnSimilarityOnly(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	entries := map[string]EntryState{
+		// Zero similarity, strong PPR → should be DROPPED despite
+		// the high graph signal.
+		"entry:PPR_ONLY": makeEntry("entry:PPR_ONLY", 1.0, now, []float32{0, 1, 0}),
+		// Similarity above floor → surfaces regardless of PPR.
+		"entry:SIM_OK": makeEntry("entry:SIM_OK", 1.0, now, []float32{1, 0, 0}),
+	}
+	p := newTestPipeline(entries, map[string]float64{
+		"entry:PPR_ONLY": 0.9,
+		"entry:SIM_OK":   0.01,
+	})
+	p.RelevanceFloor = 0.10
+
+	resp, err := p.Recall(context.Background(), Request{Query: "q"})
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	ids := make(map[string]bool, len(resp.Results))
+	for _, r := range resp.Results {
+		ids[r.EntryID] = true
+	}
+	if !ids["entry:SIM_OK"] {
+		t.Errorf("sim-above-floor entry should survive: got %v", ids)
+	}
+	if ids["entry:PPR_ONLY"] {
+		t.Errorf("sim-below-floor entry must not be rescued by PPR: got %v", ids)
 	}
 }
 
