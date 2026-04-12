@@ -1,0 +1,346 @@
+[
+  {
+    "id": 1,
+    "q": "what is a datom and what fields does it contain",
+    "intent": "concept",
+    "expected_modules": ["internal/datom/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "A datom is the atomic append-only unit of truth in cortex. Each datom carries a tx (ULID transaction id), actor, op (assert/retract), subject, attribute, value, checksum, and invocation id. Datoms are sealed before append and replayed to rebuild derived state.",
+    "rephrasings": [
+      "define the datom record structure",
+      "which fields make up a single datom"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 2,
+    "q": "how is base activation B(e) calculated",
+    "intent": "concept",
+    "expected_modules": ["internal/activation/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "B(e) = ln(sum over past reinforcements of (age_seconds ^ -decay_exponent)). Decay exponent defaults to 0.5 and is controlled by retrieval.activation.decay_exponent.",
+    "rephrasings": [
+      "what is the formula for base level activation",
+      "how does cortex compute the base-level component of ACT-R activation"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 3,
+    "q": "what are the four weights in ACT-R composite activation",
+    "intent": "concept",
+    "expected_modules": ["internal/actr/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "The composite activation is a weighted sum of base-level (0.3), PPR (0.3), similarity (0.3), and importance (0.1). Weights live under retrieval.activation.weights in config.",
+    "rephrasings": [
+      "list the components of the composite activation score",
+      "how is final score composed from base ppr similarity importance"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 4,
+    "q": "what are the recall pipeline steps from query to results",
+    "intent": "concept",
+    "expected_modules": ["internal/recall/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "concept extraction -> seed resolution -> Personalized PageRank -> entry load -> ACT-R activation rerank -> trail/community context attachment. Every surfaced entry is reinforced via an activation-update datom appended after rendering.",
+    "rephrasings": [
+      "walk me through the default recall flow",
+      "what are the stages of cortex recall"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 5,
+    "q": "how does the append-only log detect corruption",
+    "intent": "concept",
+    "expected_modules": ["internal/log/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "Each datom is sealed with a checksum. On startup the tail window (log.tail_validation_window_bytes) is validated; corrupt suffixes are truncated and self-heal replays missing datoms.",
+    "rephrasings": [
+      "how does cortex verify log segment integrity",
+      "what guarantees log tail validity after crash"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 6,
+    "q": "what does principled forgetting mean in cortex",
+    "intent": "concept",
+    "expected_modules": ["internal/activation/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "Entries whose activation falls below retrieval.forgetting.visibility_threshold (0.05) are hidden from recall but not deleted. Explicit control via pin/unpin/evict. The log stays intact so state can be rebuilt.",
+    "rephrasings": [
+      "explain cortex forgetting semantics",
+      "how does visibility threshold affect recall"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 7,
+    "q": "what is the role of trails in cortex",
+    "intent": "concept",
+    "expected_modules": ["internal/trail/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "A trail is a bracketed session of episodic observations bound by trail begin / trail end. Observations inside a trail share CORTEX_TRAIL_ID and are summarized at end.",
+    "rephrasings": [
+      "how do trail begin and trail end work",
+      "what is a cortex trail for"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 8,
+    "q": "what storage backends does cortex use",
+    "intent": "concept",
+    "expected_modules": ["docs/spec/cortex-spec.md"],
+    "gold_answer": "Neo4j (graph), Weaviate (vectors), Ollama (embeddings and concept extraction). The append-only datom log on disk is the authoritative source of truth; the backends are derived state.",
+    "rephrasings": [
+      "which databases back cortex",
+      "what services does cortex depend on at runtime"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 9,
+    "q": "what is semantic frame consolidation",
+    "intent": "concept",
+    "expected_modules": ["internal/reflect/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "Reflection promotes clusters of episodic observations into semantic frames when they meet min_cluster_size, min_distinct_timestamps, avg_pairwise_cosine_floor, and MDL compression ratio thresholds.",
+    "rephrasings": [
+      "how does reflection promote clusters into frames",
+      "what are the cluster promotion thresholds"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 10,
+    "q": "what does self-heal do on startup",
+    "intent": "concept",
+    "expected_modules": ["internal/replay/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "Self-heal replays datoms from the log that are missing from the derived backends (Neo4j, Weaviate) so that rebuilt state matches the log after a crash or partial failure.",
+    "rephrasings": [
+      "how does cortex recover from a crash",
+      "what happens at cortex startup to reconcile state"
+    ],
+    "should_be_empty": false
+  },
+
+  {
+    "id": 11,
+    "q": "where is retrieval.ppr.damping defined and what is its default",
+    "intent": "identifier",
+    "expected_modules": ["internal/config/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "retrieval.ppr.damping defaults to 0.85. It lives in the Retrieval.PPR section of config and is passed to the PPRRunner at recall time.",
+    "rephrasings": [
+      "what is the default PPR damping factor"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 12,
+    "q": "what is ingest.module_size_limit_bytes",
+    "intent": "identifier",
+    "expected_modules": ["internal/config/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "ingest.module_size_limit_bytes defaults to 262144 (256 KiB). Modules larger than this are split or skipped during ingest.",
+    "rephrasings": [
+      "maximum module size accepted by cortex ingest"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 13,
+    "q": "what function builds the recall pipeline",
+    "intent": "identifier",
+    "expected_modules": ["cmd/cortex/CLAUDE.md"],
+    "gold_answer": "buildRecallPipeline in cmd/cortex/recall.go constructs a recall.Pipeline from live adapters (Neo4j Bolt, Ollama, Weaviate) and opens the segment writer used for reinforcement datoms.",
+    "rephrasings": [
+      "where is the recall.Pipeline assembled in the CLI"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 14,
+    "q": "what type does cortex use to represent recall output",
+    "intent": "identifier",
+    "expected_modules": ["internal/recall/CLAUDE.md"],
+    "gold_answer": "recall.Response contains Results ([]Result) and ReinforcementDatoms ([]datom.Datom). Each Result carries EntryID, Body, Score, BaseActivation, PPRScore, Similarity, Importance, TrailContext, CommunityContext, and WhySurfaced.",
+    "rephrasings": [
+      "fields of recall.Response"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 15,
+    "q": "what is the config key for Ollama endpoint",
+    "intent": "identifier",
+    "expected_modules": ["internal/config/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "endpoints.ollama defaults to localhost:11434.",
+    "rephrasings": [
+      "default ollama url for cortex"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 16,
+    "q": "what does cortex retract do",
+    "intent": "identifier",
+    "expected_modules": ["cmd/cortex/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "cortex retract appends a retraction datom for a prior assertion so the effective state excludes it going forward. The original datom stays in the log for replay and history.",
+    "rephrasings": [
+      "purpose of the retract subcommand"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 17,
+    "q": "what is the visibility threshold config key",
+    "intent": "identifier",
+    "expected_modules": ["internal/config/CLAUDE.md", "docs/spec/cortex-spec.md"],
+    "gold_answer": "retrieval.forgetting.visibility_threshold defaults to 0.05. Entries with composite activation below this are hidden from recall.",
+    "rephrasings": [
+      "name of the forgetting threshold setting"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 18,
+    "q": "what ingest strategy does cortex use for Go code",
+    "intent": "identifier",
+    "expected_modules": ["docs/spec/cortex-spec.md"],
+    "gold_answer": "ingest.default_strategy.go=per-package — Go modules are ingested one unit per package.",
+    "rephrasings": [
+      "default cortex ingest unit for Go files"
+    ],
+    "should_be_empty": false
+  },
+
+  {
+    "id": 19,
+    "q": "how does cortex recall reinforce entries and where is the log write performed",
+    "intent": "cross-module",
+    "expected_modules": ["internal/recall/CLAUDE.md", "cmd/cortex/CLAUDE.md"],
+    "gold_answer": "recall.Pipeline.Recall returns unsealed ReinforcementDatoms but does not write them. The CLI (cmd/cortex/recall.go appendReinforcementDatoms) seals each datom and appends them as one transaction group to the log Writer opened by the CLI, preserving the pipeline-never-opens-its-own-log-handle invariant.",
+    "rephrasings": [
+      "who writes the reinforcement datoms produced by recall",
+      "how is activation reinforcement persisted after a recall"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 20,
+    "q": "how is concept extraction wired from config to the ollama client during recall",
+    "intent": "cross-module",
+    "expected_modules": ["internal/recall/CLAUDE.md", "internal/ollama/CLAUDE.md", "cmd/cortex/CLAUDE.md"],
+    "gold_answer": "buildRecallPipeline builds an ollama client from Config.Endpoints.Ollama and wraps it in ollamaConceptExtractor, which is assigned to recall.Pipeline.Concepts. The pipeline calls Concepts.Extract(query) which issues an Ollama completion using the concept-extraction prompt from internal/prompts.",
+    "rephrasings": [
+      "trace how a query gets concept-extracted in cortex"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 21,
+    "q": "how does ingest push entries into both neo4j and weaviate",
+    "intent": "cross-module",
+    "expected_modules": ["internal/ingest/CLAUDE.md", "internal/neo4j/CLAUDE.md", "internal/weaviate/CLAUDE.md"],
+    "gold_answer": "internal/ingest drives the pipeline: modules are summarized, embeddings are produced via Ollama, graph structure is written to Neo4j, and vectors + metadata are written to Weaviate. Every side-effect is preceded by a sealed datom append so replay can rebuild state.",
+    "rephrasings": [
+      "which components write to which backend during ingest"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 22,
+    "q": "how does the CLI surface operational errors from the pipeline",
+    "intent": "cross-module",
+    "expected_modules": ["internal/errs/CLAUDE.md", "cmd/cortex/CLAUDE.md"],
+    "gold_answer": "Pipeline code wraps underlying causes in errs.Operational/errs.Validation. The CLI's emitAndExit renders these with their cause chain and returns the cli.exit_code.operational / validation exit codes.",
+    "rephrasings": [
+      "how are underlying errors shown to the user"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 23,
+    "q": "how does PPR get its seeds from concept extraction output",
+    "intent": "cross-module",
+    "expected_modules": ["internal/recall/CLAUDE.md", "internal/neo4j/CLAUDE.md"],
+    "gold_answer": "Concepts from the extractor are passed to SeedResolver.Resolve(concepts, topK) — a neo4jSeedResolver that queries Neo4j for the top-k entries matching those concepts. Those entry ids then seed the PPRRunner.Run call.",
+    "rephrasings": [
+      "how are concepts turned into seed node ids"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 24,
+    "q": "how does cortex up bootstrap weaviate schema and which package owns it",
+    "intent": "cross-module",
+    "expected_modules": ["cmd/cortex/CLAUDE.md", "internal/weaviate/CLAUDE.md", "internal/infra/CLAUDE.md"],
+    "gold_answer": "cortex up (cmd/cortex/lifecycle.go) calls into internal/infra to start the docker stack, then into internal/weaviate to assert the required classes/schema exist. Schema ownership lives in internal/weaviate.",
+    "rephrasings": [
+      "where is the weaviate schema created for a fresh cortex install"
+    ],
+    "should_be_empty": false
+  },
+  {
+    "id": 25,
+    "q": "how does a failed ingest recover without losing prior modules",
+    "intent": "cross-module",
+    "expected_modules": ["internal/ingest/CLAUDE.md", "internal/log/CLAUDE.md", "internal/replay/CLAUDE.md"],
+    "gold_answer": "Every module ingest writes a sealed datom before it mutates derived state. On restart, self-heal replay (internal/replay) re-applies any datoms that were not reflected in Neo4j/Weaviate, and the RunInProgress marker tells the next ingest where to resume.",
+    "rephrasings": [
+      "what guarantees partial ingest is idempotent"
+    ],
+    "should_be_empty": false
+  },
+
+  {
+    "id": 26,
+    "q": "how does cortex handle real-time graphql subscriptions",
+    "intent": "negative",
+    "expected_modules": [],
+    "gold_answer": "Cortex has no graphql surface. It exposes a CLI and writes to Neo4j/Weaviate/Ollama; there is no subscription system, no graphql server, and no websocket push. Recall is a synchronous command invocation.",
+    "rephrasings": [
+      "what is the graphql subscription model in cortex"
+    ],
+    "should_be_empty": true
+  },
+  {
+    "id": 27,
+    "q": "how does cortex authenticate users via OAuth2",
+    "intent": "negative",
+    "expected_modules": [],
+    "gold_answer": "Cortex is a single-user local CLI. There is no OAuth2, no user model, and no auth middleware. The only credential in the system is the auto-generated Neo4j bolt password.",
+    "rephrasings": [
+      "cortex oauth login flow"
+    ],
+    "should_be_empty": true
+  },
+  {
+    "id": 28,
+    "q": "which react components render the cortex dashboard",
+    "intent": "negative",
+    "expected_modules": [],
+    "gold_answer": "Cortex has no react frontend. CORTEX_UI_SPEC.md may describe a planned UI but no components exist in the repo.",
+    "rephrasings": [
+      "cortex frontend component tree"
+    ],
+    "should_be_empty": true
+  },
+  {
+    "id": 29,
+    "q": "how does cortex shard writes across multiple kafka partitions",
+    "intent": "negative",
+    "expected_modules": [],
+    "gold_answer": "There is no kafka in cortex. All writes go to a single-process append-only segment log under ~/.cortex/log.d.",
+    "rephrasings": [
+      "cortex kafka partitioning strategy"
+    ],
+    "should_be_empty": true
+  },
+  {
+    "id": 30,
+    "q": "what is the cortex billing model for enterprise tenants",
+    "intent": "negative",
+    "expected_modules": [],
+    "gold_answer": "Cortex is a local developer tool with no billing, no tenancy, and no enterprise plan.",
+    "rephrasings": [
+      "cortex pricing tiers"
+    ],
+    "should_be_empty": true
+  }
+]

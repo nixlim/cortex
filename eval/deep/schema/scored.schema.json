@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nixlim/cortex/eval/deep/schema/scored.schema.json",
+  "title": "Cortex Deep Eval Scored Output",
+  "description": "Agent-produced verdicts for a deep eval run. Pairs 1:1 with a records entry in the dump file (by question id).",
+  "type": "object",
+  "required": ["dump_file", "scored_at", "scorer", "verdicts", "summary"],
+  "additionalProperties": false,
+  "properties": {
+    "dump_file": {
+      "type": "string",
+      "description": "Relative path of the dump file this scoring pass consumed, e.g. eval/deep/runs/20260412T140000Z.json"
+    },
+    "dump_commit": {
+      "type": "string",
+      "description": "Copy of header.commit from the dump — lets future re-scoring verify it consumed the same run."
+    },
+    "scored_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "scorer": {
+      "type": "object",
+      "required": ["kind", "name"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["agent", "human"]
+        },
+        "name": {
+          "type": "string",
+          "description": "Model id, human name, or tool identifier."
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "verdicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "verdict", "confidence", "reasoning"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "question.id from questions_deep.json"
+          },
+          "verdict": {
+            "type": "string",
+            "enum": ["PASS", "PARTIAL", "FAIL", "SKIP"]
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "One to three sentences explaining the verdict, citing which retrieved body was load-bearing."
+          },
+          "load_bearing": {
+            "type": "object",
+            "description": "Which hit from which retrieval the agent relied on.",
+            "required": ["query", "rank"],
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Either the original q or a rephrasing — must exactly match one of retrievals[].query in the dump."
+              },
+              "rank": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "entry_id": {
+                "type": "string"
+              },
+              "module": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "failure_mode": {
+            "type": "string",
+            "enum": [
+              "wrong_module",
+              "rank_too_low",
+              "over_retrieval",
+              "under_retrieval",
+              "rephrasing_drift",
+              "stale_content",
+              "incomplete_answer",
+              "contradiction",
+              "other"
+            ],
+            "description": "Required when verdict is FAIL or PARTIAL."
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "verdict": {
+                  "enum": ["FAIL", "PARTIAL"]
+                }
+              }
+            },
+            "then": {
+              "required": ["failure_mode"]
+            }
+          }
+        ]
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["pass", "partial", "fail", "skip"],
+      "properties": {
+        "pass": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "partial": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "fail": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skip": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

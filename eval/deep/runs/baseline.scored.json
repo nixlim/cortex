@@ -1,0 +1,255 @@
+{
+  "dump_file": "eval/deep/runs/baseline.json",
+  "dump_commit": "556345a",
+  "scored_at": "2026-04-12T01:50:00Z",
+  "scorer": {
+    "kind": "agent",
+    "name": "claude-opus-4-6",
+    "notes": "Initial baseline scoring for the deep eval harness. Performed as the end-to-end dry run required by cortex-0jm AC4. Judgments based on top-5 hits and per-retrieval module mix; eval/* artifacts are treated as over-retrieval contamination (see summary.notes)."
+  },
+  "verdicts": [
+    {
+      "id": 1,
+      "verdict": "PASS",
+      "confidence": 0.95,
+      "reasoning": "Rank-1 is internal/datom/CLAUDE.md and rank-2 is docs/spec/cortex-spec.md; either body fully supports the gold answer on datom fields.",
+      "load_bearing": {"query": "what is a datom and what fields does it contain", "rank": 1, "module": "internal/datom/CLAUDE.md"}
+    },
+    {
+      "id": 2,
+      "verdict": "PARTIAL",
+      "confidence": 0.7,
+      "reasoning": "Expected module is in top-3 (cortex-spec.md at rank 3) but rank-1/2 are eval self-hits, not the activation module. Answer is recoverable but buried.",
+      "load_bearing": {"query": "how is base activation B(e) calculated", "rank": 3, "module": "docs/spec/cortex-spec.md"},
+      "failure_mode": "rank_too_low"
+    },
+    {
+      "id": 3,
+      "verdict": "PARTIAL",
+      "confidence": 0.7,
+      "reasoning": "cortex-spec.md at rank 2 supports the four weights answer, but rank-1 is eval/questions.json which is over-retrieval.",
+      "load_bearing": {"query": "what are the four weights in ACT-R composite activation", "rank": 2, "module": "docs/spec/cortex-spec.md"},
+      "failure_mode": "rank_too_low"
+    },
+    {
+      "id": 4,
+      "verdict": "FAIL",
+      "confidence": 0.85,
+      "reasoning": "Top-3 are all eval/* artifacts; neither internal/recall/CLAUDE.md nor cortex-spec.md appears in the top-5 primary retrieval.",
+      "load_bearing": {"query": "what are the recall pipeline steps from query to results", "rank": 1, "module": "eval/results.baseline.json"},
+      "failure_mode": "over_retrieval"
+    },
+    {
+      "id": 5,
+      "verdict": "PASS",
+      "confidence": 0.9,
+      "reasoning": "cortex-spec.md at rank 1 and internal/datom at rank 2 (close neighbor of internal/log) together cover checksums and tail validation.",
+      "load_bearing": {"query": "how does the append-only log detect corruption", "rank": 1, "module": "docs/spec/cortex-spec.md"}
+    },
+    {
+      "id": 6,
+      "verdict": "PARTIAL",
+      "confidence": 0.65,
+      "reasoning": "cortex-spec.md at rank 3 mentions visibility_threshold but is buried under eval self-hits; activation module absent.",
+      "load_bearing": {"query": "what does principled forgetting mean in cortex", "rank": 3, "module": "docs/spec/cortex-spec.md"},
+      "failure_mode": "rank_too_low"
+    },
+    {
+      "id": 7,
+      "verdict": "FAIL",
+      "confidence": 0.8,
+      "reasoning": "Neither internal/trail nor cortex-spec.md appears in the top-3; primary returns eval self-hits plus a research doc.",
+      "load_bearing": {"query": "what is the role of trails in cortex", "rank": 1, "module": "eval/results.baseline.json"},
+      "failure_mode": "over_retrieval"
+    },
+    {
+      "id": 8,
+      "verdict": "PARTIAL",
+      "confidence": 0.7,
+      "reasoning": "cortex-spec.md appears at rank 3 and covers storage backends; rank-1/2 are eval over-retrieval.",
+      "load_bearing": {"query": "what storage backends does cortex use", "rank": 3, "module": "docs/spec/cortex-spec.md"},
+      "failure_mode": "rank_too_low"
+    },
+    {
+      "id": 9,
+      "verdict": "FAIL",
+      "confidence": 0.85,
+      "reasoning": "Expected internal/reflect and cortex-spec.md; neither in top-3. Rank-1 is an eval artifact.",
+      "load_bearing": {"query": "what is semantic frame consolidation", "rank": 1, "module": "eval/questions.json"},
+      "failure_mode": "over_retrieval"
+    },
+    {
+      "id": 10,
+      "verdict": "PASS",
+      "confidence": 0.9,
+      "reasoning": "cortex-spec.md at rank 1 covers self-heal replay end-to-end.",
+      "load_bearing": {"query": "what does self-heal do on startup", "rank": 1, "module": "docs/spec/cortex-spec.md"}
+    },
+    {
+      "id": 11,
+      "verdict": "PARTIAL",
+      "confidence": 0.7,
+      "reasoning": "cortex-spec.md at rank 3 has the PPR damping default; internal/config/CLAUDE.md absent.",
+      "load_bearing": {"query": "where is retrieval.ppr.damping defined and what is its default", "rank": 3, "module": "docs/spec/cortex-spec.md"},
+      "failure_mode": "rank_too_low"
+    },
+    {
+      "id": 12,
+      "verdict": "PASS",
+      "confidence": 0.9,
+      "reasoning": "cortex-spec.md at rank 1 lists ingest.module_size_limit_bytes=262144.",
+      "load_bearing": {"query": "what is ingest.module_size_limit_bytes", "rank": 1, "module": "docs/spec/cortex-spec.md"}
+    },
+    {
+      "id": 13,
+      "verdict": "FAIL",
+      "confidence": 0.9,
+      "reasoning": "Entire top-5 is eval artifacts; cmd/cortex module absent. buildRecallPipeline is not recoverable from any retrieved body.",
+      "load_bearing": {"query": "what function builds the recall pipeline", "rank": 1, "module": "eval/results.baseline.json"},
+      "failure_mode": "under_retrieval"
+    },
+    {
+      "id": 14,
+      "verdict": "FAIL",
+      "confidence": 0.9,
+      "reasoning": "internal/recall absent from top-5. recall.Response schema not recoverable.",
+      "load_bearing": {"query": "what type does cortex use to represent recall output", "rank": 1, "module": "eval/results.baseline.json"},
+      "failure_mode": "under_retrieval"
+    },
+    {
+      "id": 15,
+      "verdict": "PARTIAL",
+      "confidence": 0.6,
+      "reasoning": "docs/research/phase-1-spec-v2.md at rank 2 likely mentions endpoints.ollama=localhost:11434 but it is a research doc, not the config owner. cortex-spec.md absent from top-3.",
+      "load_bearing": {"query": "what is the config key for Ollama endpoint", "rank": 2, "module": "docs/research/phase-1-spec-v2.md"},
+      "failure_mode": "wrong_module"
+    },
+    {
+      "id": 16,
+      "verdict": "FAIL",
+      "confidence": 0.85,
+      "reasoning": "Top-3 entirely eval artifacts; no retract documentation surfaces.",
+      "load_bearing": {"query": "what does cortex retract do", "rank": 1, "module": "eval/results.baseline.json"},
+      "failure_mode": "under_retrieval"
+    },
+    {
+      "id": 17,
+      "verdict": "FAIL",
+      "confidence": 0.85,
+      "reasoning": "Top-3 entirely eval artifacts; visibility_threshold config key not in retrieved bodies.",
+      "load_bearing": {"query": "what is the visibility threshold config key", "rank": 1, "module": "eval/results.baseline.json"},
+      "failure_mode": "under_retrieval"
+    },
+    {
+      "id": 18,
+      "verdict": "PARTIAL",
+      "confidence": 0.55,
+      "reasoning": "A research doc at rank 3 may cover per-package for Go, but cortex-spec.md (canonical) is absent. Answer weakly recoverable.",
+      "load_bearing": {"query": "what ingest strategy does cortex use for Go code", "rank": 3, "module": "docs/research/phase-1-spec-v2.md"},
+      "failure_mode": "wrong_module"
+    },
+    {
+      "id": 19,
+      "verdict": "FAIL",
+      "confidence": 0.95,
+      "reasoning": "Cross-module question: requires both internal/recall and cmd/cortex. Neither in top-5. Over-retrieval dominates.",
+      "load_bearing": {"query": "how does cortex recall reinforce entries and where is the log write performed", "rank": 1, "module": "eval/results.baseline.json"},
+      "failure_mode": "under_retrieval"
+    },
+    {
+      "id": 20,
+      "verdict": "FAIL",
+      "confidence": 0.9,
+      "reasoning": "docs/research/ draft doc at rank 1 is not the canonical source; internal/recall and internal/ollama absent.",
+      "load_bearing": {"query": "how is concept extraction wired from config to the ollama client during recall", "rank": 1, "module": "docs/research/phase-1-spec-v2.md"},
+      "failure_mode": "wrong_module"
+    },
+    {
+      "id": 21,
+      "verdict": "PARTIAL",
+      "confidence": 0.6,
+      "reasoning": "cortex-spec.md at rank 2 describes ingest at a high level but none of the three target internal packages appear.",
+      "load_bearing": {"query": "how does ingest push entries into both neo4j and weaviate", "rank": 2, "module": "docs/spec/cortex-spec.md"},
+      "failure_mode": "under_retrieval"
+    },
+    {
+      "id": 22,
+      "verdict": "PARTIAL",
+      "confidence": 0.65,
+      "reasoning": "cortex-spec.md at rank 1 mentions cli.exit_code.* but internal/errs and cmd/cortex are absent — emitAndExit cannot be verified from retrieved bodies alone.",
+      "load_bearing": {"query": "how does the CLI surface operational errors from the pipeline", "rank": 1, "module": "docs/spec/cortex-spec.md"},
+      "failure_mode": "incomplete_answer"
+    },
+    {
+      "id": 23,
+      "verdict": "PARTIAL",
+      "confidence": 0.55,
+      "reasoning": "Research doc at rank 1 and cortex-spec.md at rank 3 describe PPR seeds at the conceptual level; neither internal/recall nor internal/neo4j appears.",
+      "load_bearing": {"query": "how does PPR get its seeds from concept extraction output", "rank": 3, "module": "docs/spec/cortex-spec.md"},
+      "failure_mode": "wrong_module"
+    },
+    {
+      "id": 24,
+      "verdict": "PARTIAL",
+      "confidence": 0.6,
+      "reasoning": "cortex-spec.md at rank 3 covers cortex up and weaviate schema broadly; cmd/cortex and internal/weaviate/internal/infra absent.",
+      "load_bearing": {"query": "how does cortex up bootstrap weaviate schema and which package owns it", "rank": 3, "module": "docs/spec/cortex-spec.md"},
+      "failure_mode": "under_retrieval"
+    },
+    {
+      "id": 25,
+      "verdict": "PARTIAL",
+      "confidence": 0.65,
+      "reasoning": "cortex-spec.md at rank 1 mentions self-heal replay and RunInProgress; ingest/log/replay modules absent from top-3.",
+      "load_bearing": {"query": "how does a failed ingest recover without losing prior modules", "rank": 1, "module": "docs/spec/cortex-spec.md"},
+      "failure_mode": "incomplete_answer"
+    },
+    {
+      "id": 26,
+      "verdict": "FAIL",
+      "confidence": 0.95,
+      "reasoning": "Negative query: expected no high-score hits. Rank-1 score 0.34 > 0.05 threshold; runner correctly marked negative_triggered=false.",
+      "load_bearing": {"query": "how does cortex handle real-time graphql subscriptions", "rank": 1, "module": "eval/results.baseline.json"},
+      "failure_mode": "over_retrieval"
+    },
+    {
+      "id": 27,
+      "verdict": "FAIL",
+      "confidence": 0.95,
+      "reasoning": "Negative query: high-score hits on eval artifacts instead of empty. OAuth is not a cortex concept; retrieval should have been empty or sub-threshold.",
+      "load_bearing": {"query": "how does cortex authenticate users via OAuth2", "rank": 1, "module": "eval/results.baseline.json"},
+      "failure_mode": "over_retrieval"
+    },
+    {
+      "id": 28,
+      "verdict": "FAIL",
+      "confidence": 0.95,
+      "reasoning": "Negative query failed to trigger empty; eval artifacts returned with 0.3+ scores.",
+      "load_bearing": {"query": "which react components render the cortex dashboard", "rank": 1, "module": "eval/results.baseline.json"},
+      "failure_mode": "over_retrieval"
+    },
+    {
+      "id": 29,
+      "verdict": "FAIL",
+      "confidence": 0.95,
+      "reasoning": "Negative query failed to trigger empty; eval artifacts returned with 0.3+ scores.",
+      "load_bearing": {"query": "how does cortex shard writes across multiple kafka partitions", "rank": 1, "module": "eval/results.baseline.json"},
+      "failure_mode": "over_retrieval"
+    },
+    {
+      "id": 30,
+      "verdict": "FAIL",
+      "confidence": 0.95,
+      "reasoning": "Negative query failed to trigger empty; eval artifacts returned with 0.3+ scores.",
+      "load_bearing": {"query": "what is the cortex billing model for enterprise tenants", "rank": 1, "module": "eval/results.baseline.json"},
+      "failure_mode": "over_retrieval"
+    }
+  ],
+  "summary": {
+    "pass": 4,
+    "partial": 12,
+    "fail": 14,
+    "skip": 0,
+    "notes": "Deep eval immediately surfaces two high-impact quality issues the lexical gate cannot see. (1) Eval self-recall: eval/results*.json, eval/questions.json, and eval/run_eval.sh dominate top-1 for 21/30 questions because they were ingested and their verbatim keyword lists are lexical magnets. They should be excluded via .cortexignore. (2) Negative queries never trigger empty — 0/5 — suggesting the composite activation score has no calibrated 'no relevance' floor; every query returns the same small set of eval artifacts regardless of topic. File both as separate beads; they were invisible to eval/run_eval.sh's keyword-match scoring."
+  }
+}
