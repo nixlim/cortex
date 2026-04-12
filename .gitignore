@@ -7,6 +7,7 @@
 # Build artifacts
 /bin/
 /cortex
+/cortex-mcp
 
 # macOS metadata
 .DS_Store
