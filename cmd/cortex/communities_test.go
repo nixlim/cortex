@@ -33,6 +33,23 @@ import (
 	"github.com/nixlim/cortex/internal/neo4j"
 )
 
+// fakeVectorFetcher is a community.VectorFetcher double. It returns
+// the pre-seeded vectors map verbatim — the enrich pass skips ids
+// missing from the map, so tests that don't care about cosine/mdl
+// accuracy can supply an empty map (enrichment runs but avg_cosine
+// stays 0 and mdl_ratio stays 1.0 — both non-null, which is all
+// cortex-6ef's AC requires from the default fast path).
+type fakeVectorFetcher struct {
+	vectors map[string][]float32
+}
+
+func (f *fakeVectorFetcher) FetchVectorsByCortexIDs(_ context.Context, _ string, _ []string) (map[string][]float32, error) {
+	if f.vectors == nil {
+		return map[string][]float32{}, nil
+	}
+	return f.vectors, nil
+}
+
 // fakeCommunityClient is a neo4j.Client double scoped to the surfaces
 // the detect command actually touches: RunGDS (for the projection
 // fast-path probes and the leiden / louvain stream), WriteEntries
@@ -64,8 +81,13 @@ type fakeCommunityClient struct {
 	gdsCalls []string
 	// writeCalls records every WriteEntries invocation. The detect
 	// command calls Persist once per community, so len(writeCalls)
-	// must equal sum(communities per level).
+	// must equal sum(communities per level) plus the enrich pass.
 	writeCalls []map[string]any
+
+	// enrichRows is the payload returned for the level-0 enrich
+	// read-back query. Nil means "no level-0 communities have entry
+	// members" — enrichment performs no writes in that case.
+	enrichRows []map[string]any
 }
 
 func (f *fakeCommunityClient) Ping(context.Context) error { panic("unused") }
@@ -106,6 +128,12 @@ func (f *fakeCommunityClient) RunGDS(_ context.Context, cypher string, _ map[str
 		return f.leidenRows, f.leidenErr
 	case strings.Contains(cypher, "gds.louvain.stream"):
 		return f.louvainRows, f.louvainErr
+	case strings.Contains(cypher, "MATCH (c:Community {level: 0})<-[:IN_COMMUNITY]"):
+		// Enrich pass read-back: return whatever the test seeded, or
+		// an empty row set. The happy-path tests don't care about
+		// enrichment content beyond "runs without error"; the
+		// cosine/MDL computation itself is covered in enrich_test.go.
+		return f.enrichRows, nil
 	}
 	return nil, nil
 }
@@ -136,7 +164,7 @@ func TestDetectAndPersistCommunities_HappyPathLeiden(t *testing.T) {
 		leidenRows: rows,
 	}
 
-	res, err := detectAndPersistCommunities(context.Background(), fake, "cortex.semantic")
+	res, err := detectAndPersistCommunities(context.Background(), fake, &fakeVectorFetcher{}, "Entry", "cortex.semantic")
 	if err != nil {
 		t.Fatalf("detectAndPersistCommunities: %v", err)
 	}
@@ -160,7 +188,8 @@ func TestDetectAndPersistCommunities_HappyPathLeiden(t *testing.T) {
 
 	// The projection slow path emits exists → drop → project before
 	// any algorithm call. After that, leiden runs once per
-	// resolution (3 calls). Total: 6 GDS calls.
+	// resolution (3 calls). Finally the enrich pass issues one
+	// read-back MATCH. Total: 7 GDS calls.
 	wantSeq := []string{
 		"gds.graph.exists",
 		"gds.graph.drop",
@@ -168,6 +197,7 @@ func TestDetectAndPersistCommunities_HappyPathLeiden(t *testing.T) {
 		"gds.leiden.stream",
 		"gds.leiden.stream",
 		"gds.leiden.stream",
+		"MATCH (c:Community {level: 0})",
 	}
 	if got, want := len(fake.gdsCalls), len(wantSeq); got != want {
 		for i, c := range fake.gdsCalls {
@@ -203,7 +233,7 @@ func TestDetectAndPersistCommunities_LouvainFallback(t *testing.T) {
 		louvainRows: rows,
 	}
 
-	res, err := detectAndPersistCommunities(context.Background(), fake, "cortex.semantic")
+	res, err := detectAndPersistCommunities(context.Background(), fake, &fakeVectorFetcher{}, "Entry", "cortex.semantic")
 	if err != nil {
 		t.Fatalf("detectAndPersistCommunities: %v", err)
 	}
@@ -220,11 +250,13 @@ func TestDetectAndPersistCommunities_LouvainFallback(t *testing.T) {
 		}
 	}
 
-	// Leiden is attempted once (errors immediately on the first
-	// resolution level), then Louvain is attempted three times (one
-	// per resolution). Plus the projection setup: exists, drop,
-	// project. Total: 3 setup + 1 leiden + 3 louvain = 7.
-	if got, want := len(fake.gdsCalls), 7; got != want {
+	// Leiden is attempted once (errors immediately), then Louvain is
+	// attempted ONCE — cortex-i3w fixed Louvain to run a single time
+	// and decode intermediateCommunityIds for the level hierarchy,
+	// rather than rerunning per resolution. Plus projection setup
+	// (exists, drop, project) and the enrich read-back. Total:
+	// 3 setup + 1 leiden + 1 louvain + 1 enrich = 6.
+	if got, want := len(fake.gdsCalls), 6; got != want {
 		for i, c := range fake.gdsCalls {
 			t.Logf("call %d: %s", i, firstLine(c))
 		}
@@ -237,7 +269,9 @@ func TestDetectAndPersistCommunities_LouvainFallback(t *testing.T) {
 		t.Errorf("call[4]: expected louvain fallback, got %s", firstLine(fake.gdsCalls[4]))
 	}
 
-	// Louvain ran 3 times; persist runs 2 communities × 3 levels = 6.
+	// Louvain ran once; persist runs 2 communities × 3 levels = 6
+	// because the dendrogram synthesizes all three levels from a
+	// single Louvain output.
 	if got, want := len(fake.writeCalls), 6; got != want {
 		t.Errorf("WriteEntries call count: got %d, want %d", got, want)
 	}
@@ -249,7 +283,7 @@ func TestDetectAndPersistCommunities_BothAlgorithmsFail(t *testing.T) {
 		louvainErr: errors.New("louvain boom"),
 	}
 
-	res, err := detectAndPersistCommunities(context.Background(), fake, "cortex.semantic")
+	res, err := detectAndPersistCommunities(context.Background(), fake, &fakeVectorFetcher{}, "Entry", "cortex.semantic")
 	if err == nil {
 		t.Fatalf("expected error, got result %+v", res)
 	}

@@ -150,17 +150,17 @@ func (d *Detector) Detect(ctx context.Context, alg Algorithm, cfg Config) ([][]C
 		return nil, errors.New("community: no neo4j client configured")
 	}
 
-	builder := d.LeidenQuery
 	if alg == AlgorithmLouvain {
-		builder = d.LouvainQuery
+		return d.detectLouvain(ctx, cfg)
 	}
-	if builder == nil {
+
+	if d.LeidenQuery == nil {
 		return nil, fmt.Errorf("community: no query builder for %s", alg)
 	}
 
 	hierarchy := make([][]Community, cfg.Levels)
 	for level, resolution := range cfg.Resolutions {
-		cypher := builder(cfg.GraphName)
+		cypher := d.LeidenQuery(cfg.GraphName)
 		params := map[string]any{
 			"maxLevels":  cfg.MaxIterations,
 			"resolution": resolution,
@@ -173,6 +173,97 @@ func (d *Detector) Detect(ctx context.Context, alg Algorithm, cfg Config) ([][]C
 		hierarchy[level] = groupByCommunity(rows, level, d.TopNodeCount)
 	}
 	return hierarchy, nil
+}
+
+// detectLouvain runs Louvain ONCE and decodes the per-level
+// assignments from the intermediateCommunityIds column. GDS Louvain
+// does not honor a resolution parameter (see cortex-i3w) — rerunning
+// it per level only produced non-deterministic, non-monotonic
+// partitions. Instead we use the dendrogram that Louvain already
+// returns: intermediateCommunityIds is ordered finest→coarsest, and
+// the final communityId equals the last intermediate entry.
+//
+// Cortex level 0 is the finest level, level L-1 the coarsest, so we
+// map Cortex level i → intermediateCommunityIds[min(i, len-1)]. When
+// Louvain produces fewer dendrogram levels than requested (common on
+// small graphs) the tail levels collapse to the coarsest partition —
+// still monotonic, still deterministic, no non-determinism between
+// duplicate levels.
+func (d *Detector) detectLouvain(ctx context.Context, cfg Config) ([][]Community, error) {
+	if d.LouvainQuery == nil {
+		return nil, fmt.Errorf("community: no query builder for %s", AlgorithmLouvain)
+	}
+	cypher := d.LouvainQuery(cfg.GraphName)
+	params := map[string]any{
+		"maxLevels": cfg.MaxIterations,
+		"tolerance": cfg.Tolerance,
+	}
+	rows, err := d.Neo4j.RunGDS(ctx, cypher, params)
+	if err != nil {
+		return nil, fmt.Errorf("community: %s: %w", AlgorithmLouvain, err)
+	}
+	hierarchy := make([][]Community, cfg.Levels)
+	for level := 0; level < cfg.Levels; level++ {
+		projected := make([]map[string]any, 0, len(rows))
+		for _, row := range rows {
+			nid, ok := rowInt64(row, "nodeId")
+			if !ok {
+				continue
+			}
+			cid, ok := louvainLevelCommunityID(row, level)
+			if !ok {
+				continue
+			}
+			projected = append(projected, map[string]any{
+				"nodeId":      nid,
+				"communityId": cid,
+			})
+		}
+		hierarchy[level] = groupByCommunity(projected, level, d.TopNodeCount)
+	}
+	return hierarchy, nil
+}
+
+// louvainLevelCommunityID picks the community id for a given Cortex
+// level from a Louvain result row. Uses intermediateCommunityIds when
+// available (index = min(level, len-1)) and falls back to the final
+// communityId when the intermediate column is absent or empty.
+func louvainLevelCommunityID(row map[string]any, level int) (int64, bool) {
+	if raw, ok := row["intermediateCommunityIds"]; ok && raw != nil {
+		ids := toInt64Slice(raw)
+		if len(ids) > 0 {
+			idx := level
+			if idx >= len(ids) {
+				idx = len(ids) - 1
+			}
+			return ids[idx], true
+		}
+	}
+	return rowInt64(row, "communityId")
+}
+
+// toInt64Slice decodes the common driver encodings of a Cypher list
+// of integers. Neo4j returns []any of int64 in production; tests
+// typically use []int64 directly.
+func toInt64Slice(v any) []int64 {
+	switch s := v.(type) {
+	case []int64:
+		return s
+	case []any:
+		out := make([]int64, 0, len(s))
+		for _, item := range s {
+			switch n := item.(type) {
+			case int64:
+				out = append(out, n)
+			case int:
+				out = append(out, int64(n))
+			case int32:
+				out = append(out, int64(n))
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // groupByCommunity collapses a flat "nodeId, communityId" stream

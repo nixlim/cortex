@@ -178,7 +178,14 @@ func TestDetect_LeidenPathBuildsLeidenQuery(t *testing.T) {
 }
 
 func TestDetect_LouvainFallbackPath(t *testing.T) {
-	fn := &fakeNeo4j{rowsByResolution: map[float64][]map[string]any{-1: nil}}
+	// Louvain is invoked ONCE (not per level) because GDS Louvain does
+	// not honor a resolution parameter — the hierarchy is instead
+	// decoded from intermediateCommunityIds. See cortex-i3w.
+	fn := &fakeNeo4j{rowsByResolution: map[float64][]map[string]any{-1: {
+		{"nodeId": int64(1), "communityId": int64(100), "intermediateCommunityIds": []int64{10, 50, 100}},
+		{"nodeId": int64(2), "communityId": int64(100), "intermediateCommunityIds": []int64{11, 50, 100}},
+		{"nodeId": int64(3), "communityId": int64(200), "intermediateCommunityIds": []int64{20, 60, 200}},
+	}}}
 	d := newFixtureDetector(fn)
 	_, err := d.Detect(context.Background(), AlgorithmLouvain, threeLevelConfig())
 	if err != nil {
@@ -187,8 +194,83 @@ func TestDetect_LouvainFallbackPath(t *testing.T) {
 	if !strings.HasPrefix(fn.lastCypher, "FAKE_LOUVAIN ") {
 		t.Errorf("Detect used cypher %q, want FAKE_LOUVAIN prefix", fn.lastCypher)
 	}
-	if fn.runCalls != 3 {
-		t.Errorf("RunGDS called %d times, want 3 (one per level)", fn.runCalls)
+	if fn.runCalls != 1 {
+		t.Errorf("RunGDS called %d times, want 1 (single Louvain run)", fn.runCalls)
+	}
+}
+
+// TestDetect_LouvainHierarchyMonotonic covers cortex-i3w's core
+// acceptance: the multi-level Louvain hierarchy must be monotonic
+// (coarser levels have fewer-or-equal communities). We stage a
+// three-node, three-level dendrogram where the three nodes start in
+// three distinct communities, collapse to two, then to one.
+func TestDetect_LouvainHierarchyMonotonic(t *testing.T) {
+	fn := &fakeNeo4j{rowsByResolution: map[float64][]map[string]any{-1: {
+		{"nodeId": int64(1), "communityId": int64(900), "intermediateCommunityIds": []int64{10, 50, 900}},
+		{"nodeId": int64(2), "communityId": int64(900), "intermediateCommunityIds": []int64{11, 50, 900}},
+		{"nodeId": int64(3), "communityId": int64(900), "intermediateCommunityIds": []int64{12, 51, 900}},
+	}}}
+	d := newFixtureDetector(fn)
+	h, err := d.Detect(context.Background(), AlgorithmLouvain, threeLevelConfig())
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if len(h) != 3 {
+		t.Fatalf("levels: got %d want 3", len(h))
+	}
+	if len(h[0]) != 3 || len(h[1]) != 2 || len(h[2]) != 1 {
+		t.Fatalf("community counts not monotonic: l0=%d l1=%d l2=%d",
+			len(h[0]), len(h[1]), len(h[2]))
+	}
+	for i := 1; i < len(h); i++ {
+		if len(h[i]) > len(h[i-1]) {
+			t.Errorf("level %d (%d) has more communities than level %d (%d)",
+				i, len(h[i]), i-1, len(h[i-1]))
+		}
+	}
+}
+
+// TestDetect_LouvainFallsBackToCommunityID verifies the robustness
+// path: when intermediateCommunityIds is absent, every level uses
+// the final communityId (single-level fallback).
+func TestDetect_LouvainFallsBackToCommunityID(t *testing.T) {
+	fn := &fakeNeo4j{rowsByResolution: map[float64][]map[string]any{-1: {
+		{"nodeId": int64(1), "communityId": int64(7)},
+		{"nodeId": int64(2), "communityId": int64(7)},
+		{"nodeId": int64(3), "communityId": int64(8)},
+	}}}
+	d := newFixtureDetector(fn)
+	h, err := d.Detect(context.Background(), AlgorithmLouvain, threeLevelConfig())
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	for level, comms := range h {
+		if len(comms) != 2 {
+			t.Errorf("level %d: got %d communities want 2", level, len(comms))
+		}
+	}
+}
+
+// TestDetect_LouvainShorterDendrogramTailCollapses verifies that
+// when Louvain returns fewer dendrogram levels than Cortex asks for,
+// the tail levels reuse the coarsest entry rather than going
+// out-of-bounds (monotonicity preserved via ties).
+func TestDetect_LouvainShorterDendrogramTailCollapses(t *testing.T) {
+	fn := &fakeNeo4j{rowsByResolution: map[float64][]map[string]any{-1: {
+		{"nodeId": int64(1), "communityId": int64(2), "intermediateCommunityIds": []int64{1, 2}},
+		{"nodeId": int64(2), "communityId": int64(2), "intermediateCommunityIds": []int64{2, 2}},
+	}}}
+	d := newFixtureDetector(fn)
+	h, err := d.Detect(context.Background(), AlgorithmLouvain, threeLevelConfig())
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	// Level 0 uses idx 0 (two distinct ids → 2 communities).
+	// Level 1 uses idx 1 (both ids = 2 → 1 community).
+	// Level 2 clamps to idx 1 → same as level 1.
+	if len(h[0]) != 2 || len(h[1]) != 1 || len(h[2]) != 1 {
+		t.Fatalf("tail collapse: l0=%d l1=%d l2=%d",
+			len(h[0]), len(h[1]), len(h[2]))
 	}
 }
 

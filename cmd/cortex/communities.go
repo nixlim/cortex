@@ -23,6 +23,7 @@ import (
 	"github.com/nixlim/cortex/internal/errs"
 	"github.com/nixlim/cortex/internal/infra"
 	"github.com/nixlim/cortex/internal/neo4j"
+	"github.com/nixlim/cortex/internal/weaviate"
 )
 
 // newCommunitiesCmdReal returns the wired `cortex communities` parent.
@@ -102,13 +103,18 @@ func newCommunitiesDetectCmd() *cobra.Command {
 // communitiesDetectResult is the shape returned by --json. The
 // per-level counts let an operator (or a CI gate) verify that
 // detection produced a non-empty hierarchy without having to parse
-// the human-readable rendering.
+// the human-readable rendering. EnrichedCount / VectorsFetched cover
+// the post-detect cosine/MDL enrichment pass (bead cortex-6ef) so an
+// operator can confirm that reflect's cluster source will have
+// non-null properties to filter on.
 type communitiesDetectResult struct {
 	Algorithm        string `json:"algorithm"`
 	Levels           int    `json:"levels"`
 	CommunitiesByLvl []int  `json:"communities_by_level"`
 	MembersByLvl     []int  `json:"members_by_level"`
 	GraphName        string `json:"graph_name"`
+	EnrichedCount    int    `json:"enriched_count"`
+	VectorsFetched   int    `json:"vectors_fetched"`
 }
 
 // runCommunitiesDetect is the procedural body of the detect command.
@@ -136,7 +142,8 @@ func runCommunitiesDetect(cmd *cobra.Command, jsonFlag bool) error {
 	}
 	defer func() { _ = bolt.Close(context.Background()) }()
 
-	res, err := detectAndPersistCommunities(cmd.Context(), bolt, semanticGraphName)
+	weaviateClient := newWeaviateClient(cfg)
+	res, err := detectAndPersistCommunities(cmd.Context(), bolt, weaviateClient, weaviate.ClassEntry, semanticGraphName)
 	if err != nil {
 		return emitAndExit(cmd, err, jsonFlag)
 	}
@@ -156,7 +163,7 @@ func runCommunitiesDetect(cmd *cobra.Command, jsonFlag bool) error {
 // and returns the per-level counts the renderer needs. The Detector
 // is constructed inline because it carries no per-call state and the
 // Detect/Persist split is the seam analyze.go already exercises.
-func detectAndPersistCommunities(ctx context.Context, client neo4j.Client, graphName string) (*communitiesDetectResult, error) {
+func detectAndPersistCommunities(ctx context.Context, client neo4j.Client, fetcher community.VectorFetcher, weaviateClass, graphName string) (*communitiesDetectResult, error) {
 	if err := ensureSemanticProjection(ctx, client, graphName); err != nil {
 		return nil, errs.Operational("PROJECTION_FAILED",
 			"could not create or refresh GDS projection", err)
@@ -195,12 +202,25 @@ func detectAndPersistCommunities(ctx context.Context, client neo4j.Client, graph
 			"could not persist community hierarchy", err)
 	}
 
+	// Post-detect enrichment: compute and persist avg_cosine +
+	// mdl_ratio on every level-0 :Community node. Without this step
+	// cortex reflect's cluster source (reflect_adapters.go) filters
+	// every row on `c.avg_cosine IS NOT NULL AND c.mdl_ratio IS NOT
+	// NULL` and returns zero candidates. See bead cortex-6ef.
+	enrichment, err := detector.EnrichLevel0(ctx, fetcher, weaviateClass)
+	if err != nil {
+		return nil, errs.Operational("COMMUNITY_ENRICH_FAILED",
+			"could not enrich level-0 communities with cosine/mdl", err)
+	}
+
 	res := &communitiesDetectResult{
 		Algorithm:        algorithm.String(),
 		Levels:           len(hierarchy),
 		CommunitiesByLvl: make([]int, len(hierarchy)),
 		MembersByLvl:     make([]int, len(hierarchy)),
 		GraphName:        graphName,
+		EnrichedCount:    enrichment.CommunitiesEnriched,
+		VectorsFetched:   enrichment.VectorsFetched,
 	}
 	for i, level := range hierarchy {
 		res.CommunitiesByLvl[i] = len(level)
@@ -226,6 +246,9 @@ func renderCommunitiesDetect(cmd *cobra.Command, r *communitiesDetectResult) {
 	}
 	if r.Levels == 0 || r.CommunitiesByLvl[0] == 0 {
 		fmt.Fprintln(w, "  (no communities formed; the graph may be too small or too sparse)")
+	}
+	if r.EnrichedCount > 0 {
+		fmt.Fprintf(w, "  enriched=%d  vectors_fetched=%d\n", r.EnrichedCount, r.VectorsFetched)
 	}
 }
 
