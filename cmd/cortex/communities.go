@@ -1,13 +1,13 @@
-// cmd/cortex/communities.go wires `cortex communities` and
-// `cortex community show` onto the internal/community read API.
-// Both subcommands open a short-lived Neo4j Bolt client, hand it
-// to community.ListCommunities / community.ShowCommunity through
-// the QueryGraph seam, and render the result in human or JSON form.
+// cmd/cortex/communities.go wires `cortex communities`,
+// `cortex communities detect`, and `cortex community show` onto the
+// internal/community read + detection API. Each subcommand opens a
+// short-lived Neo4j Bolt client and hands it to the appropriate
+// community.* entry point.
 //
 // Replaces the notImplemented stubs in newCommunitiesCmd /
 // newCommunityCmd in commands.go. Spec references: docs/spec/cortex-spec.md
-// FR-029 / SC-013 (community CLI surfaces hierarchical communities and
-// their summaries).
+// FR-028 (Leiden preferred, Louvain fallback) and FR-029 / SC-013
+// (community CLI surfaces hierarchical communities and their summaries).
 package main
 
 import (
@@ -62,7 +62,171 @@ func newCommunitiesCmdReal() *cobra.Command {
 	}
 	cmd.Flags().IntVar(&level, "level", 0, "hierarchy level to list (0 = leaves)")
 	cmd.Flags().BoolVar(&jsonFlag, "json", false, "emit machine-readable JSON")
+	cmd.AddCommand(newCommunitiesDetectCmd())
 	return cmd
+}
+
+// newCommunitiesDetectCmd is the bootstrap command that closes the
+// chicken-and-egg gap between recall, analyze, and reflect: it ensures
+// the shared GDS projection is present, runs Leiden (with Louvain
+// fallback), and persists the resulting :Community + :IN_COMMUNITY
+// schema back to Neo4j. Until something runs this, the analyze and
+// reflect cluster sources have nothing to enumerate and both pipelines
+// return zero candidates regardless of how much content the log holds.
+//
+// Detection only — this command does NOT call community.Refresher and
+// therefore does not invoke the LLM summarizer. The persisted
+// communities have empty Summary fields; cortex analyze --find-patterns
+// triggers the summarizer pass on the next refresh after writes land,
+// which is the natural place for the LLM cost to accrue.
+func newCommunitiesDetectCmd() *cobra.Command {
+	var jsonFlag bool
+	cmd := &cobra.Command{
+		Use:   "detect",
+		Short: "Run community detection and persist results to Neo4j",
+		Long: "cortex communities detect ensures the cortex.semantic GDS " +
+			"projection is present, runs Leiden community detection (Louvain " +
+			"fallback), and persists the resulting hierarchy back to Neo4j " +
+			"as :Community nodes and :IN_COMMUNITY edges. This is the " +
+			"bootstrap step that cortex analyze --find-patterns and cortex " +
+			"reflect both depend on; without it their cluster sources find " +
+			"no candidates.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runCommunitiesDetect(cmd, jsonFlag)
+		},
+	}
+	cmd.Flags().BoolVar(&jsonFlag, "json", false, "emit machine-readable JSON")
+	return cmd
+}
+
+// communitiesDetectResult is the shape returned by --json. The
+// per-level counts let an operator (or a CI gate) verify that
+// detection produced a non-empty hierarchy without having to parse
+// the human-readable rendering.
+type communitiesDetectResult struct {
+	Algorithm        string `json:"algorithm"`
+	Levels           int    `json:"levels"`
+	CommunitiesByLvl []int  `json:"communities_by_level"`
+	MembersByLvl     []int  `json:"members_by_level"`
+	GraphName        string `json:"graph_name"`
+}
+
+// runCommunitiesDetect is the procedural body of the detect command.
+// It is split out so the cobra wiring stays declarative and so a
+// future test can drive the logic with a fake bolt client without
+// dragging in cobra's flag parsing surface.
+func runCommunitiesDetect(cmd *cobra.Command, jsonFlag bool) error {
+	cfgPath := defaultConfigPath()
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return emitAndExit(cmd, errs.Operational("CONFIG_LOAD_FAILED",
+			"could not load ~/.cortex/config.yaml", err), jsonFlag)
+	}
+	password, _, _ := infra.EnsureNeo4jPassword(cfgPath)
+	bolt, err := neo4j.NewBoltClient(neo4j.Config{
+		BoltEndpoint: cfg.Endpoints.Neo4jBolt,
+		Username:     "neo4j",
+		Password:     password,
+		Timeout:      30 * time.Second,
+		MaxPoolSize:  4,
+	})
+	if err != nil {
+		return emitAndExit(cmd, errs.Operational("NEO4J_UNAVAILABLE",
+			"could not connect to neo4j", err), jsonFlag)
+	}
+	defer func() { _ = bolt.Close(context.Background()) }()
+
+	res, err := detectAndPersistCommunities(cmd.Context(), bolt, semanticGraphName)
+	if err != nil {
+		return emitAndExit(cmd, err, jsonFlag)
+	}
+
+	if jsonFlag {
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		return enc.Encode(res)
+	}
+	renderCommunitiesDetect(cmd, res)
+	return nil
+}
+
+// detectAndPersistCommunities is the testable core of the detect
+// command. It takes a neo4j.Client (so a fake from
+// recall_adapters_test.go's pattern can drive it) plus a graph name
+// and returns the per-level counts the renderer needs. The Detector
+// is constructed inline because it carries no per-call state and the
+// Detect/Persist split is the seam analyze.go already exercises.
+func detectAndPersistCommunities(ctx context.Context, client neo4j.Client, graphName string) (*communitiesDetectResult, error) {
+	if err := ensureSemanticProjection(ctx, client, graphName); err != nil {
+		return nil, errs.Operational("PROJECTION_FAILED",
+			"could not create or refresh GDS projection", err)
+	}
+
+	detector := &community.Detector{
+		Neo4j:        client,
+		LeidenQuery:  neo4j.LeidenStreamQuery,
+		LouvainQuery: neo4j.LouvainStreamQuery,
+		TopNodeCount: 32,
+	}
+	cfg := community.Config{
+		GraphName:     graphName,
+		Resolutions:   []float64{1.0, 0.5, 0.1},
+		Levels:        3,
+		MaxIterations: 10,
+		Tolerance:     0.0001,
+	}
+
+	algorithm := community.AlgorithmLeiden
+	hierarchy, err := detector.Detect(ctx, algorithm, cfg)
+	if err != nil {
+		// Leiden missing or otherwise unhappy: fall back to Louvain
+		// per FR-028. The error is preserved if Louvain also fails so
+		// the operator sees both attempts in the envelope.
+		algorithm = community.AlgorithmLouvain
+		hierarchy, err = detector.Detect(ctx, algorithm, cfg)
+		if err != nil {
+			return nil, errs.Operational("COMMUNITY_DETECT_FAILED",
+				"both leiden and louvain failed", err)
+		}
+	}
+
+	if err := detector.Persist(ctx, hierarchy); err != nil {
+		return nil, errs.Operational("COMMUNITY_PERSIST_FAILED",
+			"could not persist community hierarchy", err)
+	}
+
+	res := &communitiesDetectResult{
+		Algorithm:        algorithm.String(),
+		Levels:           len(hierarchy),
+		CommunitiesByLvl: make([]int, len(hierarchy)),
+		MembersByLvl:     make([]int, len(hierarchy)),
+		GraphName:        graphName,
+	}
+	for i, level := range hierarchy {
+		res.CommunitiesByLvl[i] = len(level)
+		members := 0
+		for _, c := range level {
+			members += len(c.Members)
+		}
+		res.MembersByLvl[i] = members
+	}
+	return res, nil
+}
+
+// renderCommunitiesDetect prints a terse human-readable summary of
+// one detect run. The format mirrors cortex rebuild's output: a
+// header line followed by per-level rows so an operator can scan it.
+func renderCommunitiesDetect(cmd *cobra.Command, r *communitiesDetectResult) {
+	w := cmd.OutOrStdout()
+	fmt.Fprintf(w, "cortex communities detect  ok  algorithm=%s  graph=%s\n",
+		r.Algorithm, r.GraphName)
+	for i := 0; i < r.Levels; i++ {
+		fmt.Fprintf(w, "  level=%d  communities=%-4d  members=%d\n",
+			i, r.CommunitiesByLvl[i], r.MembersByLvl[i])
+	}
+	if r.Levels == 0 || r.CommunitiesByLvl[0] == 0 {
+		fmt.Fprintln(w, "  (no communities formed; the graph may be too small or too sparse)")
+	}
 }
 
 // newCommunityCmdReal returns the wired `cortex community` parent with
