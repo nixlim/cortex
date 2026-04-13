@@ -17,10 +17,53 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/datom"
 	"github.com/nixlim/cortex/internal/log"
 	"github.com/nixlim/cortex/internal/recall"
 )
+
+func TestResolveSimFloorStrict_DisableViaZero(t *testing.T) {
+	cases := []struct {
+		name string
+		in   config.RetrievalConfig
+		want float64
+	}{
+		{
+			name: "both zero disables gate",
+			in:   config.RetrievalConfig{},
+			want: 0,
+		},
+		{
+			name: "legacy relevance_floor promoted",
+			in:   config.RetrievalConfig{RelevanceFloor: 0.5},
+			want: 0.5,
+		},
+		{
+			name: "explicit sim_floor_strict wins",
+			in: config.RetrievalConfig{
+				RelevanceGate: config.RelevanceGateConfig{SimFloorStrict: 0.6},
+			},
+			want: 0.6,
+		},
+		{
+			name: "gate beats legacy when both set",
+			in: config.RetrievalConfig{
+				RelevanceFloor: 0.5,
+				RelevanceGate:  config.RelevanceGateConfig{SimFloorStrict: 0.7},
+			},
+			want: 0.7,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveSimFloorStrict(tc.in)
+			if got != tc.want {
+				t.Fatalf("resolveSimFloorStrict = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
 
 // TestAppendReinforcementDatoms_LandsOnDisk constructs a fake recall
 // response with three reinforcement datoms (one per FR-015 attribute:

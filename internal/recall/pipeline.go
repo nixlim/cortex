@@ -67,6 +67,15 @@ const DefaultPPRDamping = 0.85
 // DefaultPPRMaxIterations matches retrieval.ppr.max_iterations from the spec.
 const DefaultPPRMaxIterations = 20
 
+// Stage labels for the layered relevance gate (cortex-9ti). Used as
+// keys in Response.Diagnostics.DroppedByStage so an operator can tell
+// which stage is doing the work and which knob to move.
+const (
+	StageHardSimFloor   = "HARD_SIM_FLOOR"
+	StageRescuePath     = "RESCUE_PATH"
+	StageCompositeFloor = "COMPOSITE_FLOOR"
+)
+
 // Request is the parsed cortex recall default-mode input.
 type Request struct {
 	Query string
@@ -100,6 +109,14 @@ type Result struct {
 type Response struct {
 	Results             []Result
 	ReinforcementDatoms []datom.Datom
+	Diagnostics         Diagnostics
+}
+
+// Diagnostics carries per-stage drop counts from the layered relevance
+// gate (cortex-9ti). DroppedByStage is keyed by StageHardSimFloor /
+// StageRescuePath / StageCompositeFloor. Empty when no gate stage fired.
+type Diagnostics struct {
+	DroppedByStage map[string]int `json:"dropped_by_stage,omitempty"`
 }
 
 // ConceptExtractor maps a query string to a list of concept terms.
@@ -184,33 +201,67 @@ type Pipeline struct {
 	DecayExponent       float64
 	Weights             actr.Weights
 
-	// RelevanceFloor is the minimum cosine similarity a candidate must
-	// carry to survive reranking. Without it, the composite is propped
-	// up by w_base*B(e)=0.3 for every fresh entry and queries with no
-	// real semantic match still return 10 results at composite ~0.3
-	// (see bead cortex-7y4).
+	// Layered relevance gate (cortex-y6g, Stage 1+2a).
 	//
-	// Why similarity alone, not max(similarity, ppr): PPR from seeds
-	// unavoidably touches graph-connected neighbors with nonzero score
-	// even when the query has no semantic match, so gating on max(sim,
-	// ppr) lets the PPR term alone keep irrelevant entries alive. The
-	// cortex-7y4 fix originally used max; the deep-eval verification
-	// at commit 4d34969 showed the max formulation did not fire on
-	// any of the five negative queries because ppr~0.15 is typical
-	// for any connected candidate. Requiring cosine similarity to
-	// clear the floor makes the gate a pure semantic relevance check.
+	// The old single-floor gate (RelevanceFloor) dropped any candidate
+	// with sim below one threshold. That was too strict on borderline
+	// positives — a sim=0.50 hit with strong PPR support was silently
+	// discarded — and too loose at the hard end because there was no
+	// absolute "never surface" bound. The layered gate replaces it
+	// with two conditions evaluated per candidate:
 	//
-	// Tuning: 0.55 is calibrated against nomic-embed-text distributions
-	// measured in deep-eval dump 20260412T225007Z, where real positive
-	// rank-1 hits sat at sim 0.65-0.70 and negative rank-1 hits sat
-	// at sim 0.53-0.60. Conservative starting point — tune downward
-	// if legitimate queries are being dropped, upward if negatives
-	// still leak through. Re-run eval/deep/run_deep_eval.sh after a
-	// change and compare .retrievals[0].hits[0].similarity for
-	// negatives vs positives. Zero disables (preserves pre-cortex-7y4
-	// behavior for benchmarks and e2e tests that construct a pipeline
-	// directly). Production wiring in cmd/cortex/recall.go sources
-	// the value from retrieval.relevance_floor.
+	//  1. sim < SimFloorHard      → DROP unconditionally (below hard floor).
+	//  2. sim >= SimFloorStrict
+	//     OR sim >= SimFloorHard - RescueAlpha*ppr → KEEP.
+	//
+	// The second clause is the smooth rescue: between the hard and
+	// strict floors, PPR strength can pull a candidate back into the
+	// result set, but only proportionally (alpha ~0.15) and only so
+	// far as the hard floor allows. A zero PPR gives no rescue; a PPR
+	// of ~0.40 buys ~0.06 of slack on sim. Tuned against deep-eval
+	// dump 20260412T225007Z: positives sit at sim 0.65-0.70, negatives
+	// at sim 0.53-0.60. Strict=0.55 preserves the prior default for
+	// the upper path; hard=0.40 is well below any observed negative.
+	//
+	// RelevanceFloor is retained as a back-compat alias for
+	// SimFloorStrict so existing callers (bench harness, older
+	// config files, tests) keep working without churn. fillDefaults
+	// copies RelevanceFloor into SimFloorStrict when only the legacy
+	// field is set. Production wiring in cmd/cortex/recall.go now
+	// sources the gate knobs from retrieval.relevance_gate.*.
+	SimFloorHard   float64
+	SimFloorStrict float64
+	RescueAlpha    float64
+
+	// Stage 3 composite floor (cortex-2sg). After a candidate clears
+	// Stage 1+2a it must also clear a simple weighted gate
+	// GateSimWeight*sim + GatePPRWeight*ppr >= CompositeFloor. Weak
+	// queries therefore return fewer than Limit results — adaptive
+	// truncation communicates confidence to downstream consumers.
+	// CompositeFloor == 0 disables the gate entirely.
+	CompositeFloor float64
+	GateSimWeight  float64
+	GatePPRWeight  float64
+
+	// PPRBaselineMinN is the minimum per-query candidate count required
+	// to use the Stage 2b quantile-baseline rescue (cortex-5mp). When
+	// len(pprScores) >= PPRBaselineMinN, a borderline candidate (sim
+	// between the hard and strict floors) is rescued only if its PPR
+	// score is a strict upper-quartile outlier in this query's PPR
+	// distribution (ppr > p75). Below the threshold, quantile estimation
+	// over so few samples is unstable so the gate falls back to the
+	// Stage 2a Option-1 formula sim >= SimFloorHard - RescueAlpha*ppr.
+	// Zero means "always use Option-1 fallback" (quantile disabled).
+	PPRBaselineMinN int
+
+	// RelevanceFloor is a back-compat alias for SimFloorStrict. Zero
+	// disables the gate entirely. When set WITHOUT any of the new
+	// RelevanceGate fields (SimFloorHard, SimFloorStrict, RescueAlpha,
+	// CompositeFloor, GateSimWeight, GatePPRWeight, PPRBaselineMinN),
+	// fillDefaults reproduces the pre-cortex-9uc single-floor gate
+	// exactly: drop iff sim < RelevanceFloor, no rescue, no Stage 3,
+	// no quantile baseline. Setting ANY RelevanceGate field alongside
+	// RelevanceFloor opts into the layered defaults described above.
 	RelevanceFloor float64
 }
 
@@ -297,20 +348,58 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Response, error) {
 		imp       float64
 	}
 	scoredAll := make([]scored, 0, len(visible))
+	// Per-call diagnostics (cortex-9ti). Tracked in a local map rather
+	// than on Pipeline so concurrent Recall callers don't trample each
+	// other's counters.
+	diag := Diagnostics{DroppedByStage: map[string]int{}}
+	// Stage 2b (cortex-5mp): compute the per-query PPR p75 once up
+	// front. Below PPRBaselineMinN samples the quantile is too noisy,
+	// so we fall back to the Stage 2a Option-1 rescue formula.
+	useQuantile := p.PPRBaselineMinN > 0 && len(pprScores) >= p.PPRBaselineMinN
+	var pprP75 float64
+	if useQuantile {
+		pprValues := make([]float64, 0, len(pprScores))
+		for _, v := range pprScores {
+			pprValues = append(pprValues, v)
+		}
+		pprP75 = quantile(pprValues, 0.75)
+	}
 	for _, e := range visible {
 		base := e.Activation.Current(now, p.DecayExponent)
 		ppr := pprScores[e.EntryID]
 		sim := cosine(queryVec, e.Embedding)
-		// Relevance floor: without a semantic-match signal the
-		// composite collapses to w_base*B(e) — a constant ~0.3 for
-		// any fresh entry — so irrelevant queries still return 10
-		// results (cortex-7y4). The gate uses sim alone, not max(sim,
-		// ppr), because PPR touches graph-connected neighbors with
-		// nonzero score regardless of semantic match. Gate here
+		// Layered relevance gate (cortex-y6g + cortex-5mp). See the
+		// field comment on Pipeline for the rationale. Gate here
 		// rather than after ranking so suppressed candidates produce
 		// neither results nor reinforcement datoms.
-		if p.RelevanceFloor > 0 && sim < p.RelevanceFloor {
-			continue
+		if p.SimFloorStrict > 0 {
+			if sim < p.SimFloorHard {
+				diag.DroppedByStage[StageHardSimFloor]++
+				continue
+			}
+			if sim < p.SimFloorStrict {
+				rescued := false
+				if useQuantile {
+					rescued = (ppr - pprP75) > 0
+				} else {
+					rescued = sim >= p.SimFloorHard-p.RescueAlpha*ppr
+				}
+				if !rescued {
+					diag.DroppedByStage[StageRescuePath]++
+					continue
+				}
+			}
+		}
+		// Stage 3 composite floor (cortex-2sg). Runs AFTER Stage 1+2a so
+		// rescued borderline candidates still get a shot; a weighted
+		// sum gate-out here yields adaptive truncation (fewer than Limit
+		// results for weak queries).
+		if p.CompositeFloor > 0 {
+			gateSig := p.GateSimWeight*sim + p.GatePPRWeight*ppr
+			if gateSig < p.CompositeFloor {
+				diag.DroppedByStage[StageCompositeFloor]++
+				continue
+			}
 		}
 		imp := actr.ImportanceScore(actr.Importance{CrossProject: e.CrossProject})
 		composite := actr.Activation(actr.Inputs{
@@ -385,12 +474,21 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Response, error) {
 	return &Response{
 		Results:             results,
 		ReinforcementDatoms: reinforcements,
+		Diagnostics:         diag,
 	}, nil
 }
 
 // fillDefaults applies spec defaults to zero-valued tunables. Called
 // at the top of Recall so tests that only care about one knob don't
 // have to set the others.
+//
+// Caveat: fillDefaults mutates the receiver permanently. After the
+// first Recall call, fields zeroed by the caller between calls will
+// NOT revert to defaults — the stamped values persist. In particular,
+// setting SimFloorStrict back to 0 after a prior Recall leaves
+// CompositeFloor / SimFloorHard populated from the first pass.
+// Callers that need to toggle the gate should construct a fresh
+// Pipeline rather than mutating fields in place.
 func (p *Pipeline) fillDefaults() {
 	if p.Limit <= 0 {
 		p.Limit = DefaultLimit
@@ -416,6 +514,48 @@ func (p *Pipeline) fillDefaults() {
 	if p.Now == nil {
 		p.Now = func() time.Time { return time.Now().UTC() }
 	}
+	// Layered gate back-compat: legacy RelevanceFloor is an alias for
+	// SimFloorStrict. To preserve byte-for-byte pre-cortex-9uc behavior,
+	// callers that set ONLY the legacy alias (none of the new
+	// RelevanceGate fields) get the old single-floor gate — no hard
+	// floor below strict, no rescue, no Stage 3, no quantile baseline.
+	// The new layered behavior is opt-in: setting ANY RelevanceGate
+	// field triggers the full layered defaults.
+	legacyOnly := p.RelevanceFloor > 0 &&
+		p.SimFloorHard == 0 &&
+		p.SimFloorStrict == 0 &&
+		p.RescueAlpha == 0 &&
+		p.CompositeFloor == 0 &&
+		p.GateSimWeight == 0 &&
+		p.GatePPRWeight == 0 &&
+		p.PPRBaselineMinN == 0
+	if p.SimFloorStrict == 0 && p.RelevanceFloor > 0 {
+		p.SimFloorStrict = p.RelevanceFloor
+	}
+	if legacyOnly {
+		p.SimFloorHard = p.SimFloorStrict
+		return
+	}
+	if p.SimFloorStrict > 0 {
+		if p.SimFloorHard == 0 {
+			p.SimFloorHard = 0.40
+		}
+		if p.RescueAlpha == 0 {
+			p.RescueAlpha = 0.15
+		}
+		if p.CompositeFloor == 0 {
+			p.CompositeFloor = 0.45
+		}
+	}
+	if p.GateSimWeight == 0 {
+		p.GateSimWeight = 0.7
+	}
+	if p.GatePPRWeight == 0 {
+		p.GatePPRWeight = 0.3
+	}
+	if p.PPRBaselineMinN <= 0 && p.SimFloorStrict > 0 {
+		p.PPRBaselineMinN = 25
+	}
 }
 
 // cosine returns the cosine similarity of two equal-length vectors.
@@ -434,6 +574,27 @@ func cosine(a, b []float32) float64 {
 		return 0
 	}
 	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+// quantile returns the q-th quantile of values using a simple
+// index-based percentile (idx = int(q*len)). Linear interpolation is
+// deliberately skipped because cortex-5mp only needs a "typical-vs-
+// outlier" cutoff for the Stage 2b rescue and we call this once per
+// query on a few hundred floats at most. Empty slice → 0; single
+// value → that value. Mutates its input by sorting in place.
+func quantile(values []float64, q float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	if len(values) == 1 {
+		return values[0]
+	}
+	sort.Float64s(values)
+	idx := int(q * float64(len(values)))
+	if idx >= len(values) {
+		idx = len(values) - 1
+	}
+	return values[idx]
 }
 
 // buildWhySurfaced assembles a short human-readable trace describing

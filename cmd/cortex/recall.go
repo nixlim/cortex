@@ -36,6 +36,7 @@ func newRecallCmdReal() *cobra.Command {
 	var (
 		limit    int
 		jsonFlag bool
+		explain  bool
 	)
 	cmd := &cobra.Command{
 		Use:   "recall <query>",
@@ -64,7 +65,7 @@ func newRecallCmdReal() *cobra.Command {
 			if err != nil {
 				return emitAndExit(cmd, err, jsonFlag)
 			}
-			if err := renderRecallResult(cmd, res, jsonFlag); err != nil {
+			if err := renderRecallResult(cmd, res, jsonFlag, explain); err != nil {
 				return err
 			}
 			// FR-015: every recall reinforces the surfaced entries.
@@ -84,6 +85,7 @@ func newRecallCmdReal() *cobra.Command {
 	}
 	cmd.Flags().IntVar(&limit, "limit", 0, "override retrieval.default_limit (10)")
 	cmd.Flags().BoolVar(&jsonFlag, "json", false, "emit machine-readable JSON output")
+	cmd.Flags().BoolVar(&explain, "explain", false, "print per-stage gate drop counts after results (cortex-9ti)")
 	return cmd
 }
 
@@ -155,10 +157,19 @@ func buildRecallPipeline() (*recall.Pipeline, *log.Writer, func(), error) {
 		SeedTopK:            cfg.Retrieval.PPR.SeedTopK,
 		Damping:             cfg.Retrieval.PPR.Damping,
 		MaxIterations:       cfg.Retrieval.PPR.MaxIterations,
-		// Relevance floor closes the "every query returns ~10 results
-		// at composite ~0.3" failure mode surfaced by deep eval
-		// negative queries. See bead cortex-7y4.
-		RelevanceFloor: cfg.Retrieval.RelevanceFloor,
+		// Layered relevance gate (cortex-y6g). Precedence:
+		// explicit relevance_gate.sim_floor_strict > legacy
+		// relevance_floor > spec default 0.55. The hard floor and
+		// rescue alpha fall back to fillDefaults if the sub-struct
+		// was omitted from config.yaml.
+		SimFloorHard:   cfg.Retrieval.RelevanceGate.SimFloorHard,
+		SimFloorStrict: resolveSimFloorStrict(cfg.Retrieval),
+		RescueAlpha:    cfg.Retrieval.RelevanceGate.RescueAlpha,
+		CompositeFloor:  cfg.Retrieval.RelevanceGate.CompositeFloor,
+		GateSimWeight:   cfg.Retrieval.RelevanceGate.GateSimWeight,
+		GatePPRWeight:   cfg.Retrieval.RelevanceGate.GatePPRWeight,
+		PPRBaselineMinN: cfg.Retrieval.RelevanceGate.PPRBaselineMinN,
+		RelevanceFloor:  cfg.Retrieval.RelevanceFloor,
 		// Pipeline default limit sourced from config so
 		// retrieval.default_limit actually flows through (bead
 		// cortex-voa). A positive --limit flag on Request overrides
@@ -166,6 +177,20 @@ func buildRecallPipeline() (*recall.Pipeline, *log.Writer, func(), error) {
 		Limit: cfg.Retrieval.DefaultLimit,
 	}
 	return pipeline, writer, cleanup, nil
+}
+
+// resolveSimFloorStrict picks the effective strict floor using the
+// cortex-y6g precedence: an explicit relevance_gate.sim_floor_strict
+// wins; otherwise the legacy retrieval.relevance_floor is promoted.
+// Both zero disables the gate — Defaults() populates both fields with
+// 0.55, so callers reach the both-zero state only by explicitly
+// overriding both to zero in config.yaml, which is the documented
+// way to opt out of the relevance gate entirely.
+func resolveSimFloorStrict(r config.RetrievalConfig) float64 {
+	if r.RelevanceGate.SimFloorStrict > 0 {
+		return r.RelevanceGate.SimFloorStrict
+	}
+	return r.RelevanceFloor
 }
 
 // appendReinforcementDatoms seals every datom in res.ReinforcementDatoms
@@ -199,7 +224,7 @@ func appendReinforcementDatoms(writer *log.Writer, res *recall.Response) error {
 // slice is returned by the pipeline but the caller is responsible for
 // appending those datoms to the log after rendering — that log write
 // will be added here once the underlying pipeline produces results.
-func renderRecallResult(cmd *cobra.Command, res *recall.Response, jsonFlag bool) error {
+func renderRecallResult(cmd *cobra.Command, res *recall.Response, jsonFlag, explain bool) error {
 	if jsonFlag {
 		enc := json.NewEncoder(cmd.OutOrStdout())
 		enc.SetIndent("", "  ")
@@ -214,5 +239,30 @@ func renderRecallResult(cmd *cobra.Command, res *recall.Response, jsonFlag bool)
 			fmt.Fprintf(w, "     %s\n", body)
 		}
 	}
+	if explain {
+		fmt.Fprintln(w, formatGateDrops(res.Diagnostics))
+	}
 	return nil
+}
+
+// formatGateDrops renders a one-line summary of per-stage gate drops
+// for the `cortex recall --explain` footer. Stage order is fixed so
+// operators can eyeball the same layout across runs. Empty or all-zero
+// maps render as "gate drops: none".
+func formatGateDrops(diag recall.Diagnostics) string {
+	stages := []string{
+		recall.StageHardSimFloor,
+		recall.StageRescuePath,
+		recall.StageCompositeFloor,
+	}
+	parts := make([]string, 0, len(stages))
+	for _, st := range stages {
+		if n := diag.DroppedByStage[st]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", st, n))
+		}
+	}
+	if len(parts) == 0 {
+		return "gate drops: none"
+	}
+	return "gate drops: " + strings.Join(parts, ", ")
 }

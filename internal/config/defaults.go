@@ -62,11 +62,35 @@ type RetrievalConfig struct {
 	PPR          PPRConfig        `yaml:"ppr"`
 	Activation   ActivationConfig `yaml:"activation"`
 	Forgetting   ForgettingConfig `yaml:"forgetting"`
-	// RelevanceFloor is the minimum max(similarity, ppr) a candidate
-	// must carry to survive reranking. See bead cortex-7y4: without a
-	// gate, every fresh entry keeps composite ~0.3 via w_base*B(e), so
-	// negative queries never return empty. Zero disables the gate.
-	RelevanceFloor float64 `yaml:"relevance_floor"`
+	// RelevanceFloor is the legacy single-floor similarity gate. It
+	// remains a back-compat alias for RelevanceGate.SimFloorStrict;
+	// prefer the sub-struct for new configs. See bead cortex-y6g.
+	// Zero disables the gate.
+	RelevanceFloor float64              `yaml:"relevance_floor"`
+	RelevanceGate  RelevanceGateConfig  `yaml:"relevance_gate"`
+}
+
+// RelevanceGateConfig holds the layered relevance gate knobs from
+// bead cortex-y6g. A candidate survives the gate when
+// sim >= SimFloorStrict OR sim >= SimFloorHard - RescueAlpha*ppr,
+// and is unconditionally dropped when sim < SimFloorHard.
+type RelevanceGateConfig struct {
+	SimFloorHard   float64 `yaml:"sim_floor_hard"`
+	SimFloorStrict float64 `yaml:"sim_floor_strict"`
+	RescueAlpha    float64 `yaml:"rescue_alpha"`
+	// Stage 3 composite floor (cortex-2sg). A candidate that survives
+	// Stage 1+2a must also clear
+	//   GateSimWeight*sim + GatePPRWeight*ppr >= CompositeFloor.
+	// CompositeFloor == 0 disables the stage.
+	CompositeFloor float64 `yaml:"composite_floor"`
+	GateSimWeight  float64 `yaml:"gate_sim_weight"`
+	GatePPRWeight  float64 `yaml:"gate_ppr_weight"`
+	// Stage 2b quantile-baseline rescue (cortex-5mp). When the per-query
+	// candidate set has at least PPRBaselineMinN entries, a borderline
+	// sim uses a strict upper-quartile PPR test instead of the Stage 2a
+	// Option-1 formula; below that count the gate falls back to
+	// Option-1. Zero disables the quantile path entirely.
+	PPRBaselineMinN int `yaml:"ppr_baseline_min_n"`
 }
 
 type PPRConfig struct {
@@ -242,19 +266,28 @@ func Defaults() Config {
 				// dead within minutes of finishing. See bead cortex-upp.
 				VisibilityThreshold: 0.0005,
 			},
-			// 0.55 is calibrated from measured cosine similarity
-			// distributions in deep-eval dump 20260412T225007Z
-			// (commit 4d34969): real positive rank-1 hits sat at
-			// sim 0.65-0.70 and negative rank-1 hits sat at sim
-			// 0.53-0.60 on nomic-embed-text. The gate is now
-			// similarity-only (not max(sim,ppr)) because PPR always
-			// finds graph-connected neighbors regardless of semantic
-			// match. The previous 0.10 default never fired — cosine
-			// similarity between arbitrary cortex text pairs is
-			// routinely 0.5+. Re-tune after a clean re-ingest
-			// (CORTEX_EVALUATION_2026-04-13.md R1+R4). Target is
-			// deep-eval negative_triggered >= 0.8. See cortex-7y4.
+			// Legacy single-floor gate. Retained as a back-compat
+			// alias for RelevanceGate.SimFloorStrict — cortex-y6g
+			// replaces it with the layered gate below but keeps
+			// this field populated so older code paths and configs
+			// continue to behave identically when relevance_gate
+			// is absent.
 			RelevanceFloor: 0.55,
+			// Layered relevance gate (cortex-y6g). Strict=0.55
+			// preserves the old top-of-gate behavior; hard=0.40
+			// is well below any observed negative rank-1 sim in
+			// deep-eval dump 20260412T225007Z, so a candidate
+			// between 0.40 and 0.55 must earn its slot via PPR
+			// rescue: sim >= 0.40 - 0.15*ppr.
+			RelevanceGate: RelevanceGateConfig{
+				SimFloorHard:   0.40,
+				SimFloorStrict: 0.55,
+				RescueAlpha:    0.15,
+				CompositeFloor:  0.45,
+				GateSimWeight:   0.7,
+				GatePPRWeight:   0.3,
+				PPRBaselineMinN: 25,
+			},
 		},
 		Pagination: PaginationConfig{
 			HumanDefaultLimit: 20,

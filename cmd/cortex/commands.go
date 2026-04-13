@@ -50,6 +50,7 @@ func addOpsCommands(root *cobra.Command) {
 	root.AddCommand(newReflectCmd())
 	root.AddCommand(newIngestCmd())
 	root.AddCommand(newAnalyzeCmd())
+	root.AddCommand(newEvalCmd())
 }
 
 // ---------------------------------------------------------------------------
