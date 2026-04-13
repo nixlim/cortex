@@ -440,6 +440,11 @@ func buildIngestPipeline(cfg config.Config, segDir string) (*ingest.Pipeline, fu
 		// Concurrency.
 		Concurrency:     cfg.Ingest.OllamaConcurrency,
 		SkipPostReflect: true,
+		// cortex-ks1: per-package size gate. Budget = num_ctx * 0.6 * 4
+		// chars/token leaves room for prompt boilerplate and structured-
+		// output response inside the model's context window. Modules
+		// exceeding this fall back to per-file granularity automatically.
+		MaxModuleBytes: int64(float64(cfg.Ollama.NumCtx) * 0.6 * 4),
 	}
 	return p, cleanup, nil
 }
@@ -493,6 +498,7 @@ func walkerWalk(root string, fn func(languages.File) error) error {
 		return fn(languages.File{
 			AbsPath: fm.AbsPath,
 			RelPath: fm.RelPath,
+			Size:    fm.Size,
 		})
 	})
 }

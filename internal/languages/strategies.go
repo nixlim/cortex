@@ -130,6 +130,11 @@ func (m Matrix) Strategy(lang Language) string {
 type File struct {
 	AbsPath string
 	RelPath string // forward-slashed, relative to project root
+	// Size is the file size in bytes as reported by the walker. Zero
+	// when the source did not populate it (in-memory test fixtures);
+	// the ingest pipeline's size gate (cortex-ks1) treats zero as
+	// "unknown" and defers to the existing per-package grouping.
+	Size int64
 }
 
 // Module is a group of one or more files that belong together under some

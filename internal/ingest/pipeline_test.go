@@ -557,6 +557,75 @@ func TestIngest_PostReflectInvokedWithTrailID(t *testing.T) {
 	}
 }
 
+// TestIngest_OversizePerPackageFallsBackToPerFile covers cortex-ks1:
+// when a per-package module's combined source bytes exceed
+// MaxModuleBytes, the pipeline must split that module into one
+// per-file module per file (and leave under-budget modules alone).
+// The fixture has two packages: "huge" with two large files that
+// blow the budget and "tiny" with one small file that does not.
+func TestIngest_OversizePerPackageFallsBackToPerFile(t *testing.T) {
+	files := []languages.File{
+		{AbsPath: "/root/huge/a.go", RelPath: "huge/a.go", Size: 60_000},
+		{AbsPath: "/root/huge/b.go", RelPath: "huge/b.go", Size: 60_000},
+		{AbsPath: "/root/tiny/c.go", RelPath: "tiny/c.go", Size: 1_000},
+	}
+	p, _, wr, _, _, _ := newTestPipeline(files)
+	p.MaxModuleBytes = 78_000 // ~num_ctx 32768 * 0.6 * 4
+
+	res, err := p.Ingest(context.Background(), Request{
+		ProjectRoot: "/root",
+		ProjectName: "fixture",
+	})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	// Expect: tiny stays per-package (1 module), huge splits into 2
+	// per-file modules → 3 total.
+	if len(res.Modules) != 3 {
+		t.Fatalf("modules after split: got %d want 3", len(res.Modules))
+	}
+	if len(wr.writes) != 3 {
+		t.Fatalf("writer calls: got %d want 3", len(wr.writes))
+	}
+	gotIDs := map[string]bool{}
+	for _, w := range wr.writes {
+		gotIDs[w.ModuleID] = true
+	}
+	wantIDs := []string{
+		"go:per-file:huge/a.go",
+		"go:per-file:huge/b.go",
+		"go:per-package:tiny",
+	}
+	for _, id := range wantIDs {
+		if !gotIDs[id] {
+			t.Errorf("missing module id %q in writer calls; got %v", id, gotIDs)
+		}
+	}
+}
+
+// TestIngest_OversizeGateDisabledWhenZero confirms MaxModuleBytes=0
+// preserves the existing per-package grouping (no split) so default
+// pipelines stay byte-for-byte identical.
+func TestIngest_OversizeGateDisabledWhenZero(t *testing.T) {
+	files := []languages.File{
+		{AbsPath: "/root/huge/a.go", RelPath: "huge/a.go", Size: 60_000},
+		{AbsPath: "/root/huge/b.go", RelPath: "huge/b.go", Size: 60_000},
+	}
+	p, _, wr, _, _, _ := newTestPipeline(files)
+	// MaxModuleBytes left at zero.
+	if _, err := p.Ingest(context.Background(), Request{
+		ProjectRoot: "/root", ProjectName: "fixture",
+	}); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if len(wr.writes) != 1 {
+		t.Fatalf("gate disabled: writer calls got %d want 1", len(wr.writes))
+	}
+	if wr.writes[0].ModuleID != "go:per-package:huge" {
+		t.Fatalf("module id: got %s want go:per-package:huge", wr.writes[0].ModuleID)
+	}
+}
+
 // TestIngest_PostReflectSkippedOnNoOp confirms the reflection hook
 // does NOT run when there are no new entries (so a no-op resume does
 // not trigger empty reflection windows).

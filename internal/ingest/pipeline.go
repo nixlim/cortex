@@ -221,6 +221,15 @@ type Pipeline struct {
 	// Callback code should be cheap; it runs inline on the worker
 	// goroutine and blocks the slot until it returns. See cortex-so5.
 	Progress func(ProgressEvent)
+	// MaxModuleBytes is the per-package size gate from cortex-ks1.
+	// When > 0, any non-per-file module whose summed File.Size exceeds
+	// this value is split into one per-file module per file before the
+	// summarizer ever sees it. The wiring in cmd/cortex/ingest.go
+	// computes the value as int64(NumCtx * 0.6 * 4) so a 32K context
+	// model gets ~78KB of source budget — enough to absorb prompt
+	// overhead and the structured-output response. Zero disables the
+	// gate (default; preserves existing tests and small projects).
+	MaxModuleBytes int64
 }
 
 // ProgressEvent carries one per-module completion signal from the
@@ -306,6 +315,7 @@ func (p *Pipeline) Ingest(ctx context.Context, req Request) (*Result, error) {
 			"could not walk project root", err)
 	}
 	modules := languages.Group(files, p.Matrix)
+	modules = p.splitOversizeModules(modules)
 	res.Modules = modules
 
 	// --- filter already-ingested modules (idempotent re-run / resume) ---
@@ -591,6 +601,48 @@ func (p *Pipeline) collectFiles(root string) ([]languages.File, error) {
 		return nil
 	})
 	return out, err
+}
+
+// splitOversizeModules implements the cortex-ks1 size gate. When
+// p.MaxModuleBytes is positive, any non-per-file module whose summed
+// File.Size exceeds the budget is replaced by one per-file module per
+// constituent file. Modules already at per-file granularity, modules
+// under the budget, and modules with zero known sizes (test fixtures
+// that did not populate languages.File.Size) pass through unchanged.
+//
+// The split preserves the per-file ID format languages.Group would
+// emit ("<lang>:per-file:<relpath>") so resume state on a future run
+// keys correctly even if MaxModuleBytes was different on the prior
+// run.
+func (p *Pipeline) splitOversizeModules(in []Module) []Module {
+	if p.MaxModuleBytes <= 0 || len(in) == 0 {
+		return in
+	}
+	out := make([]Module, 0, len(in))
+	for _, m := range in {
+		if m.Strategy == languages.StrategyPerFile || len(m.Files) <= 1 {
+			out = append(out, m)
+			continue
+		}
+		var total int64
+		for _, f := range m.Files {
+			total += f.Size
+		}
+		if total <= p.MaxModuleBytes {
+			out = append(out, m)
+			continue
+		}
+		for _, f := range m.Files {
+			out = append(out, Module{
+				ID:       string(m.Language) + ":" + languages.StrategyPerFile + ":" + f.RelPath,
+				Language: m.Language,
+				Strategy: languages.StrategyPerFile,
+				Files:    []languages.File{f},
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 func fileRelPaths(m Module) []string {
