@@ -105,8 +105,8 @@ func runRootSelfHeal(cmd *cobra.Command) error {
 	weaviateApplier := weaviate.NewBackendApplier(weaviateClient)
 	_, err = replay.SelfHeal(ctx, report.Healthy, store, neoApplier, weaviateApplier)
 	if err != nil {
-		return errs.Operational("SELFHEAL_FAILED",
-			fmt.Sprintf("self-heal replay failed for command %q", cmd.Name()), err)
+		return emitAndExit(cmd, errs.Operational("SELFHEAL_FAILED",
+			fmt.Sprintf("self-heal replay failed for command %q", cmd.Name()), err), false)
 	}
 	return nil
 }

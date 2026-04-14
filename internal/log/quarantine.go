@@ -241,6 +241,7 @@ func ScanSegment(path string) (*ScanFault, error) {
 
 	r := bufio.NewReaderSize(f, 1<<16)
 	var offset int64
+	var prevTx string
 	line := 0
 	for {
 		line++
@@ -263,13 +264,27 @@ func ScanSegment(path string) (*ScanFault, error) {
 				Err:    errors.New("line missing terminating newline"),
 			}, nil
 		}
-		if _, verr := datom.Unmarshal(buf); verr != nil {
+		d, verr := datom.Unmarshal(buf)
+		if verr != nil {
 			return &ScanFault{
 				Line:   line,
 				Offset: offset,
 				Err:    verr,
 			}, nil
 		}
+		// Enforce tx ULID monotonicity. A segment whose datoms are not in
+		// strictly non-decreasing tx order indicates concurrent-write
+		// interleaving or log corruption. The merge-sort reader detects the
+		// same violation at replay time, so catching it here lets log.Load
+		// quarantine the segment before it ever reaches the reader.
+		if prevTx != "" && d.Tx < prevTx {
+			return &ScanFault{
+				Line:   line,
+				Offset: offset,
+				Err:    fmt.Errorf("tx order violated: %s < %s", d.Tx, prevTx),
+			}, nil
+		}
+		prevTx = d.Tx
 		offset += int64(len(buf))
 		if errors.Is(err, io.EOF) {
 			// Final line had a newline and parsed cleanly.

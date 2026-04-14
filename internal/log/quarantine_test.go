@@ -257,6 +257,99 @@ func TestScanSegment_ReportsFirstFault(t *testing.T) {
 	}
 }
 
+// TestScanSegment_OutOfOrderTxReturnsFault verifies that a segment with
+// valid per-datom checksums but decreasing tx ULIDs is flagged as a
+// ScanFault. This is the class of corruption that caused real-world
+// SELFHEAL_FAILED: the merge-sort reader detects the violation inside
+// replay but ScanSegment (called by log.Load) did not, so the bad
+// segment passed quarantine and reached the reader.
+func TestScanSegment_OutOfOrderTxReturnsFault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ooo.jsonl")
+
+	tx1 := ulid.Make().String() // smaller (older)
+	tx2 := ulid.Make().String() // larger (newer); tx1 < tx2 by construction
+
+	// Write tx2 first, then tx1 — strictly out of order.
+	writeSegmentFromLines(t, path, [][]byte{
+		sealedLine(t, tx2),
+		sealedLine(t, tx1),
+	})
+
+	fault, err := ScanSegment(path)
+	if err != nil {
+		t.Fatalf("ScanSegment: %v", err)
+	}
+	if fault == nil {
+		t.Fatal("expected ScanFault for out-of-order tx, got nil")
+	}
+	if fault.Line != 2 {
+		t.Fatalf("fault line: got %d want 2", fault.Line)
+	}
+	if !strings.Contains(fault.Err.Error(), "tx") {
+		t.Fatalf("fault error should mention tx ordering: %v", fault.Err)
+	}
+}
+
+// TestLoad_QuarantinesOutOfOrderSegment verifies that log.Load moves a
+// segment with valid checksums but decreasing tx ULIDs into quarantine,
+// preventing it from entering the Healthy list and reaching the reader.
+func TestLoad_QuarantinesOutOfOrderSegment(t *testing.T) {
+	dir := t.TempDir()
+
+	healthyPath := filepath.Join(dir, "01HHEALTHY00000000000000001-pid1.jsonl")
+	writeSegmentFromLines(t, healthyPath, [][]byte{
+		sealedLine(t, ulid.Make().String()),
+		sealedLine(t, ulid.Make().String()),
+	})
+
+	oooPath := filepath.Join(dir, "01HHEALTHY00000000000000002-pid2.jsonl")
+	tx1 := ulid.Make().String() // smaller
+	tx2 := ulid.Make().String() // larger; write tx2 first → out of order
+	writeSegmentFromLines(t, oooPath, [][]byte{
+		sealedLine(t, tx2),
+		sealedLine(t, tx1),
+	})
+
+	type opsEvent struct{ level, message, entity string }
+	var events []opsEvent
+	rec := func(level, _, message, entity string, _ error) {
+		events = append(events, opsEvent{level, message, entity})
+	}
+
+	report, err := Load(dir, LoadOptions{OpsRecord: rec})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(report.Quarantined) != 1 {
+		t.Fatalf("quarantine count: got %d want 1 (quarantined=%v healthy=%v)",
+			len(report.Quarantined), report.Quarantined, report.Healthy)
+	}
+	if report.Quarantined[0].OriginalPath != oooPath {
+		t.Fatalf("quarantined wrong segment: got %s want %s",
+			report.Quarantined[0].OriginalPath, oooPath)
+	}
+	if report.Quarantined[0].Fault.Line != 2 {
+		t.Fatalf("fault line: got %d want 2", report.Quarantined[0].Fault.Line)
+	}
+
+	if len(report.Healthy) != 1 || report.Healthy[0] != healthyPath {
+		t.Fatalf("healthy: got %v want [%s]", report.Healthy, healthyPath)
+	}
+
+	found := false
+	for _, e := range events {
+		if e.level == "WARN" && strings.Contains(e.message, "segment quarantined") && e.entity == oooPath {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no quarantine ops event for out-of-order segment; events=%+v", events)
+	}
+}
+
 // TestQuarantine_PreservesPriorQuarantinedFiles ensures the name
 // collision handling does not clobber a pre-existing quarantined file.
 func TestQuarantine_PreservesPriorQuarantinedFiles(t *testing.T) {
