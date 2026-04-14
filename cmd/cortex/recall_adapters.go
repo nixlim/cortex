@@ -37,6 +37,7 @@ import (
 
 	"github.com/nixlim/cortex/internal/activation"
 	"github.com/nixlim/cortex/internal/config"
+	"github.com/nixlim/cortex/internal/llm"
 	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/ollama"
 	"github.com/nixlim/cortex/internal/prompts"
@@ -53,9 +54,12 @@ import (
 const semanticGraphName = "cortex.semantic"
 
 // newOllamaClient builds a shared *ollama.HTTPClient from the loaded
-// config. The three recall/analyze/reflect adapter files all share
-// this helper so the model name and timeout budgets stay in lock-step
-// with the defaults cortex up uses.
+// config. Post-Phase-3 this is used for the *embedding* path only —
+// embedding stays pinned to Ollama because FR-051 pins
+// embedding_model_name and embedding_model_digest on every datom and
+// only Ollama carries the model-digest capture machinery. Generation
+// now flows through newGenerator (below), which branches on
+// cfg.LLM.Provider.
 func newOllamaClient(cfg config.Config) *ollama.HTTPClient {
 	return ollama.NewHTTPClient(ollama.Config{
 		Endpoint:              cfg.Endpoints.Ollama,
@@ -65,6 +69,15 @@ func newOllamaClient(cfg config.Config) *ollama.HTTPClient {
 		LinkDerivationTimeout: time.Duration(cfg.Timeouts.LinkDerivationSeconds) * time.Second,
 		NumCtx:                cfg.Ollama.NumCtx,
 	})
+}
+
+// newGenerator is the Phase-3 factory wrapper. It calls
+// llm.NewGenerator with the loaded config and a per-command generation
+// budget (typically cfg.Timeouts.LinkDerivationSeconds, overridden to
+// IngestSummarySeconds on the ingest path). Returning llm.Generator
+// keeps the call sites decoupled from whichever provider is active.
+func newGenerator(cfg config.Config, budget time.Duration) (llm.Generator, error) {
+	return llm.NewGenerator(cfg, budget)
 }
 
 // newWeaviateClient mirrors newOllamaClient for Weaviate. The HTTP
@@ -81,7 +94,7 @@ func newWeaviateClient(cfg config.Config) *weaviate.HTTPClient {
 // ---------------------------------------------------------------------------
 
 type ollamaConceptExtractor struct {
-	client *ollama.HTTPClient
+	client llm.Generator
 }
 
 // Extract renders the concept-extraction prompt with the query as the

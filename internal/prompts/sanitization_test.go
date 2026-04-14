@@ -34,6 +34,8 @@ var templatesUnderTest = []string{
 	NameFrameProposal,
 	NameCommunitySummary,
 	NameModuleSummary,
+	NameDocSummary,
+	NameSQLSummary,
 }
 
 // TestPromptTemplateSanitization is the acceptance test for

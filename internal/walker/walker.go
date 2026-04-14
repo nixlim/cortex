@@ -35,6 +35,47 @@ import (
 // walker's acceptance tests self-contained.
 const DefaultModuleSizeLimitBytes int64 = 262144
 
+// alwaysSkipDirs names directory basenames that are pruned from the walk
+// unconditionally, BEFORE any .gitignore / .cortexignore / DenyList check.
+// These fall into two buckets:
+//
+//  1. VCS metadata (.git, .hg, .svn) — never source code, and letting them
+//     leak into ingest pollutes memory with binary index objects.
+//  2. Universally generated or vendored directories (node_modules, .next,
+//     .nuxt, .svelte-kit, .turbo, __pycache__, .venv, .gradle, .mypy_cache,
+//     .pytest_cache). These are machine-written by package managers or
+//     build tools and never contain human-authored source worth recalling.
+//     Including them balloons walk time (Next.js .next/dev/server/chunks
+//     alone can be thousands of 250KB JS blobs) and floods the summarizer
+//     with minified/transpiled noise that drowns out signal.
+//
+// This list is hardcoded rather than config-driven because there is no
+// plausible project where a directory with one of these basenames holds
+// source the operator wants indexed. If an operator needs the escape
+// hatch (e.g. ingesting the implementation of a package manager itself),
+// they can fork the walker. Cheaper than letting .next/ctx leak into
+// every recall result.
+//
+// Operators can still EXPAND the skip set per-project via .cortexignore;
+// this list is a floor, not a ceiling.
+var alwaysSkipDirs = map[string]struct{}{
+	".git":         {},
+	".hg":          {},
+	".svn":         {},
+	"node_modules": {},
+	".next":        {},
+	".nuxt":        {},
+	".svelte-kit":  {},
+	".turbo":       {},
+	".cache":       {},
+	"__pycache__":  {},
+	".pytest_cache": {},
+	".mypy_cache":  {},
+	".venv":        {},
+	".gradle":      {},
+	".tox":         {},
+}
+
 // FileMeta describes one walked file passed to the consumer callback.
 type FileMeta struct {
 	// AbsPath is the canonical (EvalSymlinks-resolved) absolute path.
@@ -198,12 +239,12 @@ func Walk(opts Options, fn func(FileMeta) error) error {
 			return nil
 		}
 
-		// Always skip the .git directory (and common VCS dirs) without
-		// consulting .gitignore so that repository metadata never enters
-		// the iterator even for repos that don't list .git in .gitignore.
+		// Always skip VCS metadata and universally-generated directories
+		// without consulting .gitignore so the iterator never sees
+		// machine-written source, even for repos that don't list these
+		// paths in .gitignore / .cortexignore. See alwaysSkipDirs.
 		if d.IsDir() {
-			base := filepath.Base(path)
-			if base == ".git" || base == ".hg" || base == ".svn" {
+			if _, skip := alwaysSkipDirs[filepath.Base(path)]; skip {
 				return filepath.SkipDir
 			}
 		}

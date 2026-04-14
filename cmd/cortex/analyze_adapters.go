@@ -23,8 +23,8 @@ import (
 
 	"github.com/nixlim/cortex/internal/analyze"
 	"github.com/nixlim/cortex/internal/community"
+	"github.com/nixlim/cortex/internal/llm"
 	"github.com/nixlim/cortex/internal/neo4j"
-	"github.com/nixlim/cortex/internal/ollama"
 	"github.com/nixlim/cortex/internal/prompts"
 )
 
@@ -152,7 +152,7 @@ func parseExemplars(raw any) []analyze.ExemplarRef {
 // ---------------------------------------------------------------------------
 
 type ollamaFrameProposer struct {
-	client *ollama.HTTPClient
+	client llm.Generator
 	source string // "analyze" or "reflect" — embedded in default frame type
 }
 
@@ -270,7 +270,7 @@ func (b *communityRefresherBridge) Refresh(ctx context.Context) error {
 // community.Summarizer. It renders the community_summary prompt with
 // the community's top member ids and returns the generated summary.
 type ollamaCommunitySummarizer struct {
-	client *ollama.HTTPClient
+	client llm.Generator
 }
 
 func (s *ollamaCommunitySummarizer) Summarize(ctx context.Context, c community.Community) (string, error) {

@@ -47,6 +47,8 @@ const (
 	NameFrameProposal     = "frame_proposal"
 	NameCommunitySummary  = "community_summary"
 	NameModuleSummary     = "module_summary"
+	NameDocSummary        = "doc_summary"
+	NameSQLSummary        = "sql_summary"
 )
 
 // ModuleSummarySchema is the JSON schema Ollama enforces when the
@@ -70,6 +72,38 @@ var ModuleSummarySchema = []byte(`{
   "required": ["summary","identifiers","algorithms","dependencies","searchable"]
 }`)
 
+// DocSummarySchema is the shape the doc_summary prompt produces. It
+// replaces the code-oriented identifiers/algorithms/dependencies
+// fields with document-oriented topics/entities/links so a prose
+// document classifier isn't asked to invent algorithm names that
+// don't exist in the source.
+var DocSummarySchema = []byte(`{
+  "type": "object",
+  "properties": {
+    "summary":    { "type": "string" },
+    "topics":     { "type": "array", "items": { "type": "string" } },
+    "entities":   { "type": "array", "items": { "type": "string" } },
+    "links":      { "type": "array", "items": { "type": "string" } },
+    "searchable": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["summary","topics","entities","links","searchable"]
+}`)
+
+// SQLSummarySchema is the shape the sql_summary prompt produces.
+// Tables / operations / columns replace the code-oriented fields so a
+// SQL migration or schema file is summarized in its own vocabulary.
+var SQLSummarySchema = []byte(`{
+  "type": "object",
+  "properties": {
+    "summary":    { "type": "string" },
+    "tables":     { "type": "array", "items": { "type": "string" } },
+    "operations": { "type": "array", "items": { "type": "string" } },
+    "columns":    { "type": "array", "items": { "type": "string" } },
+    "searchable": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["summary","tables","operations","columns","searchable"]
+}`)
+
 var all = []string{
 	NameConceptExtraction,
 	NameTrailSummary,
@@ -77,6 +111,8 @@ var all = []string{
 	NameFrameProposal,
 	NameCommunitySummary,
 	NameModuleSummary,
+	NameDocSummary,
+	NameSQLSummary,
 }
 
 // All returns the registered template names in stable order.

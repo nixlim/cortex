@@ -27,6 +27,7 @@ import (
 	"github.com/nixlim/cortex/internal/infra"
 	"github.com/nixlim/cortex/internal/log"
 	"github.com/nixlim/cortex/internal/neo4j"
+	"github.com/nixlim/cortex/internal/llm"
 	"github.com/nixlim/cortex/internal/ollama"
 	"github.com/nixlim/cortex/internal/prompts"
 	"github.com/nixlim/cortex/internal/psi"
@@ -177,7 +178,12 @@ func buildObservePipeline(segDir string, cfg config.Config) (*write.Pipeline, fu
 	}
 
 	embedder := newOllamaEmbedder(cfg)
-	ollamaClient := newOllamaClient(cfg)
+	generator, err := newGenerator(cfg, time.Duration(cfg.Timeouts.LinkDerivationSeconds)*time.Second)
+	if err != nil {
+		_ = writer.Close()
+		return nil, func() {}, errs.Operational("LLM_CONFIG_INVALID",
+			"could not construct LLM generator", err)
+	}
 	weaviateClient := newWeaviateClient(cfg)
 
 	// Open a Bolt client for the Neo4j BackendApplier. Failure here
@@ -217,7 +223,7 @@ func buildObservePipeline(segDir string, cfg config.Config) (*write.Pipeline, fu
 		Neo4j:        neoApplier,
 		Weaviate:     weaviateApplier,
 		Neighbors:    &weaviateNeighborFinder{client: weaviateClient},
-		LinkProposer: &ollamaLinkProposer{client: ollamaClient},
+		LinkProposer: &ollamaLinkProposer{client: generator},
 		LinkConfig: write.LinkDerivationConfig{
 			ConfidenceFloor:    cfg.LinkDerivation.ConfidenceFloor,
 			SimilarCosineFloor: cfg.LinkDerivation.SimilarToCosineFloor,
@@ -271,7 +277,7 @@ func (w *weaviateNeighborFinder) Neighbors(ctx context.Context, vector []float32
 // any unparseable response is treated as "no proposals" — the source
 // entry is already committed and link derivation must not fail it.
 type ollamaLinkProposer struct {
-	client *ollama.HTTPClient
+	client llm.Generator
 }
 
 func (o *ollamaLinkProposer) Propose(ctx context.Context, sourceBody string, candidates []write.LinkCandidate) ([]write.LinkProposal, error) {

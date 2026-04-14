@@ -86,48 +86,63 @@ bd close <id>         # Complete work
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **cortex** (3994 symbols, 11294 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **cortex** (4237 symbols, 10864 relationships, 300 execution flows). Use GitNexus to understand code, assess impact, and navigate safely.
 
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+## ⚠️ CRITICAL: Use the CLI, not MCP tools
+
+**ALWAYS invoke GitNexus via its CLI (`npx gitnexus <subcommand>` from the Bash tool), NOT via the `mcp__gitnexus__*` tools.** The CLI is the canonical interface for this project. Do not use `mcp__gitnexus__query`, `mcp__gitnexus__context`, `mcp__gitnexus__impact`, `mcp__gitnexus__cypher`, `mcp__gitnexus__detect_changes`, `mcp__gitnexus__rename`, `mcp__gitnexus__api_impact`, `mcp__gitnexus__route_map`, `mcp__gitnexus__tool_map`, `mcp__gitnexus__shape_check`, `mcp__gitnexus__list_repos`, or any other `mcp__gitnexus__*` tool. Run the CLI instead.
+
+- Every command below is a `Bash` tool invocation. All other GitNexus guidance in this document refers to CLI subcommands, not MCP calls.
+- The repository is indexed as `cortex`. Pass `-r cortex` when you want to be explicit, or rely on the current working directory.
+- If `npx gitnexus status` reports the index is stale, run `npx gitnexus analyze` before any other GitNexus command.
+- Two operations have no CLI equivalent: pre-commit change detection (use `git diff --name-only --cached` / `git status --short`) and symbol renames (use `npx gitnexus context <name>` + `npx gitnexus impact <name>` first, then apply edits via the Edit tool). Do NOT fall back to the MCP tools for these.
 
 ## Always Do
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `npx gitnexus impact <symbolName> --direction upstream` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST verify staged scope before committing** via `git status --short` and `git diff --stat --cached`. If you want graph-level verification, re-run `npx gitnexus impact` on the changed symbols and confirm the d=1 set is what you intended.
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+- When exploring unfamiliar code, use `npx gitnexus query "concept"` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `npx gitnexus context <symbolName>`.
 
 ## When Debugging
 
-1. `gitnexus_query({query: "<error or symptom>"})` — find execution flows related to the issue
-2. `gitnexus_context({name: "<suspect function>"})` — see all callers, callees, and process participation
-3. `READ gitnexus://repo/cortex/process/{processName}` — trace the full execution flow step by step
-4. For regressions: `gitnexus_detect_changes({scope: "compare", base_ref: "main"})` — see what your branch changed
+1. `npx gitnexus query "<error or symptom>"` — find execution flows related to the issue
+2. `npx gitnexus context <suspect function>` — see all callers, callees, and process participation
+3. `npx gitnexus cypher "MATCH (p:Process {name: '<processName>'})-[:CONTAINS]->(s) RETURN s"` — trace the full execution flow step by step
+4. For regressions: `git diff main...HEAD` — see what your branch changed, then re-run `npx gitnexus impact` on any modified symbol to understand downstream risk
 
 ## When Refactoring
 
-- **Renaming**: MUST use `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` first. Review the preview — graph edits are safe, text_search edits need manual review. Then run with `dry_run: false`.
-- **Extracting/Splitting**: MUST run `gitnexus_context({name: "target"})` to see all incoming/outgoing refs, then `gitnexus_impact({target: "target", direction: "upstream"})` to find all external callers before moving code.
-- After any refactor: run `gitnexus_detect_changes({scope: "all"})` to verify only expected files changed.
+- **Renaming**: MUST run `npx gitnexus context <old>` and `npx gitnexus impact <old>` first to see every caller. Apply the rename via the Edit tool with `replace_all: true` on each affected file, then re-run `npx gitnexus analyze` to rebuild the graph and re-run `npx gitnexus impact <new>` to confirm no callers were missed. Do NOT use the `mcp__gitnexus__rename` MCP tool.
+- **Extracting/Splitting**: MUST run `npx gitnexus context <target>` to see all incoming/outgoing refs, then `npx gitnexus impact <target> --direction upstream` to find all external callers before moving code.
+- After any refactor: `git diff --stat` to verify only expected files changed; re-run `npx gitnexus analyze` and `npx gitnexus impact` on the new symbol names to confirm the call graph is intact.
 
 ## Never Do
 
-- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
+- **NEVER use the `mcp__gitnexus__*` tools.** Always invoke `npx gitnexus ...` via Bash.
+- NEVER edit a function, class, or method without first running `npx gitnexus impact` on it.
 - NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
-- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
+- NEVER rename symbols with blind find-and-replace — run `npx gitnexus context` + `impact` first to enumerate callers.
+- NEVER commit changes without inspecting `git status --short` + `git diff --stat --cached` to verify scope.
 
-## Tools Quick Reference
+## CLI Quick Reference
 
-| Tool | When to use | Command |
-|------|-------------|---------|
-| `query` | Find code by concept | `gitnexus_query({query: "auth validation"})` |
-| `context` | 360-degree view of one symbol | `gitnexus_context({name: "validateUser"})` |
-| `impact` | Blast radius before editing | `gitnexus_impact({target: "X", direction: "upstream"})` |
-| `detect_changes` | Pre-commit scope check | `gitnexus_detect_changes({scope: "staged"})` |
-| `rename` | Safe multi-file rename | `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` |
-| `cypher` | Custom graph queries | `gitnexus_cypher({query: "MATCH ..."})` |
+All commands are invoked via the `Bash` tool. Add `-r cortex` if ambiguity arises.
+
+| Task | CLI invocation |
+|------|----------------|
+| Find code by concept | `npx gitnexus query "auth validation"` |
+| 360-degree view of one symbol | `npx gitnexus context validateUser` |
+| Blast radius before editing | `npx gitnexus impact validateUser --direction upstream` |
+| Downstream dependency walk | `npx gitnexus impact validateUser --direction downstream` |
+| Custom graph queries | `npx gitnexus cypher "MATCH (f:Function)-[:CALLS]->(g) WHERE f.name = 'foo' RETURN g.name"` |
+| Index status | `npx gitnexus status` |
+| List indexed repos | `npx gitnexus list` |
+| Re-index (after commits) | `npx gitnexus analyze` (add `--embeddings` to preserve embeddings) |
+| Generate wiki | `npx gitnexus wiki` |
+| Pre-commit scope check | `git status --short && git diff --stat --cached` (no GitNexus CLI equivalent) |
+| Pre-rename caller enumeration | `npx gitnexus context <name> && npx gitnexus impact <name>` (no GitNexus CLI rename equivalent) |
 
 ## Impact Risk Levels
 
@@ -137,21 +152,23 @@ This project is indexed by GitNexus as **cortex** (3994 symbols, 11294 relations
 | d=2 | LIKELY AFFECTED — indirect deps | Should test |
 | d=3 | MAY NEED TESTING — transitive | Test if critical path |
 
-## Resources
+## Overview Queries (no MCP resources)
 
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/cortex/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/cortex/clusters` | All functional areas |
-| `gitnexus://repo/cortex/processes` | All execution flows |
-| `gitnexus://repo/cortex/process/{name}` | Step-by-step execution trace |
+The MCP `gitnexus://repo/...` resources are NOT to be used. Get the same information from the CLI:
+
+| Need | CLI invocation |
+|------|----------------|
+| Codebase overview + freshness | `npx gitnexus status` |
+| All functional areas / clusters | `npx gitnexus cypher "MATCH (c:Cluster) RETURN c.name, c.size ORDER BY c.size DESC"` |
+| All execution flows | `npx gitnexus cypher "MATCH (p:Process) RETURN p.name ORDER BY p.name"` |
+| Step-by-step execution trace for one process | `npx gitnexus cypher "MATCH (p:Process {name: '<name>'})-[:CONTAINS]->(s) RETURN s.name, s.file, s.start_line ORDER BY s.start_line"` |
 
 ## Self-Check Before Finishing
 
 Before completing any code modification task, verify:
-1. `gitnexus_impact` was run for all modified symbols
+1. `npx gitnexus impact` was run for all modified symbols (via the Bash tool, not MCP)
 2. No HIGH/CRITICAL risk warnings were ignored
-3. `gitnexus_detect_changes()` confirms changes match expected scope
+3. `git status --short` + `git diff --stat --cached` confirm the staged scope matches what you intended
 4. All d=1 (WILL BREAK) dependents were updated
 
 ## Keeping the Index Fresh

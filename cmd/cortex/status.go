@@ -94,7 +94,37 @@ func runStatus(cmd *cobra.Command, _ []string, jsonOut bool) error {
 		return enc.Encode(report)
 	}
 	renderHumanStatus(cmd, report)
+	renderLLMProvider(cmd, cfg)
 	return nil
+}
+
+// renderLLMProvider prints the active generation provider below the
+// backend status block. The JSON status shape is contract-bound
+// (infra.Report) so provider visibility lives on the human surface
+// only; operators scripting against JSON can read config.yaml or
+// `cortex doctor --json` (which exposes the LLM check).
+func renderLLMProvider(cmd *cobra.Command, cfg config.Config) {
+	w := cmd.OutOrStdout()
+	provider := cfg.LLM.Provider
+	if provider == "" {
+		provider = "ollama"
+	}
+	model := ""
+	switch provider {
+	case "anthropic":
+		model = cfg.LLM.Anthropic.Model
+	case "openai":
+		model = cfg.LLM.OpenAI.Model
+	case "openrouter":
+		model = cfg.LLM.OpenRouter.Model
+	case "ollama":
+		model = defaultGenerationModel
+	}
+	if model != "" {
+		fmt.Fprintf(w, "  llm      : %-9s %s\n", provider, model)
+	} else {
+		fmt.Fprintf(w, "  llm      : %s\n", provider)
+	}
 }
 
 // renderHumanStatus writes a terse, column-aligned summary suitable for

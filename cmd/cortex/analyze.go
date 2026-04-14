@@ -127,10 +127,16 @@ func buildAnalyzePipeline() (*analyze.Pipeline, func(), error) {
 		_ = bolt.Close(context.Background())
 	}
 
-	ollamaClient := newOllamaClient(cfg)
+	generator, err := newGenerator(cfg, time.Duration(cfg.Timeouts.LinkDerivationSeconds)*time.Second)
+	if err != nil {
+		_ = writer.Close()
+		_ = bolt.Close(context.Background())
+		return nil, func() {}, errs.Operational("LLM_CONFIG_INVALID",
+			"could not construct LLM generator", err)
+	}
 
 	// Community refresher: Leiden preferred, Louvain fallback, with
-	// the Ollama-backed summariser for any regenerated summaries.
+	// the LLM-backed summariser for any regenerated summaries.
 	detector := &community.Detector{
 		Neo4j:        bolt,
 		LeidenQuery:  neo4j.LeidenStreamQuery,
@@ -139,7 +145,7 @@ func buildAnalyzePipeline() (*analyze.Pipeline, func(), error) {
 	}
 	refresher := &community.Refresher{
 		Neo4j:      bolt,
-		Summarizer: &ollamaCommunitySummarizer{client: ollamaClient},
+		Summarizer: &ollamaCommunitySummarizer{client: generator},
 	}
 	refreshBridge := &communityRefresherBridge{
 		detector:  detector,
@@ -156,7 +162,7 @@ func buildAnalyzePipeline() (*analyze.Pipeline, func(), error) {
 
 	pipeline := &analyze.Pipeline{
 		Source:       &neo4jAnalyzeClusterSource{client: bolt},
-		Proposer:     &ollamaFrameProposer{client: ollamaClient, source: "analyze"},
+		Proposer:     &ollamaFrameProposer{client: generator, source: "analyze"},
 		Log:          writer,
 		Community:    refreshBridge,
 		Actor:        defaultActor(),

@@ -21,6 +21,10 @@ emit the object only, no prose around it):
                     vars, and any other symbol a reader might search
                     for. Include each identifier ONCE. Prefer the most
                     specific form that appears in the source.
+                    HARD CAP: 25 entries. For modules with more than
+                    25 declared symbols, choose the exported /
+                    top-level / load-bearing ones — do NOT enumerate
+                    every helper and parameter.
 
     "algorithms":  [string] — named algorithms, protocols, data
                     structures, cryptographic primitives, and standards
@@ -28,7 +32,7 @@ emit the object only, no prose around it):
                     module (e.g. "leiden", "louvain", "ulid",
                     "SHA-256", "PPR", "YaRN"). Pull these from both
                     source identifiers AND code comments. Do not
-                    invent names that do not appear.
+                    invent names that do not appear. HARD CAP: 15.
 
     "dependencies":[string] — third-party library or package
                     identifiers this module imports or depends on,
@@ -38,14 +42,15 @@ emit the object only, no prose around it):
                     top-level package (e.g. "numpy"). Include the
                     standard library only when it is load-bearing
                     (e.g. "net/http" for an HTTP adapter).
+                    HARD CAP: 20.
 
     "searchable": [string] — natural-language phrases a user might
                     plausibly query to find this module, beyond the
                     literal identifiers. Think "things this module
                     does" in the user's words, not the author's:
                     "module summarization pipeline", "trail
-                    synthesis", "idempotent re-run of ingest". Aim
-                    for 5-10 phrases.
+                    synthesis", "idempotent re-run of ingest".
+                    HARD CAP: 10 entries.
   }
 
 Rules:

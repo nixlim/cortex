@@ -25,8 +25,8 @@ import (
 	"time"
 
 	"github.com/nixlim/cortex/internal/analyze"
+	"github.com/nixlim/cortex/internal/llm"
 	"github.com/nixlim/cortex/internal/neo4j"
-	"github.com/nixlim/cortex/internal/ollama"
 	"github.com/nixlim/cortex/internal/reflect"
 )
 
@@ -185,7 +185,7 @@ SET r.tx = $tx, r.updated_at = $updated_at
 // cross-project Projects/Importance fields, so a direct field copy
 // is sufficient.
 type reflectFrameProposerBridge struct {
-	client *ollama.HTTPClient
+	client llm.Generator
 }
 
 func (p *reflectFrameProposerBridge) Propose(ctx context.Context, cluster reflect.ClusterCandidate) (*reflect.Frame, error) {

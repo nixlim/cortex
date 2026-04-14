@@ -81,6 +81,12 @@ type Client interface {
 	// accepts a pre-templated prompt string and returns the raw
 	// completion; caller-side parsing lives in the prompts package.
 	Generate(ctx context.Context, prompt string) (string, error)
+
+	// GenerateStructured is the schema-constrained variant of
+	// Generate. The returned string is guaranteed (by Ollama's
+	// /api/generate format= field) to be valid JSON conforming to
+	// the supplied schema. Used by the ingest summarizer.
+	GenerateStructured(ctx context.Context, prompt string, schema json.RawMessage) (string, error)
 }
 
 // ModelInfo is the minimal shape of an Ollama /api/show response

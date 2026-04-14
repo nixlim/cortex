@@ -26,6 +26,76 @@ type Config struct {
 	Disk               DiskConfig               `yaml:"disk"`
 	Docker             DockerConfig             `yaml:"docker"`
 	Ollama             OllamaConfig             `yaml:"ollama"`
+	LLM                LLMConfig                `yaml:"llm"`
+}
+
+// LLMConfig selects the generation provider and carries the
+// per-provider knobs. Embedding is NOT routed through this block:
+// FR-051 pins embedding_model_name and embedding_model_digest on every
+// Entry/Frame datom, which means the embedding path stays anchored to
+// the Ollama adapter regardless of which generation provider is
+// active. See the multi-provider plan (cortex-r5k/ppc/d2v/0ur).
+//
+// API keys MUST come from environment variables only, never from the
+// config file. Each provider sub-block exposes api_key_env which is
+// the NAME of the env var to read; the actual secret never touches
+// YAML. This mirrors the Neo4j password contract (FR / US-10.7).
+type LLMConfig struct {
+	// Provider is one of "ollama", "anthropic", "openai". Unknown
+	// values cause the factory to return CONFIG_LOAD_FAILED at
+	// startup. Default is "ollama" to preserve the Phase 1-3 local
+	// profile.
+	Provider   string              `yaml:"provider"`
+	Anthropic  AnthropicLLMConfig  `yaml:"anthropic"`
+	OpenAI     OpenAILLMConfig     `yaml:"openai"`
+	OpenRouter OpenRouterLLMConfig `yaml:"openrouter"`
+}
+
+// AnthropicLLMConfig carries the Messages API knobs used by
+// internal/anthropic.HTTPClient. BaseURL defaults to the live
+// production endpoint; tests override it via httptest.Server.
+type AnthropicLLMConfig struct {
+	Model     string `yaml:"model"`
+	APIKeyEnv string `yaml:"api_key_env"`
+	MaxTokens int    `yaml:"max_tokens"`
+	BaseURL   string `yaml:"base_url"`
+}
+
+// OpenAILLMConfig carries the Chat Completions API knobs used by
+// internal/openai.HTTPClient. BaseURL defaults to the live production
+// endpoint; tests override it via httptest.Server.
+type OpenAILLMConfig struct {
+	Model     string `yaml:"model"`
+	APIKeyEnv string `yaml:"api_key_env"`
+	MaxTokens int    `yaml:"max_tokens"`
+	BaseURL   string `yaml:"base_url"`
+}
+
+// OpenRouterLLMConfig carries the OpenAI-compatible chat completions
+// knobs used by internal/openrouter.HTTPClient. OpenRouter proxies
+// hundreds of upstream models behind a single endpoint and a single
+// API key; the Model field MUST carry the upstream-provider prefix
+// (e.g. "anthropic/claude-sonnet-4.5", "openai/gpt-4o-mini",
+// "google/gemini-2.0-flash-exp"). BaseURL defaults to the live
+// production endpoint; tests override it via httptest.Server.
+//
+// Strict-mode contract: Cortex forwards response_format with
+// strict:true for structured-output calls. Operators MUST select a
+// model that honors OpenAI's strict json_schema semantics — some
+// older open-source models (older Llama variants, some community
+// releases) will fail at request time. Prefer frontier models from
+// the major vendors.
+//
+// HTTPReferer and XTitle are optional attribution headers that
+// OpenRouter displays in its operator dashboard; leaving them empty
+// is fine.
+type OpenRouterLLMConfig struct {
+	Model       string `yaml:"model"`
+	APIKeyEnv   string `yaml:"api_key_env"`
+	MaxTokens   int    `yaml:"max_tokens"`
+	BaseURL     string `yaml:"base_url"`
+	HTTPReferer string `yaml:"http_referer"`
+	XTitle      string `yaml:"x_title"`
 }
 
 // OllamaConfig holds adapter-level knobs for the Ollama HTTP client
@@ -66,8 +136,8 @@ type RetrievalConfig struct {
 	// remains a back-compat alias for RelevanceGate.SimFloorStrict;
 	// prefer the sub-struct for new configs. See bead cortex-y6g.
 	// Zero disables the gate.
-	RelevanceFloor float64              `yaml:"relevance_floor"`
-	RelevanceGate  RelevanceGateConfig  `yaml:"relevance_gate"`
+	RelevanceFloor float64             `yaml:"relevance_floor"`
+	RelevanceGate  RelevanceGateConfig `yaml:"relevance_gate"`
 }
 
 // RelevanceGateConfig holds the layered relevance gate knobs from
@@ -121,8 +191,8 @@ type PaginationConfig struct {
 }
 
 type LinkDerivationConfig struct {
-	ConfidenceFloor       float64 `yaml:"confidence_floor"`
-	SimilarToCosineFloor  float64 `yaml:"similar_to_cosine_floor"`
+	ConfidenceFloor      float64 `yaml:"confidence_floor"`
+	SimilarToCosineFloor float64 `yaml:"similar_to_cosine_floor"`
 }
 
 type ReflectionConfig struct {
@@ -133,10 +203,10 @@ type ReflectionConfig struct {
 }
 
 type AnalysisConfig struct {
-	MDLCompressionRatio           float64 `yaml:"mdl_compression_ratio"`
-	CrossProjectMinProjects       int     `yaml:"cross_project_min_projects"`
+	MDLCompressionRatio            float64 `yaml:"mdl_compression_ratio"`
+	CrossProjectMinProjects        int     `yaml:"cross_project_min_projects"`
 	CrossProjectMaxSharePerProject float64 `yaml:"cross_project_max_share_per_project"`
-	CrossProjectImportanceBoost   float64 `yaml:"cross_project_importance_boost"`
+	CrossProjectImportanceBoost    float64 `yaml:"cross_project_importance_boost"`
 }
 
 type CommunityDetectionConfig struct {
@@ -148,11 +218,47 @@ type CommunityDetectionConfig struct {
 }
 
 type IngestConfig struct {
-	ModuleSizeLimitBytes int                   `yaml:"module_size_limit_bytes"`
-	OllamaConcurrency    int                   `yaml:"ollama_concurrency"`
-	PostIngestReflect    bool                  `yaml:"post_ingest_reflect"`
-	PostIngestAnalyze    bool                  `yaml:"post_ingest_analyze"`
-	DefaultStrategy      IngestDefaultStrategy `yaml:"default_strategy"`
+	ModuleSizeLimitBytes int `yaml:"module_size_limit_bytes"`
+
+	// ModuleSourceBudgetBytes caps the combined source bytes one
+	// module contributes to the summarizer prompt. Zero means
+	// "use the built-in default" (100000 bytes ≈ 25-33K tokens,
+	// tuned for Ollama qwen3:4b at num_ctx=32768). Remote providers
+	// with larger context windows (Gemma 4 at 262K, Claude at 200K,
+	// etc.) can safely raise this to 150000-200000 bytes (≈ 50K
+	// tokens) to feed larger spec documents in a single call.
+	// Raising it beyond the provider's prompt-token ceiling will
+	// surface as a 400 from the provider, not silent truncation.
+	ModuleSourceBudgetBytes int `yaml:"module_source_budget_bytes"`
+
+	// GenerationConcurrency bounds the number of module summary
+	// calls the ingest pipeline keeps in flight against the selected
+	// LLM provider. The right value depends entirely on the execution
+	// substrate:
+	//
+	//   - Local Ollama on consumer hardware (qwen3:4b @ NumCtx=32768):
+	//     2 is the observed ceiling. Raising further floods the
+	//     single-process Ollama server; queued calls blow past per-
+	//     request deadlines.
+	//   - Remote paid-tier API (Anthropic/OpenAI tier 2+): ~1000 RPM
+	//     headroom and ~30-60s per-call latency makes 16 concurrent
+	//     calls the sweet spot. Operators on the highest tiers can
+	//     raise further in config. See bead cortex-17p.
+	//
+	// Defaults() leaves this field at 0 so Load() can choose a value
+	// based on LLM.Provider after the user YAML is merged. Explicit
+	// user values win.
+	GenerationConcurrency int `yaml:"generation_concurrency"`
+	// LegacyOllamaConcurrency reads the pre-Phase-4 YAML key
+	// (ollama_concurrency). When non-nil, it overrides
+	// GenerationConcurrency. Pointer type lets Load() distinguish
+	// "unset" from "explicitly zero". New configs should use
+	// generation_concurrency.
+	LegacyOllamaConcurrency *int `yaml:"ollama_concurrency"`
+
+	PostIngestReflect bool                  `yaml:"post_ingest_reflect"`
+	PostIngestAnalyze bool                  `yaml:"post_ingest_analyze"`
+	DefaultStrategy   IngestDefaultStrategy `yaml:"default_strategy"`
 }
 
 type IngestDefaultStrategy struct {
@@ -169,10 +275,10 @@ type IngestDefaultStrategy struct {
 }
 
 type LogConfig struct {
-	LockTimeoutSeconds       int    `yaml:"lock_timeout_seconds"`
-	TailValidationWindowBytes int   `yaml:"tail_validation_window_bytes"`
-	SegmentMaxSizeMB         int    `yaml:"segment_max_size_mb"`
-	SegmentDir               string `yaml:"segment_dir"`
+	LockTimeoutSeconds        int    `yaml:"lock_timeout_seconds"`
+	TailValidationWindowBytes int    `yaml:"tail_validation_window_bytes"`
+	SegmentMaxSizeMB          int    `yaml:"segment_max_size_mb"`
+	SegmentDir                string `yaml:"segment_dir"`
 }
 
 type DoctorConfig struct {
@@ -223,8 +329,8 @@ type EndpointsConfig struct {
 }
 
 type OpsLogConfig struct {
-	Format     string `yaml:"format"`
-	MaxSizeMB  int    `yaml:"max_size_mb"`
+	Format    string `yaml:"format"`
+	MaxSizeMB int    `yaml:"max_size_mb"`
 }
 
 type DiskConfig struct {
@@ -280,9 +386,9 @@ func Defaults() Config {
 			// between 0.40 and 0.55 must earn its slot via PPR
 			// rescue: sim >= 0.40 - 0.15*ppr.
 			RelevanceGate: RelevanceGateConfig{
-				SimFloorHard:   0.40,
-				SimFloorStrict: 0.55,
-				RescueAlpha:    0.15,
+				SimFloorHard:    0.40,
+				SimFloorStrict:  0.55,
+				RescueAlpha:     0.15,
 				CompositeFloor:  0.45,
 				GateSimWeight:   0.7,
 				GatePPRWeight:   0.3,
@@ -318,17 +424,14 @@ func Defaults() Config {
 		},
 		Ingest: IngestConfig{
 			ModuleSizeLimitBytes: 262144,
-			// OllamaConcurrency bounds the number of module summary
-			// calls in flight against /api/generate. On a constrained
-			// local Ollama running qwen3:4b at NumCtx=32768, 4 concurrent
-			// calls overflow the model's single-request capacity and 3 of
-			// them queue past their per-request deadline. 2 matches what
-			// a consumer GPU can actually serve at 32K context. Raise
-			// this in config.yaml if your Ollama host has more VRAM or
-			// you're using a smaller model. See cortex-8rk.
-			OllamaConcurrency:    2,
-			PostIngestReflect:    true,
-			PostIngestAnalyze:    false,
+			// GenerationConcurrency is intentionally left at 0 so
+			// Load() can pick a provider-aware default after it sees
+			// cfg.LLM.Provider. The effective defaults are 2 for
+			// ollama (local hardware ceiling) and 16 for remote
+			// providers (paid-tier APIs, cortex-17p).
+			GenerationConcurrency: 0,
+			PostIngestReflect:     true,
+			PostIngestAnalyze:     false,
 			DefaultStrategy: IngestDefaultStrategy{
 				Go:                   "per-package",
 				Java:                 "per-class",
@@ -371,14 +474,22 @@ func Defaults() Config {
 			TrailSummarySeconds:      60,
 			ReflectionSeconds:        60,
 			// IngestSummarySeconds is the per-module wall clock for the
-			// ingest summarizer's structured-output call. At NumCtx=32768
-			// with a 100KB module prompt on a 4-8B q4 model running
-			// locally, a single /api/generate can take several minutes
-			// end-to-end (prompt processing + constrained decoding), so
-			// the default is generous. Raised to 1800s after observing
-			// ~600s timeouts on large Go per-package summaries in the
-			// cortex self-ingest on a local qwen3:4b. See cortex-8rk.
-			IngestSummarySeconds: 1800,
+			// ingest summarizer's structured-output call. The effective
+			// value is provider-aware (Load() picks a default based on
+			// cfg.LLM.Provider):
+			//
+			//   - ollama: 1800s. A 100KB prompt at NumCtx=32768 on a
+			//     local 4-8B q4 model can take several minutes of
+			//     prompt processing + constrained decoding; generous
+			//     default keeps the cortex self-ingest green.
+			//   - anthropic/openai: 300s. A remote call that is still
+			//     running after 5 minutes is stuck, not slow — failing
+			//     fast surfaces the problem instead of hanging the
+			//     pipeline for half an hour. See cortex-17p.
+			//
+			// Zero here means "pick provider default in Load()".
+			// Explicit user values win.
+			IngestSummarySeconds: 0,
 		},
 		Ollama: OllamaConfig{
 			NumCtx:             32768,
@@ -403,6 +514,38 @@ func Defaults() Config {
 		},
 		Disk: DiskConfig{
 			WarningThresholdGB: 1,
+		},
+		LLM: LLMConfig{
+			// Default provider is ollama, preserving the Phase 1-3
+			// local-only profile. Operators opt into remote providers
+			// by flipping this value and setting the corresponding
+			// api_key_env in their shell.
+			Provider: "ollama",
+			Anthropic: AnthropicLLMConfig{
+				Model:     "claude-sonnet-4-6",
+				APIKeyEnv: "ANTHROPIC_API_KEY",
+				MaxTokens: 8192,
+				BaseURL:   "https://api.anthropic.com",
+			},
+			OpenAI: OpenAILLMConfig{
+				Model:     "gpt-4o-mini",
+				APIKeyEnv: "OPENAI_API_KEY",
+				MaxTokens: 8192,
+				BaseURL:   "https://api.openai.com",
+			},
+			OpenRouter: OpenRouterLLMConfig{
+				// Default model is left empty: OpenRouter carries
+				// hundreds of upstream model slugs and there is no
+				// sensible "just works" default. Operators opting into
+				// this provider MUST set llm.openrouter.model to a
+				// slug-prefixed identifier (e.g.
+				// "anthropic/claude-sonnet-4.5"). An empty value
+				// surfaces as LLM_CONFIG_INVALID at startup.
+				Model:     "google/gemma-4-26b-a4b-it",
+				APIKeyEnv: "OPENROUTER_API_KEY",
+				MaxTokens: 8192,
+				BaseURL:   "https://openrouter.ai/api",
+			},
 		},
 	}
 }

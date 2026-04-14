@@ -134,21 +134,45 @@ func TestSingleCppFileStillFormsOneModule(t *testing.T) {
 // appears as its own module."
 // ---------------------------------------------------------------------------
 
-func TestUnknownExtensionFallsBackToPerFile(t *testing.T) {
-	files := buildFiles("README.md", "config.ini", "data.dat")
+// TestUnknownExtensionsAreDroppedByGrouper locks in the ingest policy
+// that unknown-extension files are NOT surfaced as modules. JSON/CSV/
+// YAML/TOML/INI files were previously passed to the code summarizer
+// and produced low-signal or failing summaries; the grouper now
+// drops them so only classified languages enter the ingest pipeline.
+func TestUnknownExtensionsAreDroppedByGrouper(t *testing.T) {
+	files := buildFiles("config.ini", "data.dat", "translations.json", "table.csv")
 	mods := Group(files, DefaultMatrix())
-	if len(mods) != 3 {
-		t.Fatalf("expected 3 fallback modules, got %d", len(mods))
+	if len(mods) != 0 {
+		t.Fatalf("expected 0 modules (all dropped), got %d: %v", len(mods), mods)
 	}
+}
+
+func TestDocsAndSQLExtensionsClassifyToOwnBuckets(t *testing.T) {
+	files := buildFiles("README.md", "docs/arch.markdown", "notes.txt",
+		"spec.rst", "migrations/001_init.sql")
+	mods := Group(files, DefaultMatrix())
+	byID := map[string]Module{}
 	for _, m := range mods {
-		if m.Language != LangUnknown {
-			t.Errorf("unknown-ext module language = %q, want unknown", m.Language)
+		byID[m.ID] = m
+	}
+	wantLang := map[string]Language{
+		"docs:per-file:README.md":               LangDocs,
+		"docs:per-file:docs/arch.markdown":      LangDocs,
+		"docs:per-file:notes.txt":               LangDocs,
+		"docs:per-file:spec.rst":                LangDocs,
+		"sql:per-file:migrations/001_init.sql":  LangSQL,
+	}
+	for id, lang := range wantLang {
+		m, ok := byID[id]
+		if !ok {
+			t.Errorf("module %q not produced; got modules: %v", id, mods)
+			continue
+		}
+		if m.Language != lang {
+			t.Errorf("%q: language = %q, want %q", id, m.Language, lang)
 		}
 		if m.Strategy != StrategyPerFile {
-			t.Errorf("fallback strategy = %q, want per-file", m.Strategy)
-		}
-		if len(m.Files) != 1 {
-			t.Errorf("fallback module should have exactly 1 file, got %d", len(m.Files))
+			t.Errorf("%q: strategy = %q, want per-file", id, m.Strategy)
 		}
 	}
 }
@@ -178,7 +202,14 @@ func TestClassifyMapsAllDeclaredLanguages(t *testing.T) {
 		"source.c":      LangCCpp,
 		"obj.cpp":       LangCCpp,
 		"other.cxx":     LangCCpp,
+		"README.md":     LangDocs,
+		"spec.markdown": LangDocs,
+		"notes.txt":     LangDocs,
+		"arch.rst":      LangDocs,
+		"init.sql":      LangSQL,
 		"nope.unknown":  LangUnknown,
+		"data.json":     LangUnknown,
+		"cfg.yaml":      LangUnknown,
 		"noext":         LangUnknown,
 	}
 	for path, want := range cases {

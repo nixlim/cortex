@@ -20,7 +20,6 @@ import (
 	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/errs"
 	"github.com/nixlim/cortex/internal/log"
-	"github.com/nixlim/cortex/internal/ollama"
 	"github.com/nixlim/cortex/internal/prompts"
 	"github.com/nixlim/cortex/internal/trail"
 )
@@ -153,16 +152,14 @@ func newTrailEndCmd() *cobra.Command {
 					"could not render trail summary prompt", err), jsonFlag)
 			}
 
-			// Generate via the host Ollama. Honour
-			// timeouts.trail_summary_seconds as the per-call budget.
-			gen := ollama.NewHTTPClient(ollama.Config{
-				Endpoint:              cfg.Endpoints.Ollama,
-				EmbeddingModel:        defaultEmbeddingModel,
-				GenerationModel:       defaultGenerationModel,
-				EmbeddingTimeout:      time.Duration(cfg.Timeouts.EmbeddingSeconds) * time.Second,
-				LinkDerivationTimeout: time.Duration(cfg.Timeouts.TrailSummarySeconds) * time.Second,
-				NumCtx:                cfg.Ollama.NumCtx,
-			})
+			// Generate via the provider-agnostic LLM factory. Honour
+			// timeouts.trail_summary_seconds as the per-call budget —
+			// newGenerator passes it through to the provider.
+			gen, err := newGenerator(cfg, time.Duration(cfg.Timeouts.TrailSummarySeconds)*time.Second)
+			if err != nil {
+				return emitAndExit(cmd, errs.Operational("LLM_CONFIG_INVALID",
+					"could not construct LLM generator", err), jsonFlag)
+			}
 			budget := time.Duration(cfg.Timeouts.TrailSummarySeconds) * time.Second
 			if budget <= 0 {
 				budget = 60 * time.Second

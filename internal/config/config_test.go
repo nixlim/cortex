@@ -23,6 +23,117 @@ func TestLoadMissingFileReturnsDefaults(t *testing.T) {
 	if cfg.Log.SegmentMaxSizeMB != 64 {
 		t.Errorf("segment_max_size_mb: got %d want 64", cfg.Log.SegmentMaxSizeMB)
 	}
+	// Phase 4: Load on a missing file must still normalize the
+	// provider-aware ingest tuning fields. Default provider is
+	// ollama so concurrency=2 and ingest summary timeout=1800.
+	if cfg.Ingest.GenerationConcurrency != 2 {
+		t.Errorf("ollama default generation_concurrency: got %d want 2", cfg.Ingest.GenerationConcurrency)
+	}
+	if cfg.Timeouts.IngestSummarySeconds != 1800 {
+		t.Errorf("ollama default ingest_summary_seconds: got %d want 1800", cfg.Timeouts.IngestSummarySeconds)
+	}
+}
+
+// TestLoadProviderAwareIngestTuning covers the Phase-4 provider-aware
+// normalization path (cortex-17p). An anthropic or openai provider
+// must raise the default concurrency to 16 and shorten the per-module
+// summary timeout to 300s; an explicit user value must win over both.
+func TestLoadProviderAwareIngestTuning(t *testing.T) {
+	cases := []struct {
+		name            string
+		yaml            string
+		wantConcurrency int
+		wantTimeout     int
+	}{
+		{
+			name: "anthropic defaults",
+			yaml: `
+llm:
+  provider: anthropic
+`,
+			wantConcurrency: 16,
+			wantTimeout:     300,
+		},
+		{
+			name: "openai defaults",
+			yaml: `
+llm:
+  provider: openai
+`,
+			wantConcurrency: 16,
+			wantTimeout:     300,
+		},
+		{
+			name: "openrouter defaults",
+			yaml: `
+llm:
+  provider: openrouter
+`,
+			wantConcurrency: 16,
+			wantTimeout:     300,
+		},
+		{
+			name: "ollama explicit",
+			yaml: `
+llm:
+  provider: ollama
+`,
+			wantConcurrency: 2,
+			wantTimeout:     1800,
+		},
+		{
+			name: "user explicit generation_concurrency wins",
+			yaml: `
+llm:
+  provider: anthropic
+ingest:
+  generation_concurrency: 32
+`,
+			wantConcurrency: 32,
+			wantTimeout:     300,
+		},
+		{
+			name: "legacy ollama_concurrency alias is honored",
+			yaml: `
+ingest:
+  ollama_concurrency: 5
+`,
+			wantConcurrency: 5,
+			wantTimeout:     1800,
+		},
+		{
+			name: "explicit ingest_summary_seconds wins",
+			yaml: `
+llm:
+  provider: anthropic
+timeouts:
+  ingest_summary_seconds: 60
+`,
+			wantConcurrency: 16,
+			wantTimeout:     60,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yaml")
+			if err := os.WriteFile(path, []byte(strings.TrimSpace(tc.yaml)+"\n"), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.Ingest.GenerationConcurrency != tc.wantConcurrency {
+				t.Errorf("concurrency: got %d want %d",
+					cfg.Ingest.GenerationConcurrency, tc.wantConcurrency)
+			}
+			if cfg.Timeouts.IngestSummarySeconds != tc.wantTimeout {
+				t.Errorf("timeout: got %d want %d",
+					cfg.Timeouts.IngestSummarySeconds, tc.wantTimeout)
+			}
+		})
+	}
 }
 
 func TestLoadInsecurePermissionsReturnsError(t *testing.T) {
@@ -146,11 +257,16 @@ func TestDefaultsCompleteness(t *testing.T) {
 	if d.Migration.ExcludeFromCrossProject != true {
 		t.Error("migration.exclude_from_cross_project default wrong")
 	}
-	if d.Timeouts.IngestSummarySeconds != 1800 {
-		t.Error("timeouts.ingest_summary_seconds default wrong")
+	// Phase 4: defaults for these two fields are 0 at the
+	// Defaults() layer because Load() picks a provider-aware value
+	// in normalizeLLMTuning. The Load-path assertions below (via
+	// Load("/nonexistent") returning the ollama defaults) cover the
+	// effective values.
+	if d.Timeouts.IngestSummarySeconds != 0 {
+		t.Error("timeouts.ingest_summary_seconds raw default should be 0 (provider-aware at Load)")
 	}
-	if d.Ingest.OllamaConcurrency != 2 {
-		t.Error("ingest.ollama_concurrency default wrong")
+	if d.Ingest.GenerationConcurrency != 0 {
+		t.Error("ingest.generation_concurrency raw default should be 0 (provider-aware at Load)")
 	}
 	if d.CLI.ExitCode.Validation != 2 {
 		t.Error("cli.exit_code.validation default wrong")

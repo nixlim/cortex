@@ -113,10 +113,16 @@ func buildReflectPipeline() (*reflect.Pipeline, func(), error) {
 		_ = bolt.Close(context.Background())
 	}
 
-	ollamaClient := newOllamaClient(cfg)
+	generator, err := newGenerator(cfg, time.Duration(cfg.Timeouts.ReflectionSeconds)*time.Second)
+	if err != nil {
+		_ = writer.Close()
+		_ = bolt.Close(context.Background())
+		return nil, func() {}, errs.Operational("LLM_CONFIG_INVALID",
+			"could not construct LLM generator", err)
+	}
 	pipeline := &reflect.Pipeline{
 		Source:       &neo4jReflectClusterSource{client: bolt},
-		Proposer:     &reflectFrameProposerBridge{client: ollamaClient},
+		Proposer:     &reflectFrameProposerBridge{client: generator},
 		Watermark:    &neo4jReflectionWatermarkStore{client: bolt},
 		Log:          writer,
 		Actor:        defaultActor(),

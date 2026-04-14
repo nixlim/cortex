@@ -23,9 +23,12 @@ import (
 	"syscall"
 	"time"
 
+	"context"
+
 	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/errs"
 	"github.com/nixlim/cortex/internal/infra"
+	"github.com/nixlim/cortex/internal/llm"
 	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/ollama"
 	"github.com/nixlim/cortex/internal/weaviate"
@@ -93,6 +96,7 @@ func runDoctor(cmd *cobra.Command, _ []string, quick, full, jsonOut bool) error 
 			defaultEmbeddingModel,
 			defaultGenerationModel,
 		),
+		llmProviderCheck(cfg),
 		infra.LogQuarantineCheck(cortexHome),
 		infra.FilePermissionsCheck(cortexHome),
 	}
@@ -186,6 +190,53 @@ func (sysHost) FreeDiskBytes(path string) (uint64, error) {
 		return 0, fmt.Errorf("statfs %s: %w", path, err)
 	}
 	return uint64(stat.Bavail) * uint64(stat.Bsize), nil
+}
+
+// llmProviderCheck verifies that the selected LLM generation provider
+// can be constructed and reached. For ollama the check is a no-op
+// pass (OllamaModelCheck already covers reachability via /api/tags).
+// For anthropic/openai, the check constructs the provider client via
+// the factory (which surfaces missing API keys as an error) and then
+// calls Ping; a non-nil Ping error fails the check with a remediation
+// pointing at the api_key_env and endpoint to verify.
+func llmProviderCheck(cfg config.Config) infra.DoctorCheck {
+	return infra.NewCheck("llm.provider", true, func(ctx context.Context) infra.CheckResult {
+		provider := cfg.LLM.Provider
+		if provider == "" {
+			provider = llm.ProviderOllama
+		}
+		if provider == llm.ProviderOllama {
+			return infra.CheckResult{
+				Name:    "llm.provider",
+				Status:  infra.CheckPass,
+				Message: "provider=ollama (covered by ollama.models)",
+			}
+		}
+		gen, err := llm.NewGenerator(cfg, 5*1_000_000_000)
+		if err != nil {
+			return infra.CheckResult{
+				Name:        "llm.provider",
+				Status:      infra.CheckFail,
+				Code:        "LLM_CONFIG_INVALID",
+				Message:     err.Error(),
+				Remediation: "set the api_key_env shell variable named in llm." + provider + ".api_key_env",
+			}
+		}
+		if err := gen.Ping(ctx); err != nil {
+			return infra.CheckResult{
+				Name:        "llm.provider",
+				Status:      infra.CheckFail,
+				Code:        "LLM_PROVIDER_UNREACHABLE",
+				Message:     err.Error(),
+				Remediation: "verify outbound HTTPS to the provider endpoint and that the API key is valid",
+			}
+		}
+		return infra.CheckResult{
+			Name:    "llm.provider",
+			Status:  infra.CheckPass,
+			Message: "provider=" + provider,
+		}
+	})
 }
 
 // FDLimit returns the current process's soft file-descriptor limit.

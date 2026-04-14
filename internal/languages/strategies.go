@@ -37,7 +37,18 @@ const (
 	LangCSharp               Language = "csharp"
 	LangRuby                 Language = "ruby"
 	LangCCpp                 Language = "c_cpp"
-	LangUnknown              Language = "unknown"
+	// LangDocs covers human-prose documents whose content is meant to
+	// be read and indexed, not compiled. Only plain-text-ish extensions
+	// are included (.md, .markdown, .txt, .rst) — JSON/CSV/YAML/TOML
+	// data files are explicitly NOT docs; they fall through to
+	// LangUnknown and get skipped at ingest time.
+	LangDocs Language = "docs"
+	// LangSQL covers hand-written SQL — schema DDL, migrations,
+	// stored procedures, and query views. Scripted SQL ("SELECT *
+	// FROM foo") gets the same prompt as schema-defining DDL in
+	// Phase 1; a finer split can land later.
+	LangSQL     Language = "sql"
+	LangUnknown Language = "unknown"
 )
 
 // Strategy names from the spec's default_strategy table.
@@ -78,13 +89,19 @@ func DefaultMatrix() Matrix {
 			LangCSharp:               StrategyPerClass,
 			LangRuby:                 StrategyPerClassOrModule,
 			LangCCpp:                 StrategyPerPair,
+			LangDocs:                 StrategyPerFile,
+			LangSQL:                  StrategyPerFile,
 		},
 		Fallback: StrategyPerFile,
 	}
 }
 
 // Classify maps a file path to a built-in Language by extension.
-// Unknown extensions map to LangUnknown.
+// Unknown extensions map to LangUnknown. Only prose-text extensions
+// (.md / .markdown / .txt / .rst) resolve to LangDocs; JSON / YAML /
+// TOML / CSV data files deliberately do NOT — those fall through to
+// LangUnknown and are skipped at ingest time because their contents
+// are not meaningful to a document summarizer.
 func Classify(path string) Language {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
@@ -106,6 +123,10 @@ func Classify(path string) Language {
 		return LangRuby
 	case ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx":
 		return LangCCpp
+	case ".md", ".markdown", ".txt", ".rst":
+		return LangDocs
+	case ".sql":
+		return LangSQL
 	}
 	return LangUnknown
 }
@@ -180,6 +201,18 @@ func Group(files []File, m Matrix) []Module {
 
 	for _, f := range sorted {
 		lang := Classify(f.AbsPath)
+		// Unknown-extension files (.json, .csv, .yaml, .toml, .ini,
+		// .dat, .log, etc.) are not ingested. They are machine-readable
+		// data, not authored source, and feeding them to any summarizer
+		// produces low-signal output that pollutes recall. The walker
+		// surfaces them, the grouper filters them out — one drop point
+		// so callers that want a different policy can build a custom
+		// Matrix without re-plumbing the walker. If an operator needs
+		// to index a specific data file, they can rename the extension
+		// or place the content in a .md wrapper.
+		if lang == LangUnknown {
+			continue
+		}
 		strategy := m.Strategy(lang)
 
 		var key string

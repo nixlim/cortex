@@ -44,6 +44,7 @@ func Load(path string) (Config, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			normalizeLLMTuning(&cfg)
 			return cfg, nil
 		}
 		return cfg, fmt.Errorf("config: stat %s: %w", path, err)
@@ -75,7 +76,50 @@ func Load(path string) (Config, error) {
 		}
 	}
 
+	normalizeLLMTuning(&cfg)
 	return cfg, nil
+}
+
+// normalizeLLMTuning resolves the Phase-4 provider-aware defaults and
+// the legacy ollama_concurrency YAML alias. It runs after the user
+// YAML is merged over the static Defaults() so the caller's explicit
+// values always win. The rules:
+//
+//  1. If LegacyOllamaConcurrency is set (pointer non-nil), copy it
+//     into GenerationConcurrency. Document in a future release that
+//     the key is deprecated; for now both are read.
+//  2. If GenerationConcurrency is still 0, pick a provider-aware
+//     default: 2 for ollama, 16 for anthropic/openai. The ollama
+//     number mirrors the old OllamaConcurrency=2 constant; the
+//     remote number is tuned for tier-2 paid APIs per cortex-17p.
+//  3. If Timeouts.IngestSummarySeconds is still 0, pick a provider-
+//     aware default: 1800s for ollama (local hardware can need
+//     several minutes per module), 300s for remote (a stuck remote
+//     call should fail fast, not hang for 30 minutes).
+//
+// Readers use cfg.Ingest.GenerationConcurrency and
+// cfg.Timeouts.IngestSummarySeconds directly — the normalization
+// keeps the surface simple.
+func normalizeLLMTuning(cfg *Config) {
+	if cfg.Ingest.LegacyOllamaConcurrency != nil {
+		cfg.Ingest.GenerationConcurrency = *cfg.Ingest.LegacyOllamaConcurrency
+		cfg.Ingest.LegacyOllamaConcurrency = nil
+	}
+	remote := cfg.LLM.Provider == "anthropic" || cfg.LLM.Provider == "openai" || cfg.LLM.Provider == "openrouter"
+	if cfg.Ingest.GenerationConcurrency == 0 {
+		if remote {
+			cfg.Ingest.GenerationConcurrency = 16
+		} else {
+			cfg.Ingest.GenerationConcurrency = 2
+		}
+	}
+	if cfg.Timeouts.IngestSummarySeconds == 0 {
+		if remote {
+			cfg.Timeouts.IngestSummarySeconds = 300
+		} else {
+			cfg.Timeouts.IngestSummarySeconds = 1800
+		}
+	}
 }
 
 var lineRE = regexp.MustCompile(`line (\d+):`)

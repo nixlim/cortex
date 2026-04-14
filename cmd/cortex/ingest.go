@@ -45,6 +45,7 @@ import (
 	"github.com/nixlim/cortex/internal/languages"
 	"github.com/nixlim/cortex/internal/log"
 	"github.com/nixlim/cortex/internal/neo4j"
+	"github.com/nixlim/cortex/internal/llm"
 	"github.com/nixlim/cortex/internal/ollama"
 	"github.com/nixlim/cortex/internal/opslog"
 	"github.com/nixlim/cortex/internal/prompts"
@@ -332,12 +333,17 @@ func buildIngestPipeline(cfg config.Config, segDir string) (*ingest.Pipeline, fu
 	}
 
 	// The ingest summarizer performs a 32K-context structured-output
-	// call per module, which on a local Ollama can take several minutes
-	// per request. We therefore use cfg.Timeouts.IngestSummarySeconds
-	// (not LinkDerivationSeconds) as the per-generation budget here —
-	// the underlying ollama.Config field is "LinkDerivationTimeout" for
-	// historical reasons but is really "generationBudget" and is fine
-	// to repurpose per command. See cortex-8rk.
+	// call per module which on a local Ollama can take several minutes
+	// per request — so we use cfg.Timeouts.IngestSummarySeconds as the
+	// per-generation budget. Phase 3 split this into two clients:
+	// a generator built via the provider factory, and an embedder
+	// pinned to Ollama (FR-051 embedding digest invariant).
+	generator, err := newGenerator(cfg, time.Duration(cfg.Timeouts.IngestSummarySeconds)*time.Second)
+	if err != nil {
+		_ = writer.Close()
+		return nil, func() {}, errs.Operational("LLM_CONFIG_INVALID",
+			"could not construct LLM generator", err)
+	}
 	ollamaClient := ollama.NewHTTPClient(ollama.Config{
 		Endpoint:              cfg.Endpoints.Ollama,
 		EmbeddingModel:        defaultEmbeddingModel,
@@ -400,7 +406,7 @@ func buildIngestPipeline(cfg config.Config, segDir string) (*ingest.Pipeline, fu
 		Neo4j:        neoApplier,
 		Weaviate:     weaviateApplier,
 		Neighbors:    &weaviateNeighborFinder{client: weaviateClient},
-		LinkProposer: &ollamaLinkProposer{client: ollamaClient},
+		LinkProposer: &ollamaLinkProposer{client: generator},
 		LinkConfig: write.LinkDerivationConfig{
 			ConfidenceFloor:    cfg.LinkDerivation.ConfidenceFloor,
 			SimilarCosineFloor: cfg.LinkDerivation.SimilarToCosineFloor,
@@ -411,7 +417,10 @@ func buildIngestPipeline(cfg config.Config, segDir string) (*ingest.Pipeline, fu
 	}
 
 	entryWriter := &writePipelineEntryWriter{pipe: writePipe}
-	summarizer := &ollamaSummarizer{client: ollamaClient}
+	summarizer := &ollamaSummarizer{
+		client:       generator,
+		sourceBudget: cfg.Ingest.ModuleSourceBudgetBytes,
+	}
 	appender := &ingestTrailAppender{
 		log:          writer,
 		actor:        defaultActor(),
@@ -433,12 +442,16 @@ func buildIngestPipeline(cfg config.Config, segDir string) (*ingest.Pipeline, fu
 		PostReflect:   nil, // Phase 1: scoped reflection wired after cortex reflect lands
 		Now:           func() time.Time { return time.Now().UTC() },
 		Logger:        walker.NopLogger{},
-		// Concurrency comes from cfg.Ingest.OllamaConcurrency (default 2
-		// since cortex-8rk; see internal/config/defaults.go for the
-		// rationale). ingest.DefaultOllamaConcurrency remains as the
-		// package fallback when the pipeline is constructed with a zero
-		// Concurrency.
-		Concurrency:     cfg.Ingest.OllamaConcurrency,
+		// Concurrency comes from cfg.Ingest.GenerationConcurrency,
+		// which Phase 4 (cortex-17p) renamed from ollama_concurrency
+		// and made provider-aware: 2 for local ollama (consumer GPU
+		// ceiling) and 16 for remote paid-tier providers (Anthropic/
+		// OpenAI tier 2+). Operators on higher tiers can raise this
+		// in config. The legacy ollama_concurrency YAML key still
+		// reads into this field via LegacyOllamaConcurrency for
+		// backwards compatibility. ingest.DefaultOllamaConcurrency
+		// remains as the internal/ingest fallback if this is zero.
+		Concurrency:     cfg.Ingest.GenerationConcurrency,
 		SkipPostReflect: true,
 		// cortex-ks1: per-package size gate. Budget = num_ctx * 0.6 * 4
 		// chars/token leaves room for prompt boilerplate and structured-
@@ -514,9 +527,23 @@ const cortexIgnoreFilename = ".cortexignore"
 // recall questions about architecture and spec) and exclude IDE
 // metadata, local caches, build outputs, and the beads issue tracker
 // (which stores tracker state, not source). See cortex-8rk.
+//
+// Note: internal/walker.alwaysSkipDirs already hardcodes the
+// universally-generated directories (node_modules, .next, .nuxt,
+// .svelte-kit, .turbo, __pycache__, .pytest_cache, .mypy_cache,
+// .venv, .gradle, .tox, .cache) so those are pruned even if an
+// operator deletes them from .cortexignore. The entries below
+// duplicate that list for discoverability and add file-level
+// patterns the walker's directory prune does not cover (*.min.js,
+// *.bundle.js, sourcemaps, etc.).
 const defaultCortexIgnoreBody = `# .cortexignore — paths cortex ingest skips, in addition to .gitignore.
 # Syntax: one glob/prefix per line, same rules as .gitignore.
 # Edit to taste; this file is operator-owned once it exists.
+#
+# The walker also hardcodes a "universally generated" prune list
+# (node_modules, .next, .nuxt, .svelte-kit, .turbo, __pycache__,
+# .pytest_cache, .mypy_cache, .venv, .gradle, .tox, .cache) so
+# removing them from this file does NOT re-enable scanning them.
 
 # IDE / editor metadata
 .idea/
@@ -533,6 +560,32 @@ vendor/
 target/
 dist/
 build/
+out/
+
+# Frontend framework build output
+.next/
+.nuxt/
+.svelte-kit/
+.turbo/
+.cache/
+
+# Python caches and venvs
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+.tox/
+
+# JVM / Gradle
+.gradle/
+
+# Generated / minified assets
+*.min.js
+*.min.css
+*.bundle.js
+*.bundle.css
+*.map
 
 # Test + profile output
 coverage.out
@@ -575,7 +628,12 @@ func ensureCortexIgnore(projectRoot string) error {
 // See bead cortex-dww for the rationale and cortex-v41 for the eval
 // failure mode this replaces.
 type ollamaSummarizer struct {
-	client *ollama.HTTPClient
+	client llm.Generator
+	// sourceBudget, when > 0, overrides the moduleSourceBudget constant.
+	// Populated from cfg.Ingest.ModuleSourceBudgetBytes so operators can
+	// raise the per-module source cap when they switch to a remote
+	// provider with a much larger context window (e.g. 200K+ tokens).
+	sourceBudget int
 }
 
 // moduleSourceBudget caps the combined source bytes a single module
@@ -598,23 +656,85 @@ type moduleSummaryPayload struct {
 }
 
 func (s *ollamaSummarizer) Summarize(ctx context.Context, req ingest.SummaryRequest) (string, error) {
-	body, err := buildModuleSourceBody(req.Module, moduleSourceBudget)
+	source, err := buildModuleSourceBody(req.Module, s.budgetBytes())
 	if err != nil {
 		return "", fmt.Errorf("read module source: %w", err)
 	}
-	prompt, err := prompts.Render(prompts.NameModuleSummary, prompts.Data{Body: body})
+	tmplName, schema := promptForLanguage(req.Module.Language)
+	prompt, err := prompts.Render(tmplName, prompts.Data{Body: source})
 	if err != nil {
-		return "", fmt.Errorf("render module_summary: %w", err)
+		return "", fmt.Errorf("render %s: %w", tmplName, err)
 	}
-	out, err := s.client.GenerateStructured(ctx, prompt, prompts.ModuleSummarySchema)
+	out, err := s.client.GenerateStructured(ctx, prompt, schema)
 	if err != nil {
 		return "", err
 	}
-	var payload moduleSummaryPayload
-	if err := json.Unmarshal([]byte(out), &payload); err != nil {
-		return "", fmt.Errorf("decode module_summary response: %w", err)
+	return decodeAndFormatSummary(req.Module, tmplName, out)
+}
+
+// budgetBytes returns the configured per-module source budget, or the
+// built-in default when unset. The summarizer carries the budget on
+// itself (rather than reading from a package-level constant) so that
+// ingest.go can wire a config-driven value and tests can override it.
+func (s *ollamaSummarizer) budgetBytes() int {
+	if s.sourceBudget > 0 {
+		return s.sourceBudget
 	}
-	return formatModuleSummaryBody(req.Module, payload), nil
+	return moduleSourceBudget
+}
+
+// promptForLanguage returns the prompt template name and JSON schema
+// the summarizer should use for a module of the given language. Docs
+// (.md, .txt) and SQL (.sql) have their own prompts and schemas
+// because the module_summary prompt is code-oriented — asking a model
+// to report "identifiers, algorithms, dependencies" from a prose
+// document or a SQL migration produces garbage (or an empty response
+// that crashes the decoder downstream). Every other language falls
+// through to the code-oriented module_summary template.
+func promptForLanguage(lang languages.Language) (string, json.RawMessage) {
+	switch lang {
+	case languages.LangDocs:
+		return prompts.NameDocSummary, prompts.DocSummarySchema
+	case languages.LangSQL:
+		return prompts.NameSQLSummary, prompts.SQLSummarySchema
+	default:
+		return prompts.NameModuleSummary, prompts.ModuleSummarySchema
+	}
+}
+
+// decodeAndFormatSummary picks the right payload shape for the chosen
+// prompt, unmarshals the model's JSON response into it, and renders
+// the entry body. On decode failure the error quotes a 200-char
+// snippet of the raw response so ops.log carries enough evidence to
+// diagnose the failure without a second ingest run.
+func decodeAndFormatSummary(mod languages.Module, tmplName, out string) (string, error) {
+	snippet := func() string {
+		s := out
+		if len(s) > 200 {
+			s = s[:200] + "…"
+		}
+		return s
+	}
+	switch tmplName {
+	case prompts.NameDocSummary:
+		var p docSummaryPayload
+		if err := json.Unmarshal([]byte(out), &p); err != nil {
+			return "", fmt.Errorf("decode doc_summary response: %w (raw: %q)", err, snippet())
+		}
+		return formatDocSummaryBody(mod, p), nil
+	case prompts.NameSQLSummary:
+		var p sqlSummaryPayload
+		if err := json.Unmarshal([]byte(out), &p); err != nil {
+			return "", fmt.Errorf("decode sql_summary response: %w (raw: %q)", err, snippet())
+		}
+		return formatSQLSummaryBody(mod, p), nil
+	default:
+		var p moduleSummaryPayload
+		if err := json.Unmarshal([]byte(out), &p); err != nil {
+			return "", fmt.Errorf("decode module_summary response: %w (raw: %q)", err, snippet())
+		}
+		return formatModuleSummaryBody(mod, p), nil
+	}
 }
 
 // buildModuleSourceBody reads each file in the module and concatenates
@@ -690,6 +810,95 @@ func buildModuleSourceBody(m languages.Module, budget int) (string, error) {
 		b.WriteString("\n\n")
 	}
 	return b.String(), nil
+}
+
+// docSummaryPayload is the decoded shape of the doc_summary prompt's
+// JSON output. Markdown / plain-text documents are prose and facts,
+// not code, so the fields capture WHAT the document says rather than
+// what symbols it declares. Topics are the document's subject matter;
+// entities are named actors, products, specs, or cross-references
+// the document talks ABOUT; links are any URLs or doc-path references
+// the document cites; searchable is natural-language query phrases.
+type docSummaryPayload struct {
+	Summary    string   `json:"summary"`
+	Topics     []string `json:"topics"`
+	Entities   []string `json:"entities"`
+	Links      []string `json:"links"`
+	Searchable []string `json:"searchable"`
+}
+
+// sqlSummaryPayload is the decoded shape of the sql_summary prompt's
+// JSON output. SQL files are schema-shape + intent; the fields
+// capture the tables the file creates or touches, the operations it
+// performs, the column-level facts it pins, and query phrases a
+// reader might use to find it.
+type sqlSummaryPayload struct {
+	Summary    string   `json:"summary"`
+	Tables     []string `json:"tables"`
+	Operations []string `json:"operations"`
+	Columns    []string `json:"columns"`
+	Searchable []string `json:"searchable"`
+}
+
+// formatDocSummaryBody renders the doc payload into a markdown entry
+// body. Section order mirrors formatModuleSummaryBody so recall output
+// looks consistent across kinds: summary → sections → trimmed.
+func formatDocSummaryBody(m languages.Module, p docSummaryPayload) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Document %s (%s).\n\n", m.ID, m.Language)
+	if s := strings.TrimSpace(p.Summary); s != "" {
+		b.WriteString(s)
+		b.WriteString("\n\n")
+	}
+	writeSection := func(heading string, items []string) {
+		if len(items) == 0 {
+			return
+		}
+		fmt.Fprintf(&b, "## %s\n", heading)
+		for _, it := range items {
+			it = strings.TrimSpace(it)
+			if it == "" {
+				continue
+			}
+			fmt.Fprintf(&b, "- %s\n", it)
+		}
+		b.WriteString("\n")
+	}
+	writeSection("Topics", p.Topics)
+	writeSection("Entities", p.Entities)
+	writeSection("Links", p.Links)
+	writeSection("Searchable", p.Searchable)
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// formatSQLSummaryBody renders the sql payload into a markdown entry
+// body. Same section layout as the other two formatters.
+func formatSQLSummaryBody(m languages.Module, p sqlSummaryPayload) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "SQL %s (%s).\n\n", m.ID, m.Language)
+	if s := strings.TrimSpace(p.Summary); s != "" {
+		b.WriteString(s)
+		b.WriteString("\n\n")
+	}
+	writeSection := func(heading string, items []string) {
+		if len(items) == 0 {
+			return
+		}
+		fmt.Fprintf(&b, "## %s\n", heading)
+		for _, it := range items {
+			it = strings.TrimSpace(it)
+			if it == "" {
+				continue
+			}
+			fmt.Fprintf(&b, "- %s\n", it)
+		}
+		b.WriteString("\n")
+	}
+	writeSection("Tables", p.Tables)
+	writeSection("Operations", p.Operations)
+	writeSection("Columns", p.Columns)
+	writeSection("Searchable", p.Searchable)
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // formatModuleSummaryBody renders the five-field payload into the

@@ -131,11 +131,17 @@ func buildRecallPipeline() (*recall.Pipeline, *log.Writer, func(), error) {
 		_ = bolt.Close(context.Background())
 	}
 
-	ollamaClient := newOllamaClient(cfg)
+	generator, err := newGenerator(cfg, time.Duration(cfg.Timeouts.ConceptExtractionSeconds)*time.Second)
+	if err != nil {
+		_ = writer.Close()
+		_ = bolt.Close(context.Background())
+		return nil, nil, func() {}, errs.Operational("LLM_CONFIG_INVALID",
+			"could not construct LLM generator", err)
+	}
 	weaviateClient := newWeaviateClient(cfg)
 
 	pipeline := &recall.Pipeline{
-		Concepts: &ollamaConceptExtractor{client: ollamaClient},
+		Concepts: &ollamaConceptExtractor{client: generator},
 		Seeds:    &neo4jSeedResolver{client: bolt},
 		PPR:      &neo4jPPRRunner{client: bolt, graphName: semanticGraphName},
 		Loader: &neo4jWeaviateEntryLoader{
