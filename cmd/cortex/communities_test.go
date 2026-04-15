@@ -213,18 +213,19 @@ func TestDetectAndPersistCommunities_HappyPathLeiden(t *testing.T) {
 	}
 
 	// Persist is bulk-batched: one WriteEntries call per chunk per
-	// level. The fixture has 4 communities per level, well under
-	// PersistBatchSize, so each level ships in a single call. 3
-	// levels × 1 chunk = 3 calls. See cortex-xek.
-	if got, want := len(fake.writeCalls), 3; got != want {
+	// level, preceded by the atomic-replace wipe (cortex-udo). The
+	// fixture has 4 communities per level, well under PersistBatchSize,
+	// so each level ships in a single call. 1 wipe + 3 levels × 1 chunk
+	// = 4 calls. See cortex-xek, cortex-udo.
+	if got, want := len(fake.writeCalls), 4; got != want {
 		t.Errorf("WriteEntries call count: got %d, want %d", got, want)
 	}
-	// Spot-check the bulk parameter shape on the first persist call.
-	// The UNWIND-based Cypher takes a top-level $level plus a
-	// $communities list; each entry in that list carries the
-	// per-community fields (community_id, member_count, members,
-	// summary).
-	first := fake.writeCalls[0]
+	// Spot-check the bulk parameter shape on the first batch write
+	// (index 1 — index 0 is the DETACH DELETE wipe). The UNWIND-based
+	// Cypher takes a top-level $level plus a $communities list; each
+	// entry in that list carries the per-community fields
+	// (community_id, member_count, members, summary).
+	first := fake.writeCalls[1]
 	if _, ok := first["level"]; !ok {
 		t.Errorf("persist params missing top-level key %q: %v", "level", first)
 	}
@@ -288,9 +289,10 @@ func TestDetectAndPersistCommunities_LouvainFallback(t *testing.T) {
 
 	// Louvain ran once; persist is bulk-batched so each of the three
 	// dendrogram levels ships in one WriteEntries call (both levels'
-	// community counts are well under PersistBatchSize). 3 levels ×
-	// 1 chunk = 3 calls. See cortex-xek.
-	if got, want := len(fake.writeCalls), 3; got != want {
+	// community counts are well under PersistBatchSize), preceded by
+	// the atomic-replace wipe (cortex-udo). 1 wipe + 3 levels × 1 chunk
+	// = 4 calls. See cortex-xek, cortex-udo.
+	if got, want := len(fake.writeCalls), 4; got != want {
 		t.Errorf("WriteEntries call count: got %d, want %d", got, want)
 	}
 }

@@ -336,6 +336,26 @@ func rowInt64(row map[string]any, key string) (int64, bool) {
 // Neo4j's default request size ceiling even when members are large.
 const PersistBatchSize = 500
 
+// wipeCommunitiesCypher removes every :Community node and, via
+// DETACH, every :IN_COMMUNITY edge pointing at them. Persist runs
+// it before re-creating the hierarchy so each detect cycle is an
+// atomic replace rather than a MERGE-accumulate. See cortex-udo.
+const wipeCommunitiesCypher = `MATCH (c:Community) DETACH DELETE c`
+
+// hasAnyCommunity reports whether the hierarchy contains at least
+// one community across any level. Used by Persist to guard the
+// wipe: an empty hierarchy must not clobber the last known good
+// state when a degenerate detect run (tiny graph, partial GDS
+// failure) produced nothing.
+func hasAnyCommunity(hierarchy [][]Community) bool {
+	for _, level := range hierarchy {
+		if len(level) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // Persist writes the hierarchy to Neo4j by MERGE-ing a :Community
 // node per (level, communityId) and MERGE-ing :IN_COMMUNITY edges
 // from each member node. Communities are packed into bulk chunks of
@@ -347,6 +367,21 @@ const PersistBatchSize = 500
 func (d *Detector) Persist(ctx context.Context, hierarchy [][]Community) error {
 	if d.Neo4j == nil {
 		return errors.New("community: no neo4j client configured")
+	}
+	// Atomic replace: wipe stale :Community nodes and their
+	// :IN_COMMUNITY edges before writing the new hierarchy. MERGE
+	// on (level, community_id) below is keyed by id, so communities
+	// from prior runs whose ids no longer appear in the current
+	// detection would otherwise linger forever — on the 2026-04-15
+	// cortex + myagentsgigs graph that left 20,510 zero-entry
+	// :Community nodes behind wildcard-projection runs (cortex-udo).
+	// The wipe is skipped when the new hierarchy is empty so a
+	// degenerate detect (e.g. tiny graph, GDS failure higher up) does
+	// not clobber the last known good state.
+	if hasAnyCommunity(hierarchy) {
+		if err := d.Neo4j.WriteEntries(ctx, wipeCommunitiesCypher, nil); err != nil {
+			return fmt.Errorf("community: wipe stale communities: %w", err)
+		}
 	}
 	// UNWIND $communities AS c runs one MERGE per community inside a
 	// single Cypher statement. The inner UNWIND over c.members plus

@@ -22,8 +22,9 @@ type fakeNeo4j struct {
 	lastCypher       string
 	runCalls         int
 
-	written []map[string]any
-	writeErr error
+	written       []map[string]any
+	writtenCypher []string
+	writeErr      error
 }
 
 func (f *fakeNeo4j) RunGDS(_ context.Context, cypher string, params map[string]any) ([]map[string]any, error) {
@@ -41,12 +42,27 @@ func (f *fakeNeo4j) RunGDS(_ context.Context, cypher string, params map[string]a
 	return rows, nil
 }
 
-func (f *fakeNeo4j) WriteEntries(_ context.Context, _ string, params map[string]any) error {
+func (f *fakeNeo4j) WriteEntries(_ context.Context, cypher string, params map[string]any) error {
 	if f.writeErr != nil {
 		return f.writeErr
 	}
 	f.written = append(f.written, params)
+	f.writtenCypher = append(f.writtenCypher, cypher)
 	return nil
+}
+
+// persistBatchCalls returns the Persist WriteEntries calls that
+// are community-batch writes, skipping the leading wipe call
+// introduced by cortex-udo. Tests that assert on bulk batching
+// want the batch shape, not the wipe prelude.
+func (f *fakeNeo4j) persistBatchCalls() []map[string]any {
+	batches := make([]map[string]any, 0, len(f.written))
+	for _, p := range f.written {
+		if _, ok := p["communities"]; ok {
+			batches = append(batches, p)
+		}
+	}
+	return batches
 }
 
 func stubLeidenQuery(graphName string) string {
@@ -312,11 +328,12 @@ func TestPersist_BulkBatchesCommunities(t *testing.T) {
 	if err := d.Persist(context.Background(), hierarchy); err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
-	if len(fn.written) != 2 {
-		t.Fatalf("wrote %d bulk calls, want 2 (one per level)", len(fn.written))
+	batches := fn.persistBatchCalls()
+	if len(batches) != 2 {
+		t.Fatalf("wrote %d bulk calls, want 2 (one per level)", len(batches))
 	}
 	// Level 0: one community in the batch.
-	level0 := fn.written[0]
+	level0 := batches[0]
 	if got := level0["level"]; got != 0 {
 		t.Errorf("level-0 batch level param = %v, want 0", got)
 	}
@@ -331,7 +348,7 @@ func TestPersist_BulkBatchesCommunities(t *testing.T) {
 		t.Errorf("level-0 batch entry = %+v", batch0[0])
 	}
 	// Level 1: two communities in the batch.
-	level1 := fn.written[1]
+	level1 := batches[1]
 	batch1, _ := level1["communities"].([]map[string]any)
 	if len(batch1) != 2{
 		t.Fatalf("level-1 batch size = %d, want 2", len(batch1))
@@ -356,13 +373,14 @@ func TestPersist_ChunksAtBatchSize(t *testing.T) {
 		t.Fatalf("Persist: %v", err)
 	}
 	expectedCalls := (N + PersistBatchSize - 1) / PersistBatchSize
-	if len(fn.written) != expectedCalls {
+	batches := fn.persistBatchCalls()
+	if len(batches) != expectedCalls {
 		t.Fatalf("wrote %d calls for %d communities at batch size %d; want %d",
-			len(fn.written), N, PersistBatchSize, expectedCalls)
+			len(batches), N, PersistBatchSize, expectedCalls)
 	}
 	// Sanity: every batch is ≤ PersistBatchSize.
 	var seen int
-	for i, w := range fn.written {
+	for i, w := range batches {
 		batch, ok := w["communities"].([]map[string]any)
 		if !ok {
 			t.Fatalf("call %d: 'communities' param shape = %T, want []map[string]any", i, w["communities"])
@@ -374,6 +392,60 @@ func TestPersist_ChunksAtBatchSize(t *testing.T) {
 	}
 	if seen != N {
 		t.Errorf("total communities across batches = %d, want %d", seen, N)
+	}
+}
+
+// TestPersist_WipesStaleCommunitiesBeforeBatches covers cortex-udo:
+// Persist must DETACH DELETE every :Community (and the
+// :IN_COMMUNITY edges attached to them) before writing the new
+// hierarchy, so each detect cycle is an atomic replace rather than
+// a MERGE-accumulate. Without the wipe, prior-run communities whose
+// ids no longer appear in the current detection linger forever as
+// orphans (observed 2026-04-15 on cortex + myagentsgigs: 20,510
+// zero-entry :Community nodes after the wildcard-projection fix).
+func TestPersist_WipesStaleCommunitiesBeforeBatches(t *testing.T) {
+	fn := &fakeNeo4j{}
+	d := newFixtureDetector(fn)
+	hierarchy := [][]Community{
+		{{ID: 1, Level: 0, Members: []int64{10, 11}}},
+	}
+	if err := d.Persist(context.Background(), hierarchy); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	if len(fn.writtenCypher) < 2 {
+		t.Fatalf("wrote %d calls; want wipe + at least one batch", len(fn.writtenCypher))
+	}
+	if !strings.Contains(fn.writtenCypher[0], "DETACH DELETE") ||
+		!strings.Contains(fn.writtenCypher[0], ":Community") {
+		t.Errorf("first call = %q; want a :Community DETACH DELETE", fn.writtenCypher[0])
+	}
+	// Wipe must precede the first batch write.
+	if _, ok := fn.written[0]["communities"]; ok {
+		t.Error("first Persist call was a batch write, not the wipe")
+	}
+}
+
+// TestPersist_SkipsWipeWhenHierarchyEmpty guards the degenerate
+// case: a detect run that produced nothing (tiny graph, partial GDS
+// failure) must not clobber the last known good state. Persist with
+// an empty hierarchy must be a no-op — no wipe, no batch writes.
+func TestPersist_SkipsWipeWhenHierarchyEmpty(t *testing.T) {
+	fn := &fakeNeo4j{}
+	d := newFixtureDetector(fn)
+	if err := d.Persist(context.Background(), [][]Community{}); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	if len(fn.written) != 0 {
+		t.Fatalf("empty hierarchy produced %d writes; want 0", len(fn.written))
+	}
+	// Also cover the "levels present but all empty" shape, which is
+	// what a caller that pre-allocated hierarchy[] but never filled
+	// any level would pass in.
+	if err := d.Persist(context.Background(), [][]Community{{}, {}}); err != nil {
+		t.Fatalf("Persist empty levels: %v", err)
+	}
+	if len(fn.written) != 0 {
+		t.Fatalf("hierarchy of empty levels produced %d writes; want 0", len(fn.written))
 	}
 }
 
