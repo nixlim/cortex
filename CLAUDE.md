@@ -71,7 +71,7 @@ _Add your project-specific conventions here_
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **cortex** (4598 symbols, 11513 relationships, 300 execution flows). Use GitNexus to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **cortex** (4598 symbols, 11522 relationships, 300 execution flows). Use GitNexus to understand code, assess impact, and navigate safely.
 
 ## ⚠️ CRITICAL: Use the CLI, not MCP tools
 
