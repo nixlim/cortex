@@ -67,8 +67,18 @@ var requiredFacets = []string{"domain", "project"}
 // LogAppender is the subset of log.Writer the pipeline needs. A narrow
 // interface lets tests drop in a fake that captures the datoms the
 // pipeline tried to write without touching the filesystem.
+//
+// AppendTx is the race-free primary API: it mints the tx ULID inside
+// the Writer's own mutex and invokes build to seal the datom group
+// with that tx, eliminating the class of bugs where two concurrent
+// ingest goroutines mint their tx outside the log lock and then race
+// for the lock in an order different from tx issuance (cortex-zpl).
+// build runs under the write lock, so callers should keep it to
+// struct construction and checksum sealing — no I/O, no locks, no
+// blocking on external state.
 type LogAppender interface {
 	Append(group []datom.Datom) (string, error)
+	AppendTx(build func(tx string) ([]datom.Datom, error)) (string, error)
 }
 
 // Embedder is the subset of the Ollama adapter used during the write
@@ -343,11 +353,15 @@ func (p *Pipeline) Observe(ctx context.Context, req ObserveRequest) (*ObserveRes
 		embedding = vec
 	}
 
-	// --- Stage 5: build the transaction group. Every datom shares
-	// tx, ts, actor, src, invocation_id. The E field is the new
-	// entry's prefixed ULID. Datoms are sealed here so the log's
-	// flock critical section just does write + fsync. ---
-	tx := ulid.Make().String()
+	// --- Stages 5+6: build the transaction group and commit it to
+	// the log. tx minting and the write must happen under the same
+	// lock so their ordering is coupled: concurrent ingest goroutines
+	// that race for the log writer cannot end up with a segment
+	// whose on-disk tx order differs from the order of their log
+	// writes. AppendTx gives us that guarantee — it mints the tx
+	// inside the Writer mutex and calls back into build to seal the
+	// group with the authoritative tx. See cortex-zpl for the race
+	// this closes. ---
 	entryID := "entry:" + ulid.Make().String()
 	now := p.Now
 	if now == nil {
@@ -355,19 +369,29 @@ func (p *Pipeline) Observe(ctx context.Context, req ObserveRequest) (*ObserveRes
 	}
 	encodingAt := now().UTC()
 	ts := encodingAt.Format(time.RFC3339Nano)
-	group, err := buildObserveDatoms(tx, ts, p.Actor, p.InvocationID, entryID, req,
-		subjectCanonical, embeddingModel, embeddingDigest, encodingAt)
-	if err != nil {
-		return nil, errs.Operational("DATOM_BUILD_FAILED", "could not construct datom group", err)
-	}
 
-	// --- Stage 6: append to log. This is the commit point; nothing
-	// before this is visible to another process, nothing after this
-	// can be rolled back. ---
 	if p.Log == nil {
 		return nil, errs.Operational("NO_LOG_WRITER", "write pipeline has no log writer", nil)
 	}
-	if _, err := p.Log.Append(group); err != nil {
+
+	var (
+		group    []datom.Datom
+		buildErr error
+	)
+	tx, err := p.Log.AppendTx(func(mintedTx string) ([]datom.Datom, error) {
+		g, berr := buildObserveDatoms(mintedTx, ts, p.Actor, p.InvocationID, entryID, req,
+			subjectCanonical, embeddingModel, embeddingDigest, encodingAt)
+		if berr != nil {
+			buildErr = berr
+			return nil, berr
+		}
+		group = g
+		return g, nil
+	})
+	if err != nil {
+		if buildErr != nil {
+			return nil, errs.Operational("DATOM_BUILD_FAILED", "could not construct datom group", buildErr)
+		}
 		return nil, errs.Operational("LOG_APPEND_FAILED", "failed to append to log", err)
 	}
 

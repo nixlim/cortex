@@ -122,6 +122,19 @@ func (f *fakeWriteLog) Append(group []datom.Datom) (string, error) {
 	return group[0].Tx, nil
 }
 
+// AppendTx mirrors log.Writer.AppendTx: mint a tx, invoke build, record.
+func (f *fakeWriteLog) AppendTx(build func(tx string) ([]datom.Datom, error)) (string, error) {
+	tx := ulid.Make().String()
+	group, err := build(tx)
+	if err != nil {
+		return "", err
+	}
+	cp := make([]datom.Datom, len(group))
+	copy(cp, group)
+	f.groups = append(f.groups, cp)
+	return tx, nil
+}
+
 // fakeReflectLog satisfies reflect.LogAppender. It is intentionally a
 // distinct type from fakeWriteLog so each pipeline records its own
 // groups for clarity in failure diagnostics.

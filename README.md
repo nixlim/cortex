@@ -680,6 +680,354 @@ deleting them.
 
 ---
 
+## Full reset and re-ingest
+
+Very occasionally you want to wipe every trace of cortex's memory and
+start fresh — e.g. a corrupted ingest run left inconsistent state that
+`cortex ingest --resume` cannot recover, the schema has changed under
+you, or you want a clean baseline for a benchmark. `cortex rebuild`
+alone is **not** the right tool for this: it replays the existing log
+into the backends, so it faithfully reproduces whatever was in the log,
+including duplicates and corruption.
+
+A full reset touches three layers:
+
+1. **The append-only log** at `~/.cortex/log.d/`. This is the source of
+   truth and the only layer where deleting data is irreversible.
+2. **Per-project ingest state** at `~/.cortex/state/ingest/<project>.json`.
+   These files record which module ids have already been ingested; if
+   the log is wiped but these files remain, the next `cortex ingest`
+   will skip every "already done" module and leave the backends empty.
+3. **The derived backends** — Weaviate and Neo4j. These are rebuildable
+   from the log and are reconciled by `cortex rebuild`.
+
+> ⚠️ **`log.d` is shared across projects.** Every datom from every
+> project cortex has ever ingested lives in the same segment files.
+> Deleting `log.d` wipes the observations and trails for every
+> project, not just the one you're targeting. If you only want to
+> re-ingest one project out of several, prefer deleting just that
+> project's state file (see "per-project" below) and accept that
+> you'll have duplicate entries in the log until the dedicated
+> re-ingest feature (see bead `cortex-mkz`) lands.
+
+### Full wipe and re-ingest everything
+
+The sequence below will completely reset cortex and re-ingest every
+project from scratch. Run it from a shell where `OPENROUTER_API_KEY`
+(or your configured provider's key) is exported — the cortex binary
+loads the key from the calling environment.
+
+```bash
+# 1. Make sure no cortex commands are running (no concurrent writer
+#    can be touching log.d while you wipe it).
+pgrep -lf cortex
+
+# 2. Wipe the append-only log. Recreating the directory keeps the
+#    mode/ownership sensible for the next writer.
+rm -rf ~/.cortex/log.d
+mkdir ~/.cortex/log.d
+
+# 3. Remove per-project ingest state so every module is re-summarised.
+#    The *.bak-* files are previous snapshots; keep them if you want
+#    a rollback point.
+rm ~/.cortex/state/ingest/*.json
+
+# 4. Rebuild. With an empty log, this drops the prior Weaviate and
+#    Neo4j state and leaves both backends empty — the clean baseline.
+./cortex rebuild
+
+# 5. Ingest each project. Pass the commit SHA you want recorded in
+#    per-project state so `cortex ingest status` reports something
+#    useful afterwards.
+./cortex ingest --project=cortex       --commit=$(git -C /path/to/cortex       rev-parse HEAD) /path/to/cortex
+./cortex ingest --project=myagentsgigs --commit=$(git -C /path/to/myagentsgigs rev-parse HEAD) /path/to/myagentsgigs
+
+# 6. Verify. Doctor reports all subsystems healthy; status shows the
+#    per-project commit you just ingested; rebuild reports a non-zero
+#    datoms-scanned count matching the new log.
+./cortex doctor
+./cortex ingest status --project=cortex
+./cortex rebuild
+```
+
+### Per-project reset (no `log.d` wipe)
+
+If you want to re-ingest just one project and you're willing to accept
+duplicate entries in the log until the dedicated feature lands, delete
+only that project's state file:
+
+```bash
+rm ~/.cortex/state/ingest/cortex.json
+./cortex ingest --project=cortex --commit=$(git rev-parse HEAD) .
+```
+
+The log will grow by one full project's worth of entries. Weaviate and
+Neo4j will carry both the old and the new entries. Recall quality will
+be degraded until a clean reset (above) or the dedupe feature lands.
+
+### After the reset: expectations
+
+- `~/.cortex/log.d/` holds fresh segments timestamped after the reset.
+  Any `.quarantine/` directory that survived the wipe is cosmetic; you
+  can delete it too if you want a truly pristine tree.
+- `cortex rebuild` run immediately after re-ingest should report a
+  datom count matching the sum across all projects' ingest summaries.
+  If rebuild scans zero datoms or reports segments in `.quarantine/`,
+  a log invariant was violated during ingest — open a bead with the
+  contents of `~/.cortex/ops.log` and the full list of quarantined
+  segments.
+- If you configured the `~/.cortex/` auto-backup (see below), push a
+  new commit after the reset so the remote reflects the new baseline.
+
+---
+
+## Backing up `~/.cortex/` to a private git remote (optional)
+
+The cortex log is the source of truth for your memory — every datom
+committed to `~/.cortex/log.d/` can be replayed into Neo4j and
+Weaviate via `cortex rebuild` to reconstruct the backend state. The
+backends are rebuildable; the log is not. Losing the log dir to a
+disk failure costs you every observation, trail, and ingested module
+summary you've ever written. This section explains how to set up
+periodic automatic commits of `~/.cortex/` to a private GitHub
+repository so the log survives a dead machine.
+
+This is **not required** to run cortex — skip this section entirely
+if you're running on one workstation and handle backups another way.
+
+### Why a private repo, never public
+
+`~/.cortex/config.yaml` contains `neo4j_password` in plaintext. The
+setup below puts `config.yaml` in `.gitignore` as the first line of
+defense, but a public remote is still a bad idea: observations,
+ingested module summaries, and trail content may themselves carry
+project-sensitive material. Use a **private** GitHub repo (or
+another private git host).
+
+### Prerequisites
+
+- Git (`brew install git`) and an SSH key loaded into GitHub (`ssh-keygen -t ed25519` then add the public key at https://github.com/settings/keys)
+- A private GitHub repository created — e.g. `github.com:<you>/cortex-log` with no README, no `.gitignore`, no license (we'll push our own initial commit)
+- macOS with launchd (Linux users: use systemd timers instead; same script, different scheduler)
+
+### 1. Initialize git in `~/.cortex/` and exclude secrets
+
+```bash
+cd ~/.cortex
+git init -b main
+
+# CRITICAL: never commit config.yaml — it carries neo4j_password.
+# Add .idea/ and any IDE noise at the same time.
+cat > .gitignore <<'EOF'
+config.yaml
+.idea/
+*.lock
+paste-cache/
+EOF
+
+git add -A
+git commit -m "initial backup of cortex state"
+
+# Wire up the private remote and push.
+git remote add origin git@github.com:<you>/cortex-log.git
+git push -u origin main
+```
+
+**Verify `config.yaml` never hit the history** before you push to
+the remote for the first time:
+
+```bash
+git log --all --full-history -- config.yaml    # must print nothing
+git ls-files config.yaml                       # must print nothing
+```
+
+If either command prints a line, stop — your password has been
+committed. Remove it with `git rm --cached config.yaml`, amend, and
+re-verify before pushing anywhere.
+
+### 2. Install the auto-commit script
+
+Save the script below as `~/.local/bin/cortex-auto-commit.sh` and
+`chmod +x` it. It stages whatever the `.gitignore` allows, commits
+with a UTC timestamp subject, pushes to `origin/main`, and
+double-checks that `config.yaml` never ends up in the staged index
+even if the `.gitignore` is edited later.
+
+```bash
+#!/usr/bin/env bash
+# ~/.local/bin/cortex-auto-commit.sh
+set -u
+
+REPO="${HOME}/.cortex"
+LOG="${HOME}/Library/Logs/cortex-auto-commit.log"
+mkdir -p "$(dirname "$LOG")"
+
+log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG"; }
+
+[[ -d "$REPO/.git" ]] || { log "ERROR: $REPO is not a git repository"; exit 1; }
+cd "$REPO" || { log "ERROR: cannot cd $REPO"; exit 1; }
+
+# Security: refuse to commit if config.yaml is tracked.
+if git ls-files --error-unmatch config.yaml >/dev/null 2>&1; then
+  log "ERROR: config.yaml is tracked — refusing to commit (contains neo4j_password)"
+  exit 1
+fi
+
+# No-op when nothing has changed.
+if git diff --quiet && git diff --cached --quiet && \
+   [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
+  exit 0
+fi
+
+git add -A 2>>"$LOG"
+
+# Defense in depth: abort if config.yaml somehow got staged.
+if git diff --cached --name-only | grep -qx 'config.yaml'; then
+  log "ERROR: config.yaml ended up staged — unstaging and aborting"
+  git reset HEAD -- config.yaml >>"$LOG" 2>&1
+  exit 1
+fi
+
+staged=$(git diff --cached --name-only | wc -l | tr -d ' ')
+[[ "$staged" == "0" ]] && exit 0
+
+subject="auto: $(date -u +%Y-%m-%dT%H:%M:%SZ) (${staged} files)"
+if ! git commit -m "$subject" --no-verify --quiet 2>>"$LOG"; then
+  log "ERROR: commit failed"
+  exit 1
+fi
+log "committed: $subject"
+
+# Push failures are logged but non-fatal; next tick retries.
+if ! git push --quiet origin main 2>>"$LOG"; then
+  log "WARN: push failed; will retry on next tick"
+  exit 0
+fi
+log "pushed to origin/main"
+```
+
+Test it manually once:
+
+```bash
+chmod +x ~/.local/bin/cortex-auto-commit.sh
+~/.local/bin/cortex-auto-commit.sh
+tail ~/Library/Logs/cortex-auto-commit.log
+```
+
+You should see one `committed: …` line followed by `pushed to
+origin/main`. Check the GitHub repo page to confirm the push
+arrived.
+
+### 3. Schedule it with launchd (macOS)
+
+Save the plist below as
+`~/Library/LaunchAgents/com.user.cortex-auto-commit.plist`, swapping
+in your own home directory path where you see `/Users/YOU`. The
+`StartInterval` of `1800` fires the script every 30 minutes;
+`RunAtLoad` makes it fire once immediately at login.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.cortex-auto-commit</string>
+
+  <key>StartInterval</key>
+  <integer>1800</integer>
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOU/.local/bin/cortex-auto-commit.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/YOU</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/YOU/.cortex</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/Library/Logs/cortex-auto-commit.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/Library/Logs/cortex-auto-commit.stderr.log</string>
+
+  <key>Nice</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
+```
+
+Validate, load, and verify:
+
+```bash
+plutil -lint ~/Library/LaunchAgents/com.user.cortex-auto-commit.plist
+launchctl load -w ~/Library/LaunchAgents/com.user.cortex-auto-commit.plist
+launchctl list | grep cortex-auto-commit
+```
+
+The `launchctl list` line shows three columns — `PID  LAST_EXIT  LABEL`.
+`LAST_EXIT=0` after the first tick means the load-time run succeeded.
+
+### 4. Operate
+
+| Task | Command |
+|---|---|
+| Follow commits in real time | `tail -f ~/Library/Logs/cortex-auto-commit.log` |
+| Run a commit right now | `~/.local/bin/cortex-auto-commit.sh` |
+| Pause | `launchctl unload ~/Library/LaunchAgents/com.user.cortex-auto-commit.plist` |
+| Resume | `launchctl load -w ~/Library/LaunchAgents/com.user.cortex-auto-commit.plist` |
+| Change interval | Edit `StartInterval` in the plist, then unload + `load -w`. `900` = 15 min, `3600` = 1 hr. |
+
+### Caveats worth planning for
+
+- **Repo growth.** `log.d/` is append-only and never compacts. A
+  few thousand segments a week is normal for active use. In months,
+  the private repo can exceed GitHub's soft size limit (~5 GB).
+  Mitigations: reduce the commit interval (less frequent = fewer
+  pack-unfriendly diffs), `git gc --auto` weekly, or periodically
+  prune segments older than your retention horizon with BFG
+  Repo-Cleaner.
+- **Multi-machine conflicts.** The script pushes but does not pull.
+  Running the same setup on a second machine against the same
+  remote will produce a fast-forward failure on the second push.
+  If you expand to multi-machine sync, add `git pull --rebase`
+  before the push and accept that you'll have to resolve append-
+  conflicts by hand. Syncthing (append-only aware, rolling-hash
+  based) is a better fit for multi-machine than git is.
+- **Credential rotation.** Rotating your GitHub SSH key or moving
+  your `origin` remote URL will silently break the push loop; the
+  script logs `WARN: push failed` but there's no notification.
+  Check `~/Library/Logs/cortex-auto-commit.log` after any keychain
+  change.
+- **Backfill on first setup.** The first commit stages every segment
+  currently in `log.d/` — potentially tens of thousands of files.
+  Expect a one-time large push (hundreds of MB). Subsequent
+  commits are bounded by your cortex activity since the prior
+  tick, which is small.
+
+### Linux note
+
+launchd is macOS-only. On Linux, the same script runs under a
+systemd user timer. Create
+`~/.config/systemd/user/cortex-auto-commit.service` (`Type=oneshot`,
+`ExecStart=%h/.local/bin/cortex-auto-commit.sh`) and
+`cortex-auto-commit.timer` (`OnUnitActiveSec=30min`,
+`OnBootSec=1min`). Enable with `systemctl --user enable --now
+cortex-auto-commit.timer`.
+
+---
+
 ## Development
 
 ### Build & test

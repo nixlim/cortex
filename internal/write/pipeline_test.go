@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/oklog/ulid/v2"
+
 	"github.com/nixlim/cortex/internal/datom"
 	"github.com/nixlim/cortex/internal/errs"
 	"github.com/nixlim/cortex/internal/security/secrets"
@@ -28,6 +30,28 @@ func (f *fakeLog) Append(group []datom.Datom) (string, error) {
 	copy(cp, group)
 	f.groups = append(f.groups, cp)
 	return group[0].Tx, nil
+}
+
+// AppendTx mirrors log.Writer.AppendTx for tests. It picks a fresh
+// monotonic tx, passes it to build, and records the resulting group.
+// The injected failErr short-circuits with zero bytes written, just
+// like the real Writer.
+func (f *fakeLog) AppendTx(build func(tx string) ([]datom.Datom, error)) (string, error) {
+	if f.failErr != nil {
+		return "", f.failErr
+	}
+	if build == nil {
+		return "", errors.New("fakeLog: nil build")
+	}
+	tx := ulid.Make().String()
+	group, err := build(tx)
+	if err != nil {
+		return "", err
+	}
+	cp := make([]datom.Datom, len(group))
+	copy(cp, group)
+	f.groups = append(f.groups, cp)
+	return tx, nil
 }
 
 // fakeBackend records every datom applied. It never fails so success

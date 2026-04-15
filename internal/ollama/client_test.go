@@ -24,6 +24,7 @@ type fakeOllama struct {
 	tagsStatus  int32
 	showCalls   int32
 	embedCalls  int32
+	embedFail5xx int32 // counter: /api/embeddings returns 503 while > 0, decremented per call
 	showDigest  string
 	showName    string
 	embedDigest string // if non-empty, included on /api/embeddings responses
@@ -71,6 +72,15 @@ func newFakeOllama() *fakeOllama {
 
 	mux.HandleFunc("/api/embeddings", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&f.embedCalls, 1)
+		// Transient-failure seam: while embedFail5xx > 0, return 503
+		// and decrement. Used by TestEmbed_RetriesOnTransient5xx to
+		// assert bounded retry over momentary Ollama stalls.
+		if remaining := atomic.LoadInt32(&f.embedFail5xx); remaining > 0 {
+			atomic.AddInt32(&f.embedFail5xx, -1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":"model loading"}`)
+			return
+		}
 		length := f.embedLength
 		if length == 0 {
 			length = 768
@@ -145,6 +155,48 @@ func TestShowCalledExactlyOnce(t *testing.T) {
 	}
 	if got := c.ShowCallCount(); got != 1 {
 		t.Fatalf("client ShowCallCount = %d, want 1", got)
+	}
+}
+
+// TestEmbed_RetriesOnTransient5xx asserts that a momentary Ollama
+// stall (HTTP 503 on /api/embeddings) does not fail the write. The
+// embedder is expected to retry a bounded number of times and succeed
+// once the backend recovers. Without this, a single transient stall
+// during ingest causes the whole module's observe to fail (see the
+// Apr 14 ingest run where go.sum hit EMBEDDING_FAILED).
+func TestEmbed_RetriesOnTransient5xx(t *testing.T) {
+	f := newFakeOllama()
+	defer f.Close()
+	atomic.StoreInt32(&f.embedFail5xx, 2) // fail twice, succeed on 3rd
+
+	c := newClientFor(f)
+	vec, err := c.Embed(context.Background(), "hello")
+	if err != nil {
+		t.Fatalf("Embed after transient 503s: %v", err)
+	}
+	if len(vec) != 768 {
+		t.Fatalf("Embed returned %d-dim vector, want 768", len(vec))
+	}
+	if got := atomic.LoadInt32(&f.embedCalls); got != 3 {
+		t.Fatalf("embedCalls = %d, want 3 (2 failures + 1 success)", got)
+	}
+}
+
+// TestEmbed_RetryBudgetExhausted asserts that retries are bounded:
+// if transient 503s persist past the retry budget the call returns
+// an error rather than looping forever.
+func TestEmbed_RetryBudgetExhausted(t *testing.T) {
+	f := newFakeOllama()
+	defer f.Close()
+	atomic.StoreInt32(&f.embedFail5xx, 100) // always fail within the budget
+
+	c := newClientFor(f)
+	_, err := c.Embed(context.Background(), "hello")
+	if err == nil {
+		t.Fatal("expected error after exhausted retries, got nil")
+	}
+	if !strings.Contains(err.Error(), "503") {
+		t.Errorf("err = %v, want 503 in message", err)
 	}
 }
 

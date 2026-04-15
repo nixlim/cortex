@@ -299,11 +299,36 @@ type embedResponse struct {
 	Digest string `json:"digest,omitempty"`
 }
 
+// embedMaxAttempts bounds retry on transient Ollama embedding
+// failures. A stalled or momentarily-unreachable Ollama (network
+// reset, HTTP 429/5xx while a model is paging in) would otherwise
+// fail the whole write-pipeline module at EMBEDDING_FAILED — the
+// Apr 14 ingest hit this on go.sum. Three attempts at 100ms → 400ms
+// backoff covers the sub-second stalls observed in practice without
+// extending the embedding budget meaningfully.
+const embedMaxAttempts = 3
+
+// embedRetryBackoff returns the sleep before the Nth attempt (1-indexed).
+// The first attempt has no backoff.
+func embedRetryBackoff(attempt int) time.Duration {
+	switch attempt {
+	case 2:
+		return 100 * time.Millisecond
+	case 3:
+		return 400 * time.Millisecond
+	}
+	return 0
+}
+
 // Embed requests a vector for text using the configured embedding
 // model. If the response carries a digest that differs from the
 // cached digest, the call returns ErrModelDigestRace and the vector
 // is discarded. Callers MUST treat ErrModelDigestRace as fatal for
 // the in-flight write.
+//
+// Transient failures (network error, HTTP 429, HTTP 5xx) are retried
+// up to embedMaxAttempts with bounded backoff. Digest race, empty
+// embedding, and HTTP 4xx (except 429) are non-retryable.
 func (c *HTTPClient) Embed(ctx context.Context, text string) ([]float32, error) {
 	// Ensure we have a cached digest. The first Embed call triggers
 	// the one-shot Show; subsequent calls reuse the cached value.
@@ -315,41 +340,69 @@ func (c *HTTPClient) Embed(ctx context.Context, text string) ([]float32, error) 
 	ctx, cancel := ctxWithDefault(ctx, c.embeddingBudget)
 	defer cancel()
 
-	body, err := json.Marshal(embedRequest{Model: c.embeddingModel, Prompt: text})
+	bodyBytes, err := json.Marshal(embedRequest{Model: c.embeddingModel, Prompt: text})
 	if err != nil {
 		return nil, fmt.Errorf("ollama: marshal embed body: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/embeddings", bytes.NewReader(body))
+
+	var lastErr error
+	for attempt := 1; attempt <= embedMaxAttempts; attempt++ {
+		if delay := embedRetryBackoff(attempt); delay > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("ollama: embed: %w (last: %v)", ctx.Err(), lastErr)
+			case <-time.After(delay):
+			}
+		}
+
+		vec, err, retryable := c.doEmbedOnce(ctx, bodyBytes, info)
+		if err == nil {
+			return vec, nil
+		}
+		lastErr = err
+		if !retryable {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+// doEmbedOnce performs a single /api/embeddings round trip. The
+// returned retryable flag is true iff the failure is a transient
+// network/server condition (net error, HTTP 429, HTTP 5xx). All
+// other failures — digest race, decode error, 4xx, empty embedding —
+// are terminal and MUST NOT be retried.
+func (c *HTTPClient) doEmbedOnce(ctx context.Context, bodyBytes []byte, info ModelInfo) ([]float32, error, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/embeddings", bytes.NewReader(bodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("ollama: build embed request: %w", err)
+		return nil, fmt.Errorf("ollama: build embed request: %w", err), false
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("ollama: embed: %w", err)
+		return nil, fmt.Errorf("ollama: embed: %w", err), true
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ollama: embed returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		return nil, fmt.Errorf("ollama: embed returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw))), retryable
 	}
 
 	var er embedResponse
 	if err := json.Unmarshal(raw, &er); err != nil {
-		return nil, fmt.Errorf("ollama: decode embed response: %w", err)
+		return nil, fmt.Errorf("ollama: decode embed response: %w", err), false
 	}
 
-	// Digest race check: if the response carries a digest and it
-	// disagrees with the one we captured at Show time, abort.
 	if er.Digest != "" && info.Digest != "" && er.Digest != info.Digest {
-		return nil, fmt.Errorf("%w: cached=%s, response=%s", ErrModelDigestRace, info.Digest, er.Digest)
+		return nil, fmt.Errorf("%w: cached=%s, response=%s", ErrModelDigestRace, info.Digest, er.Digest), false
 	}
 
 	if len(er.Embedding) == 0 {
-		return nil, errors.New("ollama: embed returned empty embedding")
+		return nil, errors.New("ollama: embed returned empty embedding"), false
 	}
-	return er.Embedding, nil
+	return er.Embedding, nil, false
 }
 
 // generateRequest / generateResponse are the /api/generate shapes.

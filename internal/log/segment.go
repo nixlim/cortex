@@ -46,6 +46,21 @@ var (
 
 	// ErrWriterClosed is returned by Append after Close has been called.
 	ErrWriterClosed = errors.New("log: writer closed")
+
+	// ErrNonMonotonicTx is returned by Append if the incoming group's
+	// tx ULID is less than or equal to the tx of the previous
+	// successful append on this segment. The reader and ScanSegment
+	// enforce strict per-segment tx monotonicity, so a writer that
+	// silently appended an out-of-order tx would corrupt the segment
+	// and cause it to be quarantined at the next load. Rather than
+	// write bytes that will be immediately invalidated, Append rejects
+	// the group without writing. See cortex-zpl.
+	//
+	// Concurrent callers that race for the Writer's lock should mint
+	// their tx via AppendTx (which atomically mints tx inside the
+	// lock) so this error cannot be observed. Append is the lower-
+	// level primitive whose caller has already committed to a tx.
+	ErrNonMonotonicTx = errors.New("log: tx ULID is not strictly greater than the previous append")
 )
 
 // Writer owns a single segment file and serialises appends to it under a
@@ -63,6 +78,13 @@ type Writer struct {
 	mu     sync.Mutex // serialises appends within one process
 	file   *os.File
 	closed bool
+
+	// lastTx is the tx ULID of the most recent successful append on
+	// this segment, or "" if no append has succeeded yet. Append
+	// refuses to write a group whose tx is <= lastTx because that
+	// would break per-segment monotonicity and cause ScanSegment to
+	// quarantine the segment on the next load. See cortex-zpl.
+	lastTx string
 
 	// rollCount tracks how many times the writer has transparently
 	// rolled to a new segment. Tests and `cortex status` can surface
@@ -280,6 +302,18 @@ func (w *Writer) Append(group []datom.Datom) (string, error) {
 		return "", ErrWriterClosed
 	}
 
+	// Per-segment tx monotonicity. The reader (ErrSegmentOutOfOrder)
+	// and ScanSegment both enforce strictly non-decreasing tx ULIDs
+	// within a segment. If two concurrent callers minted their tx
+	// outside this lock and then raced for it, the later-minted tx
+	// can win the race and leave the segment out of order. Catching
+	// that here keeps the on-disk invariant sound without requiring
+	// every caller to coordinate tx minting externally. See
+	// cortex-zpl for the race that motivated this guard.
+	if w.lastTx != "" && tx <= w.lastTx {
+		return "", ErrNonMonotonicTx
+	}
+
 	// Roll to a fresh segment *before* acquiring the flock on the new
 	// file. Rollover finalises the current segment durably (fsync +
 	// close) so a crash mid-rollover leaves an intact prior segment
@@ -329,6 +363,108 @@ func (w *Writer) Append(group []datom.Datom) (string, error) {
 	}
 	w.fsyncCount.Add(1)
 	w.size += int64(n)
+	w.lastTx = tx
+
+	if unlockErr != nil {
+		return tx, fmt.Errorf("log: release flock: %w", unlockErr)
+	}
+	return tx, nil
+}
+
+// AppendTx is the race-free counterpart to Append. It mints the tx
+// ULID inside the Writer's mutex, passes it to build to construct the
+// sealed datom group, and then commits that group. Because tx minting
+// and Append serialisation happen under the same lock, the on-disk
+// tx order is guaranteed to match the order of AppendTx calls, and
+// concurrent callers never produce an out-of-order segment.
+//
+// build runs inside the write critical section, so it MUST be fast:
+// datom struct construction, checksum sealing, and nothing else. In
+// particular, build MUST NOT perform I/O, call other Writer methods,
+// or block on external resources — doing so would serialise every
+// append behind that work and defeat the purpose of the per-segment
+// flock's tight scope.
+//
+// Callers that previously minted a tx and then called Append should
+// migrate to AppendTx. See cortex-zpl for the race this closes.
+func (w *Writer) AppendTx(build func(tx string) ([]datom.Datom, error)) (string, error) {
+	if build == nil {
+		return "", fmt.Errorf("log: AppendTx build function is nil")
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return "", ErrWriterClosed
+	}
+
+	// Mint the tx ULID under the lock. ulid.Make() uses oklog/ulid's
+	// process-global monotonic entropy source, which guarantees that
+	// sequential calls in the same millisecond still produce strictly
+	// increasing ULIDs. Because w.mu serialises all AppendTx calls on
+	// this segment, the minted tx is strictly greater than w.lastTx.
+	tx := ulid.Make().String()
+	if w.lastTx != "" && tx <= w.lastTx {
+		// Defensive: ulid.Make's monotonic entropy should make this
+		// impossible, but if the clock jumps backward across a restart
+		// we'd rather surface a clear error than silently corrupt.
+		return "", fmt.Errorf("log: AppendTx minted %s <= lastTx %s (clock regression?)", tx, w.lastTx)
+	}
+
+	group, err := build(tx)
+	if err != nil {
+		return "", fmt.Errorf("log: AppendTx build: %w", err)
+	}
+	if len(group) == 0 {
+		return "", ErrEmptyGroup
+	}
+	// Validate the caller honoured the tx we supplied.
+	payload := make([]byte, 0, len(group)*256)
+	for i := range group {
+		d := &group[i]
+		if d.Tx != tx {
+			return "", ErrMixedTx
+		}
+		if d.Checksum == "" {
+			return "", ErrUnsealedDatom
+		}
+		line, err := datom.Marshal(d)
+		if err != nil {
+			return "", fmt.Errorf("log: marshal datom %d: %w", i, err)
+		}
+		payload = append(payload, line...)
+	}
+
+	// From here on, the sequence is identical to Append's post-lock
+	// path: rollover, flock, write, fsync, size/lastTx update.
+	if err := w.rolloverIfNeeded(int64(len(payload))); err != nil {
+		return "", err
+	}
+
+	fd := int(w.file.Fd())
+	if err := acquireFlock(fd, w.lockTimeout); err != nil {
+		return "", err
+	}
+	var unlockErr error
+	defer func() {
+		if err := releaseFlock(fd); err != nil && unlockErr == nil {
+			unlockErr = err
+		}
+	}()
+
+	n, err := w.file.Write(payload)
+	if err != nil {
+		return "", fmt.Errorf("log: write segment: %w", err)
+	}
+	if n != len(payload) {
+		return "", fmt.Errorf("log: short write: %d of %d bytes", n, len(payload))
+	}
+	if err := w.fsyncFn(w.file); err != nil {
+		return "", fmt.Errorf("log: fsync segment: %w", err)
+	}
+	w.fsyncCount.Add(1)
+	w.size += int64(n)
+	w.lastTx = tx
 
 	if unlockErr != nil {
 		return tx, fmt.Errorf("log: release flock: %w", unlockErr)

@@ -42,6 +42,94 @@ func makeGroup(t *testing.T, n int) (tx string, group []datom.Datom) {
 	return tx, group
 }
 
+// makeGroupWithTx builds a sealed single-datom group stamped with the
+// caller-supplied tx. Used by monotonicity tests that need to submit
+// groups with explicitly chosen tx ordering.
+func makeGroupWithTx(t *testing.T, tx string) []datom.Datom {
+	t.Helper()
+	d := datom.Datom{
+		Tx:           tx,
+		Ts:           "2026-04-10T00:00:00Z",
+		Actor:        "test",
+		Op:           datom.OpAdd,
+		E:            "entry:monotonic",
+		A:            "body",
+		V:            json.RawMessage(`"ok"`),
+		Src:          "segment_test",
+		InvocationID: "01HPTESTINVOCATION0000000000",
+	}
+	if err := d.Seal(); err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	return []datom.Datom{d}
+}
+
+// TestAppend_RejectsNonMonotonicTx reproduces cortex-zpl:
+// Writer.Append MUST NOT accept a group whose tx is less than or equal
+// to the tx of the previous successful append on this segment, because
+// the reader (and ScanSegment) enforce per-segment tx monotonicity and
+// would quarantine the whole segment at replay time.
+//
+// Before the fix: the Writer happily wrote both groups, and the
+// resulting segment was corrupted from the moment the second Append
+// returned. The bug was latent until cortex-ks1 added the per-segment
+// monotonicity guard in ScanSegment; two concurrent ingest runs hit
+// the race in the wild on Apr 15 because internal/write/pipeline.go
+// minted the tx ULID outside the Writer mutex, so the order of tx
+// minting and the order of Writer.Append calls were independent.
+//
+// After the fix: the Writer rejects the out-of-order group with
+// ErrNonMonotonicTx, does not write its bytes, and preserves the
+// prior segment state byte-for-byte.
+func TestAppend_RejectsNonMonotonicTx(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewWriter(dir)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer w.Close()
+
+	txEarlier := ulid.Make().String()
+	txLater := ulid.Make().String()
+	if txEarlier >= txLater {
+		t.Fatalf("ulid.Make() did not produce strictly-increasing tx: %s >= %s", txEarlier, txLater)
+	}
+
+	// Simulate the race outcome: the later-minted tx wins the Append race.
+	if _, err := w.Append(makeGroupWithTx(t, txLater)); err != nil {
+		t.Fatalf("first Append (txLater): %v", err)
+	}
+
+	sizeAfterFirst, err := os.Stat(w.Path())
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	// The earlier-minted tx arrives second. The Writer must reject it.
+	_, err = w.Append(makeGroupWithTx(t, txEarlier))
+	if !errors.Is(err, ErrNonMonotonicTx) {
+		t.Fatalf("out-of-order Append: got err=%v, want ErrNonMonotonicTx", err)
+	}
+
+	// Segment bytes must be unchanged — a rejected Append never writes.
+	sizeAfterReject, err := os.Stat(w.Path())
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if sizeAfterReject.Size() != sizeAfterFirst.Size() {
+		t.Fatalf("segment grew on rejected Append: %d -> %d",
+			sizeAfterFirst.Size(), sizeAfterReject.Size())
+	}
+
+	// And the segment must scan clean — the monotonicity invariant
+	// ScanSegment enforces is still intact.
+	if fault, err := ScanSegment(w.Path()); err != nil {
+		t.Fatalf("ScanSegment: %v", err)
+	} else if fault != nil {
+		t.Fatalf("ScanSegment found fault after rejected Append: %+v", fault)
+	}
+}
+
 // TestAppend_WritesExpectedBytes covers AC1 and AC3 of cortex-4kq.16:
 // "A successful Append writes exactly len(group) lines" and "stat().Size
 // equals prior size plus serialized group length".
