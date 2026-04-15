@@ -50,6 +50,13 @@ type neo4jReflectClusterSource struct {
 // those properties this returns empty; the threshold filter in the
 // reflect pipeline drops each candidate as BELOW_COSINE_FLOOR or
 // similar, which is the correct "no work to do" behaviour.
+//
+// Read the entry tx from e.last_tx — the Neo4j applier in
+// internal/neo4j/applier.go writes it under that name, and an
+// earlier version of this Cypher referenced a bare e.tx which
+// never existed on the node, silently coalescing to "" and
+// dropping every candidate through the m.tx > $sinceTx predicate.
+// See cortex-h9y.
 func (s *neo4jReflectClusterSource) Candidates(ctx context.Context, sinceTx string) ([]reflect.ClusterCandidate, error) {
 	const cypher = `
 MATCH (c:Community {level: 0})<-[:IN_COMMUNITY]-(e)
@@ -57,7 +64,7 @@ WHERE e.entry_id IS NOT NULL
 WITH c, collect({
   entry_id: e.entry_id,
   ts:       coalesce(e.encoding_at,''),
-  tx:       coalesce(e.tx,'')
+  tx:       coalesce(e.last_tx,'')
 }) AS members
 WITH c, members,
      [m IN members WHERE m.tx > $sinceTx | m] AS newMembers
@@ -84,10 +91,12 @@ RETURN
 		exemplars := parseReflectExemplars(row["members"])
 		avgCos, _ := rowFloat64(row, "avg_cosine")
 		mdl, _ := rowFloat64(row, "mdl_ratio")
-		distinctTS := 0
-		if n, ok := row["distinct_ts"].(int64); ok {
-			distinctTS = int(n)
-		}
+		// Compute DistinctTimestamps client-side from the parsed
+		// exemplar time values, grouping by UTC calendar day. Pre-fix
+		// this field read from a non-existent c.distinct_timestamps
+		// Community property, always returned 0, and silently pushed
+		// every candidate into INSUFFICIENT_TIMESTAMPS. See cortex-5aq.
+		distinctTS := countDistinctDays(exemplars)
 		out = append(out, reflect.ClusterCandidate{
 			ID:                    id,
 			Exemplars:             exemplars,
@@ -97,6 +106,27 @@ RETURN
 		})
 	}
 	return out, nil
+}
+
+// countDistinctDays returns the number of distinct UTC calendar
+// days represented in the exemplar list. Exemplars whose Timestamp
+// is the zero value are skipped — they carry no day signal and
+// should not inflate the count. This feeds the reflect pipeline's
+// MinDistinctTimestamps threshold, which rejects clusters whose
+// members all land within a single day as likely-intraday noise
+// rather than a genuine temporal pattern.
+func countDistinctDays(exemplars []reflect.ExemplarRef) int {
+	if len(exemplars) == 0 {
+		return 0
+	}
+	seen := make(map[string]struct{}, len(exemplars))
+	for _, ex := range exemplars {
+		if ex.Timestamp.IsZero() {
+			continue
+		}
+		seen[ex.Timestamp.UTC().Format("2006-01-02")] = struct{}{}
+	}
+	return len(seen)
 }
 
 // parseReflectExemplars decodes the collect(map) column into
