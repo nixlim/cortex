@@ -322,35 +322,76 @@ func rowInt64(row map[string]any, key string) (int64, bool) {
 	}
 }
 
+// PersistBatchSize caps the number of communities packed into a
+// single bulk WriteEntries call from Persist. One autocommit Cypher
+// per community (the pre-fix behaviour) meant O(N) Bolt round trips
+// — on the Apr 15 cortex + myagentsgigs graph with ~40k level-0
+// communities that was ~12 minutes of network-bound wall clock.
+// Bulk UNWIND of PersistBatchSize communities per round trip cuts
+// that to O(N / PersistBatchSize) calls. See cortex-xek.
+//
+// 500 is a deliberately conservative default: large enough to
+// amortise Bolt framing, small enough that a single chunk's payload
+// (community metadata + member id list) fits comfortably inside
+// Neo4j's default request size ceiling even when members are large.
+const PersistBatchSize = 500
+
 // Persist writes the hierarchy to Neo4j by MERGE-ing a :Community
 // node per (level, communityId) and MERGE-ing :IN_COMMUNITY edges
-// from each member node. The Cypher is intentionally one statement
-// per community so a mid-run failure leaves earlier communities
+// from each member node. Communities are packed into bulk chunks of
+// PersistBatchSize and shipped one Cypher per chunk, so the round
+// trip count scales with the chunk count rather than the total
+// community count. On a mid-chunk failure earlier chunks remain
 // committed; callers that want all-or-nothing semantics should wrap
 // this in a Neo4j transaction at a higher layer.
 func (d *Detector) Persist(ctx context.Context, hierarchy [][]Community) error {
 	if d.Neo4j == nil {
 		return errors.New("community: no neo4j client configured")
 	}
+	// UNWIND $communities AS c runs one MERGE per community inside a
+	// single Cypher statement. The inner UNWIND over c.members plus
+	// MATCH (n) WHERE id(n) = nid creates the :IN_COMMUNITY edge for
+	// every member. Binding level on the :IN_COMMUNITY relationship
+	// still reads from each community's own level field so a single
+	// chunk can technically span levels; the caller drives one level
+	// per chunk today and the Cypher tolerates either convention.
 	const cypher = `
-MERGE (c:Community {level: $level, community_id: $community_id})
-SET c.member_count = $member_count, c.summary = $summary
-WITH c
-UNWIND $members AS nid
+UNWIND $communities AS c
+MERGE (x:Community {level: c.level, community_id: c.community_id})
+SET x.member_count = c.member_count, x.summary = c.summary
+WITH x, c
+UNWIND c.members AS nid
 MATCH (n) WHERE id(n) = nid
-MERGE (n)-[:IN_COMMUNITY {level: $level}]->(c)
+MERGE (n)-[:IN_COMMUNITY {level: c.level}]->(x)
 `
 	for _, level := range hierarchy {
-		for _, c := range level {
+		if len(level) == 0 {
+			continue
+		}
+		levelID := level[0].Level
+		for start := 0; start < len(level); start += PersistBatchSize {
+			end := start + PersistBatchSize
+			if end > len(level) {
+				end = len(level)
+			}
+			chunk := level[start:end]
+			communities := make([]map[string]any, len(chunk))
+			for i, c := range chunk {
+				communities[i] = map[string]any{
+					"level":        c.Level,
+					"community_id": c.ID,
+					"member_count": len(c.Members),
+					"members":      c.Members,
+					"summary":      c.Summary,
+				}
+			}
 			params := map[string]any{
-				"level":        c.Level,
-				"community_id": c.ID,
-				"member_count": len(c.Members),
-				"members":      c.Members,
-				"summary":      c.Summary,
+				"level":       levelID,
+				"communities": communities,
 			}
 			if err := d.Neo4j.WriteEntries(ctx, cypher, params); err != nil {
-				return fmt.Errorf("community: persist level %d id %d: %w", c.Level, c.ID, err)
+				return fmt.Errorf("community: persist level %d chunk %d..%d: %w",
+					levelID, start, end, err)
 			}
 		}
 	}

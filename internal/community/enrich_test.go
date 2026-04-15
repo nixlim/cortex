@@ -2,6 +2,7 @@ package community
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"testing"
 )
@@ -30,6 +31,127 @@ type enrichFakeFetcher struct {
 
 func (f *enrichFakeFetcher) FetchVectorsByCortexIDs(_ context.Context, _ string, _ []string) (map[string][]float32, error) {
 	return f.vectors, nil
+}
+
+// batchRecordingFetcher records every id batch it is asked for so a
+// test can assert that EnrichLevel0 chunks its calls instead of
+// shipping one oversized GraphQL Or filter. Used by the cortex-bxi
+// regression test.
+type batchRecordingFetcher struct {
+	vectors    map[string][]float32
+	batchSizes []int
+	seenIDs    map[string]struct{}
+}
+
+func newBatchRecordingFetcher(vectors map[string][]float32) *batchRecordingFetcher {
+	return &batchRecordingFetcher{
+		vectors: vectors,
+		seenIDs: make(map[string]struct{}, len(vectors)),
+	}
+}
+
+func (f *batchRecordingFetcher) FetchVectorsByCortexIDs(_ context.Context, _ string, ids []string) (map[string][]float32, error) {
+	f.batchSizes = append(f.batchSizes, len(ids))
+	out := make(map[string][]float32, len(ids))
+	for _, id := range ids {
+		f.seenIDs[id] = struct{}{}
+		if v, ok := f.vectors[id]; ok {
+			out[id] = v
+		}
+	}
+	return out, nil
+}
+
+func (f *batchRecordingFetcher) maxBatch() int {
+	m := 0
+	for _, n := range f.batchSizes {
+		if n > m {
+			m = n
+		}
+	}
+	return m
+}
+
+// TestEnrichLevel0_BatchesVectorFetch reproduces cortex-bxi: EnrichLevel0
+// must chunk its FetchVectorsByCortexIDs calls so the Weaviate GraphQL
+// Or filter never holds more than VectorFetchBatchSize operands. On a
+// multi-project graph we have hundreds of thousands of level-0 member
+// entry_ids; a single call holds the whole union and trips Weaviate's
+// parser/query-size limits.
+//
+// The test populates three level-0 communities whose member ids total
+// well above the batch cap, drives EnrichLevel0 through a
+// batch-recording fetcher, and asserts:
+//  1. No individual FetchVectorsByCortexIDs call exceeds
+//     VectorFetchBatchSize.
+//  2. Every id eventually reaches the fetcher (so no member is silently
+//     skipped by the chunking).
+//  3. The per-community avg_cosine / mdl_ratio still lands on the
+//     right community (chunking must not corrupt the mapping).
+func TestEnrichLevel0_BatchesVectorFetch(t *testing.T) {
+	// Use 450 ids across three communities — comfortably larger than
+	// the batch cap so we force at least three Fetch calls.
+	const totalIDs = 450
+	vectors := make(map[string][]float32, totalIDs)
+	for i := 0; i < totalIDs; i++ {
+		vectors[fmt.Sprintf("entry:%04d", i)] = []float32{1, 0, 0}
+	}
+
+	// Three communities, 150 members each.
+	readRows := []map[string]any{
+		{"community_id": int64(1), "entry_ids": make([]string, 0, 150)},
+		{"community_id": int64(2), "entry_ids": make([]string, 0, 150)},
+		{"community_id": int64(3), "entry_ids": make([]string, 0, 150)},
+	}
+	for i := 0; i < totalIDs; i++ {
+		row := readRows[i/150]
+		row["entry_ids"] = append(row["entry_ids"].([]string), fmt.Sprintf("entry:%04d", i))
+	}
+
+	fn := &enrichFakeNeo4j{readRows: readRows}
+	d := &Detector{Neo4j: fn}
+	fetcher := newBatchRecordingFetcher(vectors)
+
+	summary, err := d.EnrichLevel0(context.Background(), fetcher, "Entry")
+	if err != nil {
+		t.Fatalf("EnrichLevel0: %v", err)
+	}
+
+	if fetcher.maxBatch() > VectorFetchBatchSize {
+		t.Fatalf("maxBatch=%d > VectorFetchBatchSize=%d (batch sizes: %v)",
+			fetcher.maxBatch(), VectorFetchBatchSize, fetcher.batchSizes)
+	}
+	// Must have issued more than one call — otherwise we're just
+	// shipping the whole set in a single request and the cap does
+	// nothing.
+	if len(fetcher.batchSizes) < 2 {
+		t.Fatalf("expected chunked fetch (>=2 calls), got %d calls", len(fetcher.batchSizes))
+	}
+	if len(fetcher.seenIDs) != totalIDs {
+		t.Fatalf("fetcher saw %d distinct ids, want %d", len(fetcher.seenIDs), totalIDs)
+	}
+	if summary.CommunitiesEnriched != 3 {
+		t.Errorf("communities enriched: got %d want 3", summary.CommunitiesEnriched)
+	}
+	if summary.VectorsFetched != totalIDs {
+		t.Errorf("vectors fetched: got %d want %d", summary.VectorsFetched, totalIDs)
+	}
+	if len(fn.writes) != 3 {
+		t.Fatalf("writes: got %d want 3", len(fn.writes))
+	}
+	// All three communities are members of identical-vector families,
+	// so avg_cosine must equal 1 and mdl must be 1 + ln(1+150).
+	wantMDL := 1 + math.Log(1+150)
+	for i, w := range fn.writes {
+		avg, _ := w["avg_cosine"].(float64)
+		mdl, _ := w["mdl_ratio"].(float64)
+		if math.Abs(avg-1.0) > 1e-9 {
+			t.Errorf("write %d avg_cosine: got %v want 1.0", i, avg)
+		}
+		if math.Abs(mdl-wantMDL) > 1e-9 {
+			t.Errorf("write %d mdl_ratio: got %v want %v", i, mdl, wantMDL)
+		}
+	}
 }
 
 // TestEnrichLevel0_ComputesCosineAndMDL covers cortex-6ef's main AC:

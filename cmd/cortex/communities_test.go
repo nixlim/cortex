@@ -211,17 +211,32 @@ func TestDetectAndPersistCommunities_HappyPathLeiden(t *testing.T) {
 		}
 	}
 
-	// Persist must be called once per community per level: 4 × 3 = 12.
-	if got, want := len(fake.writeCalls), 12; got != want {
+	// Persist is bulk-batched: one WriteEntries call per chunk per
+	// level. The fixture has 4 communities per level, well under
+	// PersistBatchSize, so each level ships in a single call. 3
+	// levels × 1 chunk = 3 calls. See cortex-xek.
+	if got, want := len(fake.writeCalls), 3; got != want {
 		t.Errorf("WriteEntries call count: got %d, want %d", got, want)
 	}
-	// Spot-check the parameter shape on the first persist call. The
-	// MERGE Cypher in community.Detector.Persist takes level,
-	// community_id, member_count, members, and summary parameters.
+	// Spot-check the bulk parameter shape on the first persist call.
+	// The UNWIND-based Cypher takes a top-level $level plus a
+	// $communities list; each entry in that list carries the
+	// per-community fields (community_id, member_count, members,
+	// summary).
 	first := fake.writeCalls[0]
+	if _, ok := first["level"]; !ok {
+		t.Errorf("persist params missing top-level key %q: %v", "level", first)
+	}
+	batch, ok := first["communities"].([]map[string]any)
+	if !ok {
+		t.Fatalf("persist params[%q] shape = %T, want []map[string]any", "communities", first["communities"])
+	}
+	if len(batch) == 0 {
+		t.Fatalf("persist 'communities' batch is empty")
+	}
 	for _, key := range []string{"level", "community_id", "member_count", "members"} {
-		if _, ok := first[key]; !ok {
-			t.Errorf("persist params missing key %q: %v", key, first)
+		if _, ok := batch[0][key]; !ok {
+			t.Errorf("persist communities[0] missing key %q: %v", key, batch[0])
 		}
 	}
 }
@@ -269,10 +284,11 @@ func TestDetectAndPersistCommunities_LouvainFallback(t *testing.T) {
 		t.Errorf("call[4]: expected louvain fallback, got %s", firstLine(fake.gdsCalls[4]))
 	}
 
-	// Louvain ran once; persist runs 2 communities × 3 levels = 6
-	// because the dendrogram synthesizes all three levels from a
-	// single Louvain output.
-	if got, want := len(fake.writeCalls), 6; got != want {
+	// Louvain ran once; persist is bulk-batched so each of the three
+	// dendrogram levels ships in one WriteEntries call (both levels'
+	// community counts are well under PersistBatchSize). 3 levels ×
+	// 1 chunk = 3 calls. See cortex-xek.
+	if got, want := len(fake.writeCalls), 3; got != want {
 		t.Errorf("WriteEntries call count: got %d, want %d", got, want)
 	}
 }

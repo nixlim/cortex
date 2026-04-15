@@ -294,10 +294,15 @@ func TestDetect_MissingQueryBuilder(t *testing.T) {
 	}
 }
 
-// TestPersist_WritesOneEntryPerCommunity covers "persists them to
-// Neo4j". We stub WriteEntries as a capture list and assert both the
-// total count and per-community parameter shape.
-func TestPersist_WritesOneEntryPerCommunity(t *testing.T) {
+// TestPersist_BulkBatchesCommunities covers cortex-xek: Persist must
+// ship communities to Neo4j in bulk so the wall-clock cost of a
+// detect run is O(levels × chunks), not O(total communities). The
+// test fixture has 1 community at level 0 and 2 at level 1; a
+// correctly bulk-batched Persist sends one WriteEntries call per
+// level (2 total) with the communities packed into a $communities
+// list parameter. The pre-fix implementation sent one call per
+// community (3 total).
+func TestPersist_BulkBatchesCommunities(t *testing.T) {
 	fn := &fakeNeo4j{}
 	d := newFixtureDetector(fn)
 	hierarchy := [][]Community{
@@ -307,12 +312,68 @@ func TestPersist_WritesOneEntryPerCommunity(t *testing.T) {
 	if err := d.Persist(context.Background(), hierarchy); err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
-	if len(fn.written) != 3 {
-		t.Fatalf("wrote %d communities, want 3", len(fn.written))
+	if len(fn.written) != 2 {
+		t.Fatalf("wrote %d bulk calls, want 2 (one per level)", len(fn.written))
 	}
-	first := fn.written[0]
-	if first["level"] != 0 || first["community_id"] != int64(10) || first["member_count"] != 3 {
-		t.Errorf("first write params = %+v", first)
+	// Level 0: one community in the batch.
+	level0 := fn.written[0]
+	if got := level0["level"]; got != 0 {
+		t.Errorf("level-0 batch level param = %v, want 0", got)
+	}
+	batch0, ok := level0["communities"].([]map[string]any)
+	if !ok {
+		t.Fatalf("level-0 batch 'communities' param shape = %T, want []map[string]any", level0["communities"])
+	}
+	if len(batch0) != 1 {
+		t.Fatalf("level-0 batch size = %d, want 1", len(batch0))
+	}
+	if batch0[0]["community_id"] != int64(10) || batch0[0]["member_count"] != 3 {
+		t.Errorf("level-0 batch entry = %+v", batch0[0])
+	}
+	// Level 1: two communities in the batch.
+	level1 := fn.written[1]
+	batch1, _ := level1["communities"].([]map[string]any)
+	if len(batch1) != 2{
+		t.Fatalf("level-1 batch size = %d, want 2", len(batch1))
+	}
+}
+
+// TestPersist_ChunksAtBatchSize reproduces cortex-xek on a large
+// synthetic hierarchy: 2000 level-0 communities must be persisted in
+// ⌈2000 / PersistBatchSize⌉ calls, not 2000. This is the scale case
+// that motivates the fix — the Apr 15 cortex + myagentsgigs graph hit
+// ~40k communities at level 0 and Persist was taking ~12 minutes at
+// one autocommit round trip each.
+func TestPersist_ChunksAtBatchSize(t *testing.T) {
+	fn := &fakeNeo4j{}
+	d := newFixtureDetector(fn)
+	const N = 2000
+	level0 := make([]Community, N)
+	for i := 0; i < N; i++ {
+		level0[i] = Community{ID: int64(i), Level: 0, Members: []int64{int64(i)}}
+	}
+	if err := d.Persist(context.Background(), [][]Community{level0}); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	expectedCalls := (N + PersistBatchSize - 1) / PersistBatchSize
+	if len(fn.written) != expectedCalls {
+		t.Fatalf("wrote %d calls for %d communities at batch size %d; want %d",
+			len(fn.written), N, PersistBatchSize, expectedCalls)
+	}
+	// Sanity: every batch is ≤ PersistBatchSize.
+	var seen int
+	for i, w := range fn.written {
+		batch, ok := w["communities"].([]map[string]any)
+		if !ok {
+			t.Fatalf("call %d: 'communities' param shape = %T, want []map[string]any", i, w["communities"])
+		}
+		if len(batch) > PersistBatchSize {
+			t.Errorf("call %d: batch size %d > PersistBatchSize %d", i, len(batch), PersistBatchSize)
+		}
+		seen += len(batch)
+	}
+	if seen != N {
+		t.Errorf("total communities across batches = %d, want %d", seen, N)
 	}
 }
 

@@ -30,6 +30,22 @@ type VectorFetcher interface {
 	FetchVectorsByCortexIDs(ctx context.Context, class string, cortexIDs []string) (map[string][]float32, error)
 }
 
+// VectorFetchBatchSize caps the number of cortex_ids handed to a
+// single FetchVectorsByCortexIDs call. The Weaviate HTTPClient builds
+// a GraphQL Or filter with one Equal operand per id, and the function
+// itself warns "small id sets ... keep this query well under the
+// GraphQL parser limits". On a multi-project graph the union of all
+// level-0 members can easily exceed 100k ids; a single call times
+// out or is rejected as oversized by the parser. EnrichLevel0
+// chunks its requests at this cap so each Weaviate round trip stays
+// in the safe region. See cortex-bxi.
+//
+// 200 is deliberately conservative: it is well below any plausible
+// parser limit, keeps per-call latency bounded, and still amortises
+// TLS + HTTP framing across enough ids to complete the enrich pass
+// on a 100k-member graph in a few dozen sequential calls.
+const VectorFetchBatchSize = 200
+
 // EnrichmentSummary is the non-cypher-specific return shape the CLI
 // uses to print "enriched N communities" after detect.
 type EnrichmentSummary struct {
@@ -104,9 +120,24 @@ RETURN c.community_id AS community_id, entry_ids
 	for id := range allIDs {
 		idBatch = append(idBatch, id)
 	}
-	vectors, err := fetcher.FetchVectorsByCortexIDs(ctx, weaviateClass, idBatch)
-	if err != nil {
-		return EnrichmentSummary{}, fmt.Errorf("community: fetch vectors: %w", err)
+	// Chunk the vector fetch at VectorFetchBatchSize so the Weaviate
+	// GraphQL Or-filter never exceeds the safe operand count. A
+	// single oversized call is the root cause of cortex-bxi.
+	vectors := make(map[string][]float32, len(idBatch))
+	for start := 0; start < len(idBatch); start += VectorFetchBatchSize {
+		end := start + VectorFetchBatchSize
+		if end > len(idBatch) {
+			end = len(idBatch)
+		}
+		chunk := idBatch[start:end]
+		part, err := fetcher.FetchVectorsByCortexIDs(ctx, weaviateClass, chunk)
+		if err != nil {
+			return EnrichmentSummary{}, fmt.Errorf("community: fetch vectors (chunk %d..%d of %d): %w",
+				start, end, len(idBatch), err)
+		}
+		for id, v := range part {
+			vectors[id] = v
+		}
 	}
 
 	const writeCypher = `
