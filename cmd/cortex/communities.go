@@ -143,7 +143,7 @@ func runCommunitiesDetect(cmd *cobra.Command, jsonFlag bool) error {
 	defer func() { _ = bolt.Close(context.Background()) }()
 
 	weaviateClient := newWeaviateClient(cfg)
-	res, err := detectAndPersistCommunities(cmd.Context(), bolt, weaviateClient, weaviate.ClassEntry, semanticGraphName)
+	res, err := detectAndPersistCommunities(cmd.Context(), bolt, weaviateClient, weaviate.ClassEntry, communityGraphName)
 	if err != nil {
 		return emitAndExit(cmd, err, jsonFlag)
 	}
@@ -164,15 +164,15 @@ func runCommunitiesDetect(cmd *cobra.Command, jsonFlag bool) error {
 // is constructed inline because it carries no per-call state and the
 // Detect/Persist split is the seam analyze.go already exercises.
 func detectAndPersistCommunities(ctx context.Context, client neo4j.Client, fetcher community.VectorFetcher, weaviateClass, graphName string) (*communitiesDetectResult, error) {
-	if err := ensureSemanticProjection(ctx, client, graphName); err != nil {
+	if err := ensureCommunityProjection(ctx, client, graphName); err != nil {
 		return nil, errs.Operational("PROJECTION_FAILED",
 			"could not create or refresh GDS projection", err)
 	}
 
 	detector := &community.Detector{
 		Neo4j:        client,
-		LeidenQuery:  neo4j.LeidenStreamQuery,
-		LouvainQuery: neo4j.LouvainStreamQuery,
+		LeidenQuery:  neo4j.CommunityLeidenStreamQuery,
+		LouvainQuery: neo4j.CommunityLouvainStreamQuery,
 		TopNodeCount: 32,
 	}
 	cfg := community.Config{

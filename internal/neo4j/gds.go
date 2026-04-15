@@ -62,6 +62,49 @@ func LouvainStreamQuery(graphName string) string {
 	)
 }
 
+// CommunityLeidenStreamQuery is the Leiden stream variant used by the
+// community-detection path over the derived Entry↔Entry projection.
+// It differs from LeidenStreamQuery in one place only — the
+// relationshipWeightProperty: 'weight' option — so Leiden multiplies
+// the modularity contribution of each edge by the number of shared
+// concepts that produced it. Without this, two Entries linked via 20
+// shared concepts would be no more tightly coupled than two Entries
+// linked via 1, collapsing the signal the projection was built to
+// surface. A separate function (rather than a second argument) keeps
+// the wildcard recall-time Leiden path from breaking: cortex.semantic
+// does not carry a 'weight' property and GDS would error if the
+// option referenced a non-existent one. See cortex-rjz.
+func CommunityLeidenStreamQuery(graphName string) string {
+	return fmt.Sprintf(
+		`CALL gds.leiden.stream('%s', {
+            maxLevels: $maxLevels,
+            gamma: $resolution,
+            tolerance: $tolerance,
+            randomSeed: 42,
+            relationshipWeightProperty: 'weight'
+        }) YIELD nodeId, communityId, intermediateCommunityIds
+        RETURN nodeId, communityId, intermediateCommunityIds`,
+		escapeGraphName(graphName),
+	)
+}
+
+// CommunityLouvainStreamQuery is the weighted-edge variant of
+// LouvainStreamQuery for the community projection. Same rationale as
+// CommunityLeidenStreamQuery — the cortex.community graph carries a
+// 'weight' property that Leiden and Louvain must read to honour the
+// shared-concept signal.
+func CommunityLouvainStreamQuery(graphName string) string {
+	return fmt.Sprintf(
+		`CALL gds.louvain.stream('%s', {
+            maxLevels: $maxLevels,
+            tolerance: $tolerance,
+            relationshipWeightProperty: 'weight'
+        }) YIELD nodeId, communityId, intermediateCommunityIds
+        RETURN nodeId, communityId, intermediateCommunityIds`,
+		escapeGraphName(graphName),
+	)
+}
+
 // escapeGraphName is a defence-in-depth check: graph names are
 // produced internally by Cortex (e.g., "cortex.semantic") and should
 // never contain characters that would break out of the single-quoted

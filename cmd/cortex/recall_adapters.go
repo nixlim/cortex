@@ -47,11 +47,24 @@ import (
 )
 
 // semanticGraphName is the GDS in-memory projection name Cortex uses
-// for semantic-graph queries (PPR, community detection). The
-// projection is created by cortex up / rebuild once the backend
-// applier lands; until then, GDS calls against it return an error
-// that this package surfaces as PPR_FAILED.
-const semanticGraphName = "cortex.semantic"
+// for the recall pipeline (PPR). It is built wildcard via
+// ensureSemanticProjection so page-rank can walk across the full
+// Entry/Concept bipartite graph seeded from query-time concepts.
+//
+// communityGraphName is a SEPARATE projection used ONLY by the
+// community-detection path. The MENTIONS graph is bipartite
+// Entry↔Concept, which caused Leiden/Louvain over the wildcard
+// projection to land ~20k isolated :Concept nodes as singleton
+// communities — only ~10 out of 20,564 had ≥3 Entry members, so
+// reflect never had a viable candidate pool. cortex.community
+// projects Entry nodes with derived Entry↔Entry weighted edges
+// (shared Concept count), hub concepts above a degree cap filtered
+// out. See cortex-rjz and ensureCommunityProjection for the exact
+// shape.
+const (
+	semanticGraphName  = "cortex.semantic"
+	communityGraphName = "cortex.community"
+)
 
 // newOllamaClient builds a shared *ollama.HTTPClient from the loaded
 // config. Post-Phase-3 this is used for the *embedding* path only —

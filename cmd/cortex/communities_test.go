@@ -186,12 +186,13 @@ func TestDetectAndPersistCommunities_HappyPathLeiden(t *testing.T) {
 		}
 	}
 
-	// The projection slow path emits exists → drop → project before
-	// any algorithm call. After that, leiden runs once per
-	// resolution (3 calls). Finally the enrich pass issues one
-	// read-back MATCH. Total: 7 GDS calls.
+	// ensureCommunityProjection always drops and rebuilds (the
+	// derived projection's counts never match the live graph, so a
+	// fast-path probe would always fall through anyway — see
+	// cortex-rjz). The sequence is therefore drop → project → three
+	// leiden streams (one per resolution) → the enrich read-back.
+	// Total: 6 GDS calls.
 	wantSeq := []string{
-		"gds.graph.exists",
 		"gds.graph.drop",
 		"gds.graph.project",
 		"gds.leiden.stream",
@@ -268,20 +269,21 @@ func TestDetectAndPersistCommunities_LouvainFallback(t *testing.T) {
 	// Leiden is attempted once (errors immediately), then Louvain is
 	// attempted ONCE — cortex-i3w fixed Louvain to run a single time
 	// and decode intermediateCommunityIds for the level hierarchy,
-	// rather than rerunning per resolution. Plus projection setup
-	// (exists, drop, project) and the enrich read-back. Total:
-	// 3 setup + 1 leiden + 1 louvain + 1 enrich = 6.
-	if got, want := len(fake.gdsCalls), 6; got != want {
+	// rather than rerunning per resolution. Plus the community
+	// projection setup (drop, project — no fast-path probe) and the
+	// enrich read-back. Total: 2 setup + 1 leiden + 1 louvain + 1
+	// enrich = 5.
+	if got, want := len(fake.gdsCalls), 5; got != want {
 		for i, c := range fake.gdsCalls {
 			t.Logf("call %d: %s", i, firstLine(c))
 		}
 		t.Fatalf("gds call count: got %d, want %d", got, want)
 	}
-	if !strings.Contains(fake.gdsCalls[3], "gds.leiden.stream") {
-		t.Errorf("call[3]: expected leiden first attempt, got %s", firstLine(fake.gdsCalls[3]))
+	if !strings.Contains(fake.gdsCalls[2], "gds.leiden.stream") {
+		t.Errorf("call[2]: expected leiden first attempt, got %s", firstLine(fake.gdsCalls[2]))
 	}
-	if !strings.Contains(fake.gdsCalls[4], "gds.louvain.stream") {
-		t.Errorf("call[4]: expected louvain fallback, got %s", firstLine(fake.gdsCalls[4]))
+	if !strings.Contains(fake.gdsCalls[3], "gds.louvain.stream") {
+		t.Errorf("call[3]: expected louvain fallback, got %s", firstLine(fake.gdsCalls[3]))
 	}
 
 	// Louvain ran once; persist is bulk-batched so each of the three
