@@ -164,7 +164,7 @@ func TestDetectAndPersistCommunities_HappyPathLeiden(t *testing.T) {
 		leidenRows: rows,
 	}
 
-	res, err := detectAndPersistCommunities(context.Background(), fake, &fakeVectorFetcher{}, "Entry", "cortex.semantic")
+	res, err := detectAndPersistCommunities(context.Background(), fake, &fakeVectorFetcher{}, "Entry", "cortex.semantic", nil)
 	if err != nil {
 		t.Fatalf("detectAndPersistCommunities: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestDetectAndPersistCommunities_LouvainFallback(t *testing.T) {
 		louvainRows: rows,
 	}
 
-	res, err := detectAndPersistCommunities(context.Background(), fake, &fakeVectorFetcher{}, "Entry", "cortex.semantic")
+	res, err := detectAndPersistCommunities(context.Background(), fake, &fakeVectorFetcher{}, "Entry", "cortex.semantic", nil)
 	if err != nil {
 		t.Fatalf("detectAndPersistCommunities: %v", err)
 	}
@@ -297,13 +297,81 @@ func TestDetectAndPersistCommunities_LouvainFallback(t *testing.T) {
 	}
 }
 
+// TestDetectAndPersistCommunities_RespectsResolutionsOverride covers
+// cortex-4i2: a non-nil resolutions slice passed through from the
+// --resolutions CLI flag must drive the hierarchy depth and the
+// per-level gds.leiden.stream calls, not the package default. Four
+// resolutions → four leiden calls and four levels in the result.
+func TestDetectAndPersistCommunities_RespectsResolutionsOverride(t *testing.T) {
+	rows := fixtureCommunityRows(6, 2)
+	fake := &fakeCommunityClient{leidenRows: rows}
+
+	res, err := detectAndPersistCommunities(
+		context.Background(), fake, &fakeVectorFetcher{},
+		"Entry", "cortex.semantic",
+		[]float64{4.0, 2.0, 1.0, 0.5},
+	)
+	if err != nil {
+		t.Fatalf("detectAndPersistCommunities: %v", err)
+	}
+	if res.Levels != 4 {
+		t.Errorf("levels: got %d, want 4", res.Levels)
+	}
+	var leidenCalls int
+	for _, c := range fake.gdsCalls {
+		if strings.Contains(c, "gds.leiden.stream") {
+			leidenCalls++
+		}
+	}
+	if leidenCalls != 4 {
+		t.Errorf("leiden stream calls: got %d, want 4 (one per resolution)", leidenCalls)
+	}
+}
+
+func TestParseResolutionsFlag(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		want    []float64
+		wantErr bool
+	}{
+		{"empty falls back to default", "", nil, false},
+		{"whitespace falls back to default", "   ", nil, false},
+		{"single value", "2.5", []float64{2.5}, false},
+		{"three values", "3.0,1.5,0.7", []float64{3.0, 1.5, 0.7}, false},
+		{"tolerates inner whitespace", " 3.0 , 1.5 , 0.7 ", []float64{3.0, 1.5, 0.7}, false},
+		{"rejects non-numeric token", "3.0,oops,0.7", nil, true},
+		{"rejects zero", "3.0,0,0.7", nil, true},
+		{"rejects negative", "3.0,-1,0.7", nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseResolutionsFlag(tc.input)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("parseResolutionsFlag(%q) err=%v, wantErr=%v", tc.input, err, tc.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseResolutionsFlag(%q) = %v, want %v", tc.input, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("parseResolutionsFlag(%q)[%d] = %v, want %v", tc.input, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestDetectAndPersistCommunities_BothAlgorithmsFail(t *testing.T) {
 	fake := &fakeCommunityClient{
 		leidenErr:  errors.New("leiden boom"),
 		louvainErr: errors.New("louvain boom"),
 	}
 
-	res, err := detectAndPersistCommunities(context.Background(), fake, &fakeVectorFetcher{}, "Entry", "cortex.semantic")
+	res, err := detectAndPersistCommunities(context.Background(), fake, &fakeVectorFetcher{}, "Entry", "cortex.semantic", nil)
 	if err == nil {
 		t.Fatalf("expected error, got result %+v", res)
 	}

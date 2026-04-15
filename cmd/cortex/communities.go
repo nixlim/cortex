@@ -14,6 +14,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -25,6 +27,20 @@ import (
 	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/weaviate"
 )
+
+// defaultCommunityResolutions are the Leiden γ values used by
+// `cortex communities detect` when --resolutions is not supplied.
+// One value per hierarchy level (finest → coarsest). These were
+// bumped on 2026-04-15 (cortex-4i2) from the original
+// [1.0, 0.5, 0.1] after the cortex + myagentsgigs graph collapsed
+// into only 12 / 4 / 2 communities at levels 0 / 1 / 2 — level-0
+// averaged 460 entries per community, far too coarse for frame
+// promotion. Higher γ produces finer partitions in Leiden, so the
+// new defaults aim for an order-of-magnitude increase in level-0
+// community count on the same graph. Operators should still
+// re-sweep per-graph via the --resolutions flag and measure
+// frame-acceptance after each detect run.
+var defaultCommunityResolutions = []float64{3.0, 1.5, 0.7}
 
 // newCommunitiesCmdReal returns the wired `cortex communities` parent.
 // commands.go installs it in place of the notImplemented stub.
@@ -81,7 +97,10 @@ func newCommunitiesCmdReal() *cobra.Command {
 // triggers the summarizer pass on the next refresh after writes land,
 // which is the natural place for the LLM cost to accrue.
 func newCommunitiesDetectCmd() *cobra.Command {
-	var jsonFlag bool
+	var (
+		jsonFlag        bool
+		resolutionsFlag string
+	)
 	cmd := &cobra.Command{
 		Use:   "detect",
 		Short: "Run community detection and persist results to Neo4j",
@@ -93,11 +112,53 @@ func newCommunitiesDetectCmd() *cobra.Command {
 			"reflect both depend on; without it their cluster sources find " +
 			"no candidates.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCommunitiesDetect(cmd, jsonFlag)
+			resolutions, err := parseResolutionsFlag(resolutionsFlag)
+			if err != nil {
+				return emitAndExit(cmd, errs.Validation("BAD_RESOLUTIONS",
+					err.Error(), nil), jsonFlag)
+			}
+			return runCommunitiesDetect(cmd, jsonFlag, resolutions)
 		},
 	}
 	cmd.Flags().BoolVar(&jsonFlag, "json", false, "emit machine-readable JSON")
+	cmd.Flags().StringVar(&resolutionsFlag, "resolutions", "",
+		"comma-separated Leiden γ values, finest→coarsest (e.g. 3.0,1.5,0.7); "+
+			"number of values determines hierarchy depth")
 	return cmd
+}
+
+// parseResolutionsFlag turns the --resolutions CLI string into a
+// []float64, trimmed and validated. Empty input returns nil so the
+// caller falls back to defaultCommunityResolutions; any other input
+// must yield a non-empty list of strictly positive floats (Leiden
+// requires γ > 0 — γ = 0 degenerates to "one giant community" and
+// negative γ is rejected by GDS). Error messages name the bad token
+// so a typo is easy to spot in cortex-4i2 sweeps.
+func parseResolutionsFlag(s string) ([]float64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]float64, 0, len(parts))
+	for _, p := range parts {
+		token := strings.TrimSpace(p)
+		if token == "" {
+			continue
+		}
+		v, err := strconv.ParseFloat(token, 64)
+		if err != nil {
+			return nil, fmt.Errorf("--resolutions: %q is not a number", token)
+		}
+		if v <= 0 {
+			return nil, fmt.Errorf("--resolutions: %q must be > 0", token)
+		}
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("--resolutions: no values parsed from %q", s)
+	}
+	return out, nil
 }
 
 // communitiesDetectResult is the shape returned by --json. The
@@ -121,7 +182,7 @@ type communitiesDetectResult struct {
 // It is split out so the cobra wiring stays declarative and so a
 // future test can drive the logic with a fake bolt client without
 // dragging in cobra's flag parsing surface.
-func runCommunitiesDetect(cmd *cobra.Command, jsonFlag bool) error {
+func runCommunitiesDetect(cmd *cobra.Command, jsonFlag bool, resolutions []float64) error {
 	cfgPath := defaultConfigPath()
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -143,7 +204,7 @@ func runCommunitiesDetect(cmd *cobra.Command, jsonFlag bool) error {
 	defer func() { _ = bolt.Close(context.Background()) }()
 
 	weaviateClient := newWeaviateClient(cfg)
-	res, err := detectAndPersistCommunities(cmd.Context(), bolt, weaviateClient, weaviate.ClassEntry, communityGraphName)
+	res, err := detectAndPersistCommunities(cmd.Context(), bolt, weaviateClient, weaviate.ClassEntry, communityGraphName, resolutions)
 	if err != nil {
 		return emitAndExit(cmd, err, jsonFlag)
 	}
@@ -163,7 +224,7 @@ func runCommunitiesDetect(cmd *cobra.Command, jsonFlag bool) error {
 // and returns the per-level counts the renderer needs. The Detector
 // is constructed inline because it carries no per-call state and the
 // Detect/Persist split is the seam analyze.go already exercises.
-func detectAndPersistCommunities(ctx context.Context, client neo4j.Client, fetcher community.VectorFetcher, weaviateClass, graphName string) (*communitiesDetectResult, error) {
+func detectAndPersistCommunities(ctx context.Context, client neo4j.Client, fetcher community.VectorFetcher, weaviateClass, graphName string, resolutions []float64) (*communitiesDetectResult, error) {
 	if err := ensureCommunityProjection(ctx, client, graphName); err != nil {
 		return nil, errs.Operational("PROJECTION_FAILED",
 			"could not create or refresh GDS projection", err)
@@ -175,10 +236,13 @@ func detectAndPersistCommunities(ctx context.Context, client neo4j.Client, fetch
 		LouvainQuery: neo4j.CommunityLouvainStreamQuery,
 		TopNodeCount: 32,
 	}
+	if len(resolutions) == 0 {
+		resolutions = defaultCommunityResolutions
+	}
 	cfg := community.Config{
 		GraphName:     graphName,
-		Resolutions:   []float64{1.0, 0.5, 0.1},
-		Levels:        3,
+		Resolutions:   resolutions,
+		Levels:        len(resolutions),
 		MaxIterations: 10,
 		Tolerance:     0.0001,
 	}
