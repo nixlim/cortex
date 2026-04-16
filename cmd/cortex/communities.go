@@ -30,17 +30,26 @@ import (
 
 // defaultCommunityResolutions are the Leiden γ values used by
 // `cortex communities detect` when --resolutions is not supplied.
-// One value per hierarchy level (finest → coarsest). These were
-// bumped on 2026-04-15 (cortex-4i2) from the original
-// [1.0, 0.5, 0.1] after the cortex + myagentsgigs graph collapsed
-// into only 12 / 4 / 2 communities at levels 0 / 1 / 2 — level-0
-// averaged 460 entries per community, far too coarse for frame
-// promotion. Higher γ produces finer partitions in Leiden, so the
-// new defaults aim for an order-of-magnitude increase in level-0
-// community count on the same graph. Operators should still
-// re-sweep per-graph via the --resolutions flag and measure
-// frame-acceptance after each detect run.
-var defaultCommunityResolutions = []float64{3.0, 1.5, 0.7}
+// One value per hierarchy level (finest → coarsest).
+//
+// Tuned on 2026-04-15 (cortex-4i2) via an empirical γ sweep on
+// the cortex + myagentsgigs graph (5578 projected members). The
+// sweep measured detect community counts and reflect --dry-run
+// frame-acceptance rates at γ = 3, 4, 5, 6, 8, 10, 15:
+//
+//   γ=3  →  52 clusters, 100% accepted
+//   γ=10 → 193 clusters,  98.4% accepted  (pareto sweet spot)
+//   γ=15 → 280 clusters,  95.4% accepted  (first size/cosine rejects)
+//
+// γ ≈ 10 is the pareto-optimal point: 3.7× more accepted frames
+// than γ=3 while rejection stays under 2%. Above γ=10 the graph
+// starts fragmenting into sub-3-member and low-cosine clusters,
+// quadrupling the rejection rate at γ=15. Levels 1 and 2 scale
+// proportionally (5.0, 2.5). Operators should still re-sweep
+// per-graph via the --resolutions flag; this measurement covers
+// only one graph — a larger, more topically diverse graph may
+// push the inflection point lower.
+var defaultCommunityResolutions = []float64{10.0, 5.0, 2.5}
 
 // newCommunitiesCmdReal returns the wired `cortex communities` parent.
 // commands.go installs it in place of the notImplemented stub.

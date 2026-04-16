@@ -388,6 +388,7 @@ server this small.
 | `cortex retract`  | Write a retraction datom against an entity.                     |
 | `cortex subject`  | Manage PSI subjects (merge / alias).                            |
 | `cortex community`, `cortex communities` | Inspect Leiden communities.          |
+| `cortex communities detect`              | Run Leiden detection and persist hierarchy. `--resolutions` accepts comma-separated γ values for per-graph tuning (e.g. `--resolutions=10,5,2.5`). |
 | `cortex pin` / `unpin` / `evict` / `unevict` | Activation overrides.            |
 | `cortex export`   | Merge all segments into one tx-sorted stream.                   |
 | `cortex migrate`  | Migrate content from an external knowledge system.              |
