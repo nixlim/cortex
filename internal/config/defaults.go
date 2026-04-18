@@ -27,6 +27,45 @@ type Config struct {
 	Docker             DockerConfig             `yaml:"docker"`
 	Ollama             OllamaConfig             `yaml:"ollama"`
 	LLM                LLMConfig                `yaml:"llm"`
+	Summarise          SummariseConfig          `yaml:"summarise"`
+}
+
+// SummariseConfig turns on and tunes the continuous categorised-
+// summarisation pass (bead cortex-8sr, Pass A of the two-pass
+// categorised-context architecture). When Enabled=false (the
+// default) the pass is a no-op — analyze never builds a
+// summarise.Stage, nothing shells out to claude. When enabled, each
+// cortex analyze run after community.Refresh walks the Leiden
+// communities, hashes each community's membership, and calls the
+// Claude Code CLI per-community (skipping those whose hash still
+// matches the prior CommunityBrief) to produce curated briefs.
+//
+// Opt-in because this pass invokes a subprocess (`claude`) and
+// incurs provider cost per community; operators should decide when
+// that's worth paying for.
+type SummariseConfig struct {
+	// Enabled gates the whole pass. Default: false.
+	Enabled bool `yaml:"enabled"`
+
+	// Command is the `claude` binary name or absolute path. Empty
+	// defaults to "claude" (resolved via PATH). The CLI is invoked
+	// in reasoning-only mode: -p <prompt> --output-format json
+	// --permission-mode plan --tools "" --max-turns 1.
+	Command string `yaml:"command"`
+
+	// Model is passed to the CLI via --model. Empty falls back to
+	// the CLI's configured default.
+	Model string `yaml:"model"`
+
+	// CallTimeoutSeconds bounds one per-community or stitch LLM
+	// call. 0 uses summarise.defaultCallTimeout (120s).
+	CallTimeoutSeconds int `yaml:"call_timeout_seconds"`
+
+	// Concurrency is the number of in-flight per-community calls.
+	// 0 uses summarise.defaultConcurrency (2). Raise on faster
+	// hardware / wider rate-limit budgets; remember each worker
+	// spawns a fresh subprocess.
+	Concurrency int `yaml:"concurrency"`
 }
 
 // LLMConfig selects the generation provider and carries the
