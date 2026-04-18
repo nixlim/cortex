@@ -2,11 +2,15 @@
 // validates operator custom frames loaded from ~/.cortex/frames/*.json at
 // startup.
 //
-// There are exactly 11 built-in types, split into three that agents may
+// There are exactly 13 built-in types, split into three that agents may
 // write directly via `cortex observe` (Observation, SessionReflection,
-// ObservedRace) and eight that are reflection-only (BugPattern,
+// ObservedRace) and ten that are reflection-only (BugPattern,
 // DesignDecision, RetryPattern, ReliabilityPattern, SecurityPattern,
-// LibraryBehavior, Principle, ArchitectureNote).
+// LibraryBehavior, Principle, ArchitectureNote, CommunityBrief,
+// ProjectBrief). CommunityBrief and ProjectBrief are produced by the
+// continuous categorised-summarisation pass (bead cortex-8sr) and
+// carry the membership-hash-gated community digests consumed by
+// decision-time reflect (bead cortex-jr9).
 //
 // Operators may add custom frame types by dropping JSON files into
 // ~/.cortex/frames/. A custom file that redefines a built-in name is
@@ -56,8 +60,12 @@ var (
 //go:embed builtin/*.json
 var builtinFS embed.FS
 
-// BuiltinNames lists the exact 11 Phase 1 built-in frame names in the
-// canonical order specified in cortex-spec.md's Frame Type Registry table.
+// BuiltinNames lists the built-in frame names in the canonical order
+// specified in cortex-spec.md's Frame Type Registry table, followed by
+// the summarisation frames CommunityBrief and ProjectBrief appended
+// for cortex-z33. Any addition here MUST be accompanied by a matching
+// internal/frames/builtin/<name>.json — LoadBuiltin asserts the sets
+// agree.
 var BuiltinNames = []string{
 	"Observation",
 	"SessionReflection",
@@ -70,6 +78,8 @@ var BuiltinNames = []string{
 	"LibraryBehavior",
 	"Principle",
 	"ArchitectureNote",
+	"CommunityBrief",
+	"ProjectBrief",
 }
 
 // Registry holds the loaded frame schemas.

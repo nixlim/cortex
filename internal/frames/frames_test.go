@@ -8,18 +8,18 @@ import (
 	"testing"
 )
 
-func TestLoadBuiltinHasExactly11Types(t *testing.T) {
+func TestLoadBuiltinMatchesNames(t *testing.T) {
 	r, err := LoadBuiltin()
 	if err != nil {
 		t.Fatalf("LoadBuiltin: %v", err)
 	}
-	if r.Len() != 11 {
-		t.Fatalf("expected 11 built-ins, got %d", r.Len())
+	if r.Len() != len(BuiltinNames) {
+		t.Fatalf("expected %d built-ins, got %d", len(BuiltinNames), r.Len())
 	}
 	want := append([]string(nil), BuiltinNames...)
 	sort.Strings(want)
 
-	got := make([]string, 0, 11)
+	got := make([]string, 0, len(BuiltinNames))
 	for _, n := range BuiltinNames {
 		if _, ok := r.Get(n); !ok {
 			t.Errorf("missing built-in %q", n)
@@ -59,6 +59,37 @@ func TestBuiltinSchemaShapes(t *testing.T) {
 			t.Errorf("%s version missing", n)
 		}
 	}
+	// CommunityBrief: semantic, reflection-only, membership_hash required
+	// so the summariser idempotency gate (bead cortex-8sr) has a slot to
+	// populate and compare against on subsequent runs.
+	cb, _ := r.Get("CommunityBrief")
+	if cb.Store != StoreSemantic || !cb.ReflectionOnly {
+		t.Errorf("CommunityBrief shape wrong: %+v", cb)
+	}
+	if !containsSlot(cb.Required, "membership_hash") {
+		t.Errorf("CommunityBrief must require membership_hash for idempotency: %+v", cb.Required)
+	}
+	if !containsSlot(cb.Required, "exemplar_entry_id") {
+		t.Errorf("CommunityBrief must require exemplar_entry_id for promoted-recall: %+v", cb.Required)
+	}
+	// ProjectBrief: semantic, reflection-only, community_ids required so
+	// the stitch output can be traced back to the briefs it consumed.
+	pb, _ := r.Get("ProjectBrief")
+	if pb.Store != StoreSemantic || !pb.ReflectionOnly {
+		t.Errorf("ProjectBrief shape wrong: %+v", pb)
+	}
+	if !containsSlot(pb.Required, "community_ids") {
+		t.Errorf("ProjectBrief must require community_ids: %+v", pb.Required)
+	}
+}
+
+func containsSlot(slots []string, name string) bool {
+	for _, s := range slots {
+		if s == name {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCheckObserveKind(t *testing.T) {
@@ -73,7 +104,7 @@ func TestCheckObserveKind(t *testing.T) {
 		}
 	}
 	// Reflection-only kinds.
-	for _, n := range []string{"BugPattern", "DesignDecision", "RetryPattern", "ReliabilityPattern", "SecurityPattern", "LibraryBehavior", "Principle", "ArchitectureNote"} {
+	for _, n := range []string{"BugPattern", "DesignDecision", "RetryPattern", "ReliabilityPattern", "SecurityPattern", "LibraryBehavior", "Principle", "ArchitectureNote", "CommunityBrief", "ProjectBrief"} {
 		err := r.CheckObserveKind(n)
 		if !errors.Is(err, ErrReflectionOnly) {
 			t.Errorf("CheckObserveKind(%q) = %v; want ErrReflectionOnly", n, err)
@@ -114,8 +145,8 @@ func TestCustomFrameValid(t *testing.T) {
 	if _, ok := r.Get("TeamConvention"); !ok {
 		t.Error("custom frame not loaded")
 	}
-	if r.Len() != 12 {
-		t.Errorf("expected 12 frames (11 builtin + 1 custom), got %d", r.Len())
+	if r.Len() != len(BuiltinNames)+1 {
+		t.Errorf("expected %d frames (builtin + 1 custom), got %d", len(BuiltinNames)+1, r.Len())
 	}
 	if r.IsBuiltin("TeamConvention") {
 		t.Error("custom frame should not be flagged as builtin")

@@ -1,0 +1,8 @@
+{
+  "name": "ProjectBrief",
+  "store": "semantic",
+  "required": ["project", "generated_at", "community_ids", "stitched_narrative"],
+  "optional": ["top_themes", "cross_cluster_concepts", "open_questions_project", "coverage_ratio"],
+  "reflection_only": true,
+  "version": 1
+}

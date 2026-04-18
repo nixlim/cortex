@@ -1,0 +1,8 @@
+{
+  "name": "CommunityBrief",
+  "store": "semantic",
+  "required": ["community_id", "membership_hash", "theme_label", "canonical_insight", "exemplar_entry_id", "summary"],
+  "optional": ["alternate_exemplars", "open_questions", "suggested_conflicts", "concept_tags", "coverage_notes"],
+  "reflection_only": true,
+  "version": 1
+}
