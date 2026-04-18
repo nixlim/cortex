@@ -22,11 +22,29 @@ import (
 	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/errs"
 	"github.com/nixlim/cortex/internal/infra"
+	"github.com/nixlim/cortex/internal/llm"
 	"github.com/nixlim/cortex/internal/neo4j"
 	"github.com/nixlim/cortex/internal/ollama"
 	"github.com/nixlim/cortex/internal/weaviate"
 	"github.com/spf13/cobra"
 )
+
+// generationModelForProvider returns the Ollama generation model name
+// that the readiness contract should require, given the configured
+// LLM provider. When the provider is a remote one (anthropic, openai,
+// openrouter), the local generation model is never invoked — only
+// embeddings are pinned to Ollama (FR-051) — so requiring its
+// presence would fail cortex up for operators with a valid remote
+// setup. Returning "" opts the contract out of the check; the
+// contract (infra.UpOptions.GenerationModel doc + OllamaModelCheck)
+// already treats empty as "skip".
+func generationModelForProvider(cfg config.Config) string {
+	provider := cfg.LLM.Provider
+	if provider == "" || provider == llm.ProviderOllama {
+		return defaultGenerationModel
+	}
+	return ""
+}
 
 // defaultEmbeddingModel / defaultGenerationModel are the Phase 1
 // pinned model names from cortex-spec.md §"Pinned Service Versions".
@@ -103,7 +121,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		ConfigPath:      configPath,
 		StartupBudget:   infra.DefaultStartupBudget,
 		EmbeddingModel:  defaultEmbeddingModel,
-		GenerationModel: defaultGenerationModel,
+		GenerationModel: generationModelForProvider(cfg),
 		Docker:          infra.ExecDocker{},
 		Weaviate:        weaviateClient,
 		Neo4j:           neo4jAdapter{c: neoClient},

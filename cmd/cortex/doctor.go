@@ -94,7 +94,7 @@ func runDoctor(cmd *cobra.Command, _ []string, quick, full, jsonOut bool) error 
 		infra.OllamaModelCheck(
 			ollamaAdapter{c: ollamaClient, endpoint: cfg.Endpoints.Ollama},
 			defaultEmbeddingModel,
-			defaultGenerationModel,
+			generationModelForProvider(cfg),
 		),
 		llmProviderCheck(cfg),
 		infra.LogQuarantineCheck(cortexHome),
