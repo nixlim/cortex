@@ -45,12 +45,20 @@ func (r *ExecRunner) Run(ctx context.Context, req Request) (Response, error) {
 		cmdName = "claude"
 	}
 
+	// --max-turns 2 lets the assistant close cleanly after a
+	// StructuredOutput tool_use: turn 1 emits the tool_use; the
+	// runtime injects "Structured output provided successfully" as a
+	// tool_result; turn 2 lets the assistant finish with
+	// stop_reason=end_turn. With --max-turns 1, even successful
+	// structured-output calls surface as is_error=true with
+	// subtype=error_max_turns because the assistant was cut off before
+	// it could stop cleanly.
 	args := []string{
 		"-p", req.Prompt,
 		"--output-format", "json",
 		"--permission-mode", "plan",
 		"--tools", "",
-		"--max-turns", "1",
+		"--max-turns", "2",
 	}
 	if req.Model != "" {
 		args = append(args, "--model", req.Model)
@@ -123,34 +131,162 @@ func (r *ExecRunner) Run(ctx context.Context, req Request) (Response, error) {
 	return resp, nil
 }
 
-// cliEnvelope mirrors the shape of `claude -p --output-format json`
-// output. Only the fields cortex harvests are decoded; unknown fields
-// are ignored so a CLI version bump does not break us.
+// cliEnvelope is the normalised result of parsing whatever shape the
+// claude CLI emitted on stdout. Cortex coalesces two on-the-wire
+// formats into this one struct:
+//
+//   - Legacy single-object envelope:
+//     {"result":"...","structured_output":{...},"is_error":false,...}
+//   - Current array-of-events (Claude Code ≥2.x):
+//     [{"type":"system",...},{"type":"assistant",...},{"type":"result",...}]
+//
+// Only the fields cortex harvests are decoded; unknown ones are
+// ignored so a CLI version bump does not break us.
 type cliEnvelope struct {
+	Result           string
+	StructuredOutput json.RawMessage
+	SessionID        string
+	CostUSD          float64
+	IsError          bool
+	Subtype          string // e.g. "error_max_turns"; only meaningful on array format
+	Usage            struct {
+		InputTokens  int64
+		OutputTokens int64
+	}
+}
+
+// parseJSONEnvelope decodes the stdout JSON envelope. Auto-detects
+// array-of-events vs single-object format so the wrapper works across
+// claude CLI versions without a configuration knob.
+func parseJSONEnvelope(stdout []byte) (cliEnvelope, error) {
+	trimmed := bytes.TrimSpace(stdout)
+	if len(trimmed) == 0 {
+		return cliEnvelope{}, fmt.Errorf("empty stdout")
+	}
+	if trimmed[0] == '[' {
+		return parseEventStream(trimmed)
+	}
+	return parseLegacyEnvelope(trimmed)
+}
+
+// legacyEnvelope is the claude ≤1.x single-object shape.
+type legacyEnvelope struct {
 	Result           string          `json:"result"`
 	StructuredOutput json.RawMessage `json:"structured_output,omitempty"`
-	SessionID       string          `json:"session_id,omitempty"`
-	CostUSD         float64         `json:"cost,omitempty"`
-	CostUSDLegacy   float64         `json:"cost_usd,omitempty"` // older CLI versions
-	IsError         bool            `json:"is_error,omitempty"`
-	Usage           struct {
+	SessionID        string          `json:"session_id,omitempty"`
+	CostUSD          float64         `json:"cost,omitempty"`
+	CostUSDLegacy    float64         `json:"cost_usd,omitempty"` // older CLI versions
+	IsError          bool            `json:"is_error,omitempty"`
+	Usage            struct {
 		InputTokens  int64 `json:"input_tokens"`
 		OutputTokens int64 `json:"output_tokens"`
 	} `json:"usage,omitempty"`
 }
 
-// parseJSONEnvelope decodes the stdout JSON envelope. It coalesces
-// the current `cost` and legacy `cost_usd` fields so we survive the
-// field rename observed between Claude Code CLI versions.
-func parseJSONEnvelope(stdout []byte) (cliEnvelope, error) {
-	var env cliEnvelope
-	if err := json.Unmarshal(stdout, &env); err != nil {
-		return env, fmt.Errorf("decode envelope: %w", err)
+func parseLegacyEnvelope(stdout []byte) (cliEnvelope, error) {
+	var legacy legacyEnvelope
+	if err := json.Unmarshal(stdout, &legacy); err != nil {
+		return cliEnvelope{}, fmt.Errorf("decode envelope: %w", err)
 	}
-	if env.CostUSD == 0 && env.CostUSDLegacy != 0 {
-		env.CostUSD = env.CostUSDLegacy
+	if legacy.CostUSD == 0 && legacy.CostUSDLegacy != 0 {
+		legacy.CostUSD = legacy.CostUSDLegacy
+	}
+	env := cliEnvelope{
+		Result:           legacy.Result,
+		StructuredOutput: legacy.StructuredOutput,
+		SessionID:        legacy.SessionID,
+		CostUSD:          legacy.CostUSD,
+		IsError:          legacy.IsError,
+	}
+	env.Usage.InputTokens = legacy.Usage.InputTokens
+	env.Usage.OutputTokens = legacy.Usage.OutputTokens
+	return env, nil
+}
+
+// eventEnvelope is one entry in the array the current claude CLI
+// emits with --output-format json. Only the fields we consume are
+// typed; everything else rides in json.RawMessage so we can pull it
+// out event-by-event.
+type eventEnvelope struct {
+	Type    string          `json:"type"`
+	Subtype string          `json:"subtype,omitempty"`
+	Message json.RawMessage `json:"message,omitempty"`
+
+	// Fields populated only on {"type":"result"} entries.
+	SessionID    string  `json:"session_id,omitempty"`
+	IsError      bool    `json:"is_error,omitempty"`
+	TotalCostUSD float64 `json:"total_cost_usd,omitempty"`
+	CostUSD      float64 `json:"cost_usd,omitempty"`
+	Result       string  `json:"result,omitempty"`
+	Usage        struct {
+		InputTokens  int64 `json:"input_tokens"`
+		OutputTokens int64 `json:"output_tokens"`
+	} `json:"usage,omitempty"`
+}
+
+// parseEventStream walks the array-of-events format, harvesting the
+// structured output from assistant tool_use blocks named
+// "StructuredOutput" and the metadata from the terminal result event.
+// A successful structured-output call that ends with
+// subtype=error_max_turns is treated as success: the structured
+// output was delivered before the turn limit bit.
+func parseEventStream(stdout []byte) (cliEnvelope, error) {
+	var events []eventEnvelope
+	if err := json.Unmarshal(stdout, &events); err != nil {
+		return cliEnvelope{}, fmt.Errorf("decode event stream: %w", err)
+	}
+	var env cliEnvelope
+	for _, ev := range events {
+		switch ev.Type {
+		case "assistant":
+			if so, ok := extractStructuredOutput(ev.Message); ok && env.StructuredOutput == nil {
+				env.StructuredOutput = so
+			}
+		case "result":
+			env.SessionID = ev.SessionID
+			env.Result = ev.Result
+			env.IsError = ev.IsError
+			env.Subtype = ev.Subtype
+			env.CostUSD = ev.TotalCostUSD
+			if env.CostUSD == 0 && ev.CostUSD != 0 {
+				env.CostUSD = ev.CostUSD
+			}
+			env.Usage.InputTokens = ev.Usage.InputTokens
+			env.Usage.OutputTokens = ev.Usage.OutputTokens
+		}
+	}
+	// A max-turns termination AFTER the model has already emitted the
+	// StructuredOutput tool_use is functionally a success — we have
+	// the schema-validated JSON we asked for.
+	if env.IsError && env.Subtype == "error_max_turns" && env.StructuredOutput != nil {
+		env.IsError = false
 	}
 	return env, nil
+}
+
+// extractStructuredOutput pulls the first StructuredOutput tool_use
+// input from an assistant message, JSON-encoded. Returns (nil, false)
+// if the message does not carry one.
+func extractStructuredOutput(raw json.RawMessage) (json.RawMessage, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var msg struct {
+		Content []struct {
+			Type  string          `json:"type"`
+			Name  string          `json:"name,omitempty"`
+			Input json.RawMessage `json:"input,omitempty"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return nil, false
+	}
+	for _, blk := range msg.Content {
+		if blk.Type == "tool_use" && blk.Name == "StructuredOutput" && len(blk.Input) > 0 {
+			return blk.Input, true
+		}
+	}
+	return nil, false
 }
 
 // classifyStderr inspects the subprocess's stderr for patterns that

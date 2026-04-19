@@ -137,6 +137,74 @@ func TestExecRunner_IsErrorEnvelope(t *testing.T) {
 	}
 }
 
+// TestExecRunner_EventStreamArray exercises the current claude CLI
+// output format: a JSON array of events. Structured output lives on
+// an assistant tool_use block; metadata lives on a terminal result
+// event. This is the shape cortex-8sr's summariser actually depends
+// on at runtime — the legacy single-object envelope is a historical
+// fallback.
+func TestExecRunner_EventStreamArray(t *testing.T) {
+	stdout := `[
+{"type":"system","subtype":"init","session_id":"sess-42"},
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"StructuredOutput","input":{"label":"hi","ok":true}}]}},
+{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}},
+{"type":"result","subtype":"success","is_error":false,"session_id":"sess-42","total_cost_usd":0.012,"usage":{"input_tokens":123,"output_tokens":4}}
+]`
+	r := &ExecRunner{Command: stubScript(t, stdout, "", 0)}
+	resp, err := r.Run(context.Background(), Request{Prompt: "p", SchemaJSON: `{"type":"object"}`})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.SessionID != "sess-42" {
+		t.Errorf("session_id: got %q", resp.SessionID)
+	}
+	if resp.CostUSD != 0.012 {
+		t.Errorf("cost: got %v want 0.012", resp.CostUSD)
+	}
+	if resp.InputTokens != 123 || resp.OutputTokens != 4 {
+		t.Errorf("tokens: in=%d out=%d", resp.InputTokens, resp.OutputTokens)
+	}
+	var so map[string]any
+	if err := json.Unmarshal(resp.StructuredOutput, &so); err != nil {
+		t.Fatalf("structured_output not parseable: %v", err)
+	}
+	if so["label"] != "hi" || so["ok"] != true {
+		t.Errorf("structured_output contents: got %v", so)
+	}
+}
+
+// TestExecRunner_EventStreamMaxTurnsSuccess: when the CLI reports
+// is_error=true with subtype=error_max_turns, but a StructuredOutput
+// tool_use already emitted the schema-validated JSON, the wrapper
+// MUST surface success — the payload we asked for was delivered,
+// the assistant just didn't get another turn to say "done."
+func TestExecRunner_EventStreamMaxTurnsSuccess(t *testing.T) {
+	stdout := `[
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"StructuredOutput","input":{"label":"ok"}}]}},
+{"type":"user","message":{"content":[{"type":"tool_result","content":"Structured output provided successfully"}]}},
+{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s","total_cost_usd":0.001}
+]`
+	r := &ExecRunner{Command: stubScript(t, stdout, "", 0)}
+	resp, err := r.Run(context.Background(), Request{Prompt: "p", SchemaJSON: `{"type":"object"}`})
+	if err != nil {
+		t.Fatalf("max_turns WITH structured output must be success, got %v", err)
+	}
+	if resp.StructuredOutput == nil {
+		t.Fatal("structured_output should have been captured from the tool_use block")
+	}
+}
+
+// TestExecRunner_EventStreamGenuineError: is_error=true on the result
+// event WITHOUT an accompanying structured output is still a crash.
+func TestExecRunner_EventStreamGenuineError(t *testing.T) {
+	stdout := `[{"type":"result","subtype":"error_during_execution","is_error":true,"result":"model refused"}]`
+	r := &ExecRunner{Command: stubScript(t, stdout, "", 0)}
+	_, err := r.Run(context.Background(), Request{Prompt: "p"})
+	if !errors.Is(err, ErrCLICrash) {
+		t.Fatalf("expected ErrCLICrash, got %v", err)
+	}
+}
+
 // helpers
 
 func itoa(n int) string {
