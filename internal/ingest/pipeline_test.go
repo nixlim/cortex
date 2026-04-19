@@ -626,6 +626,311 @@ func TestIngest_OversizeGateDisabledWhenZero(t *testing.T) {
 	}
 }
 
+// --- delta detection fakes -----------------------------------------------
+
+type fakeRetracter struct {
+	calls []struct {
+		project   string
+		moduleIDs []string
+	}
+	err error
+}
+
+func (f *fakeRetracter) RetractModules(_ context.Context, project string, moduleIDs []string) error {
+	f.calls = append(f.calls, struct {
+		project   string
+		moduleIDs []string
+	}{project, moduleIDs})
+	return f.err
+}
+
+// staticDiff returns a DiffFunc that always returns the given result.
+func staticDiff(d DiffResult) DiffFunc {
+	return func(_, _, _ string) (DiffResult, error) { return d, nil }
+}
+
+// --- delta detection tests -----------------------------------------------
+
+// TestIngest_DeltaDetection_ChangedFileEvictsModule confirms that when
+// a file changes between commits, its module is evicted from
+// CompletedModuleIDs and re-ingested.
+func TestIngest_DeltaDetection_ChangedFileEvictsModule(t *testing.T) {
+	p, sum, wr, _, st, _ := newTestPipeline(threePackageGoFixture())
+	// Pre-seed: all three modules already ingested at commit "aaa".
+	st.byProject = map[string]ProjectState{
+		"fixture": {
+			ProjectName:   "fixture",
+			LastCommitSHA: "aaa",
+			CompletedModuleIDs: []string{
+				"go:per-package:bar",
+				"go:per-package:baz",
+				"go:per-package:foo",
+			},
+			TotalEntriesWritten: 3,
+		},
+	}
+	// One file in foo/ changed between aaa and bbb.
+	p.Differ = staticDiff(DiffResult{Changed: []string{"foo/a.go"}})
+	p.Retracter = &fakeRetracter{}
+
+	res, err := p.Ingest(context.Background(), Request{
+		ProjectRoot: "/root",
+		ProjectName: "fixture",
+		CommitSHA:   "bbb",
+	})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	// foo was evicted → re-ingested; bar and baz skipped.
+	if len(res.EvictedModules) != 1 || res.EvictedModules[0] != "go:per-package:foo" {
+		t.Fatalf("evicted: got %v, want [go:per-package:foo]", res.EvictedModules)
+	}
+	if len(res.EntryIDs) != 1 {
+		t.Fatalf("entries written: got %d want 1", len(res.EntryIDs))
+	}
+	if len(res.SkippedModules) != 2 {
+		t.Fatalf("skipped: got %d want 2", len(res.SkippedModules))
+	}
+	if sum.calls != 1 {
+		t.Fatalf("summarizer calls: got %d want 1", sum.calls)
+	}
+	if len(wr.writes) != 1 || wr.writes[0].ModuleID != "go:per-package:foo" {
+		t.Fatalf("writer target: got %v", wr.writes)
+	}
+	// State should advance to new commit.
+	saved := st.byProject["fixture"]
+	if saved.LastCommitSHA != "bbb" {
+		t.Fatalf("LastCommitSHA: got %s want bbb", saved.LastCommitSHA)
+	}
+}
+
+// TestIngest_DeltaDetection_DeletedFileRetractsModule confirms that
+// when all files in a module are deleted, the module is retracted and
+// removed from CompletedModuleIDs.
+func TestIngest_DeltaDetection_DeletedFileRetractsModule(t *testing.T) {
+	// Walk returns only foo and bar — baz's file was deleted.
+	files := []languages.File{
+		{AbsPath: "/root/foo/a.go", RelPath: "foo/a.go"},
+		{AbsPath: "/root/foo/b.go", RelPath: "foo/b.go"},
+		{AbsPath: "/root/bar/c.go", RelPath: "bar/c.go"},
+	}
+	p, _, _, _, st, _ := newTestPipeline(files)
+	ret := &fakeRetracter{}
+	st.byProject = map[string]ProjectState{
+		"fixture": {
+			ProjectName:   "fixture",
+			LastCommitSHA: "aaa",
+			CompletedModuleIDs: []string{
+				"go:per-package:bar",
+				"go:per-package:baz",
+				"go:per-package:foo",
+			},
+			TotalEntriesWritten: 3,
+		},
+	}
+	// baz/d.go was deleted between aaa and bbb.
+	p.Differ = staticDiff(DiffResult{Deleted: []string{"baz/d.go"}})
+	p.Retracter = ret
+
+	res, err := p.Ingest(context.Background(), Request{
+		ProjectRoot: "/root",
+		ProjectName: "fixture",
+		CommitSHA:   "bbb",
+	})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	// baz retracted.
+	if len(res.RetractedModules) != 1 || res.RetractedModules[0] != "go:per-package:baz" {
+		t.Fatalf("retracted: got %v, want [go:per-package:baz]", res.RetractedModules)
+	}
+	if len(ret.calls) != 1 {
+		t.Fatalf("retracter calls: got %d want 1", len(ret.calls))
+	}
+	if ret.calls[0].project != "fixture" {
+		t.Fatalf("retracter project: got %s want fixture", ret.calls[0].project)
+	}
+	// baz should be removed from CompletedModuleIDs.
+	saved := st.byProject["fixture"]
+	for _, id := range saved.CompletedModuleIDs {
+		if id == "go:per-package:baz" {
+			t.Fatal("baz should have been removed from CompletedModuleIDs")
+		}
+	}
+	// foo and bar remain untouched (no new entries).
+	if len(res.SkippedModules) != 2 {
+		t.Fatalf("skipped: got %d want 2", len(res.SkippedModules))
+	}
+}
+
+// TestIngest_DeltaDetection_MixedChangedAndDeleted confirms that when
+// one module has a changed file and another has a deleted file, both
+// are evicted but only the deleted-only module is retracted.
+func TestIngest_DeltaDetection_MixedChangedAndDeleted(t *testing.T) {
+	// Walk returns only foo — bar is unchanged, baz was deleted.
+	files := []languages.File{
+		{AbsPath: "/root/foo/a.go", RelPath: "foo/a.go"},
+		{AbsPath: "/root/foo/b.go", RelPath: "foo/b.go"},
+		{AbsPath: "/root/bar/c.go", RelPath: "bar/c.go"},
+	}
+	p, _, wr, _, st, _ := newTestPipeline(files)
+	ret := &fakeRetracter{}
+	st.byProject = map[string]ProjectState{
+		"fixture": {
+			ProjectName:   "fixture",
+			LastCommitSHA: "aaa",
+			CompletedModuleIDs: []string{
+				"go:per-package:bar",
+				"go:per-package:baz",
+				"go:per-package:foo",
+			},
+			TotalEntriesWritten: 3,
+		},
+	}
+	// foo/a.go changed, baz/d.go deleted.
+	p.Differ = staticDiff(DiffResult{
+		Changed: []string{"foo/a.go"},
+		Deleted: []string{"baz/d.go"},
+	})
+	p.Retracter = ret
+
+	res, err := p.Ingest(context.Background(), Request{
+		ProjectRoot: "/root",
+		ProjectName: "fixture",
+		CommitSHA:   "bbb",
+	})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	// Two modules evicted: foo (changed) and baz (deleted).
+	if len(res.EvictedModules) != 2 {
+		t.Fatalf("evicted: got %v, want 2 modules", res.EvictedModules)
+	}
+	// Only baz retracted (foo has changed files, not all deleted).
+	if len(res.RetractedModules) != 1 || res.RetractedModules[0] != "go:per-package:baz" {
+		t.Fatalf("retracted: got %v, want [go:per-package:baz]", res.RetractedModules)
+	}
+	// foo re-ingested (1 entry), bar skipped, baz retracted.
+	if len(wr.writes) != 1 || wr.writes[0].ModuleID != "go:per-package:foo" {
+		t.Fatalf("writer: got %v", wr.writes)
+	}
+	if len(res.SkippedModules) != 1 || res.SkippedModules[0] != "go:per-package:bar" {
+		t.Fatalf("skipped: got %v, want [go:per-package:bar]", res.SkippedModules)
+	}
+}
+
+// TestIngest_DeltaDetection_SameSHANoOp confirms that when the
+// commit SHA hasn't changed, delta detection is skipped entirely.
+func TestIngest_DeltaDetection_SameSHANoOp(t *testing.T) {
+	p, sum, _, _, st, _ := newTestPipeline(threePackageGoFixture())
+	st.byProject = map[string]ProjectState{
+		"fixture": {
+			ProjectName:   "fixture",
+			LastCommitSHA: "aaa",
+			CompletedModuleIDs: []string{
+				"go:per-package:bar",
+				"go:per-package:baz",
+				"go:per-package:foo",
+			},
+			TotalEntriesWritten: 3,
+		},
+	}
+	diffCalled := false
+	p.Differ = func(_, _, _ string) (DiffResult, error) {
+		diffCalled = true
+		return DiffResult{}, nil
+	}
+
+	res, err := p.Ingest(context.Background(), Request{
+		ProjectRoot: "/root",
+		ProjectName: "fixture",
+		CommitSHA:   "aaa", // same as state
+	})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if diffCalled {
+		t.Fatal("differ should not be called when SHA is unchanged")
+	}
+	if sum.calls != 0 {
+		t.Fatalf("summarizer should not be called, got %d", sum.calls)
+	}
+	if len(res.EvictedModules) != 0 {
+		t.Fatalf("no evictions expected, got %v", res.EvictedModules)
+	}
+}
+
+// TestIngest_DeltaDetection_NoDifferPreservesLegacy confirms that when
+// Differ is nil, the pipeline uses legacy full-walk idempotent behavior.
+func TestIngest_DeltaDetection_NoDifferPreservesLegacy(t *testing.T) {
+	p, sum, _, _, st, _ := newTestPipeline(threePackageGoFixture())
+	st.byProject = map[string]ProjectState{
+		"fixture": {
+			ProjectName:   "fixture",
+			LastCommitSHA: "aaa",
+			CompletedModuleIDs: []string{
+				"go:per-package:bar",
+				"go:per-package:baz",
+				"go:per-package:foo",
+			},
+			TotalEntriesWritten: 3,
+		},
+	}
+	// Differ is nil — legacy behavior.
+	res, err := p.Ingest(context.Background(), Request{
+		ProjectRoot: "/root",
+		ProjectName: "fixture",
+		CommitSHA:   "bbb",
+	})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	// All modules already completed, no diff → all skipped.
+	if sum.calls != 0 {
+		t.Fatalf("summarizer calls: got %d want 0", sum.calls)
+	}
+	if len(res.SkippedModules) != 3 {
+		t.Fatalf("skipped: got %d want 3", len(res.SkippedModules))
+	}
+}
+
+// TestIngest_DeltaDetection_DryRunSkipsRetraction confirms that
+// --dry-run evicts modules but does NOT call the retracter.
+func TestIngest_DeltaDetection_DryRunSkipsRetraction(t *testing.T) {
+	p, _, _, _, st, _ := newTestPipeline(threePackageGoFixture())
+	ret := &fakeRetracter{}
+	st.byProject = map[string]ProjectState{
+		"fixture": {
+			ProjectName:   "fixture",
+			LastCommitSHA: "aaa",
+			CompletedModuleIDs: []string{
+				"go:per-package:bar",
+				"go:per-package:baz",
+				"go:per-package:foo",
+			},
+		},
+	}
+	p.Differ = staticDiff(DiffResult{Deleted: []string{"baz/d.go"}})
+	p.Retracter = ret
+
+	res, err := p.Ingest(context.Background(), Request{
+		ProjectRoot: "/root",
+		ProjectName: "fixture",
+		CommitSHA:   "bbb",
+		DryRun:      true,
+	})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if len(ret.calls) != 0 {
+		t.Fatalf("retracter should not be called in dry-run, got %d calls", len(ret.calls))
+	}
+	// Eviction still happens (visible in result) so dry-run shows what WOULD change.
+	if len(res.EvictedModules) != 1 {
+		t.Fatalf("evicted: got %v, want 1", res.EvictedModules)
+	}
+}
+
 // TestIngest_PostReflectSkippedOnNoOp confirms the reflection hook
 // does NOT run when there are no new entries (so a no-op resume does
 // not trigger empty reflection windows).

@@ -181,15 +181,17 @@ type Request struct {
 // Result is the full output of one Ingest call. EntryIDs lists only
 // entries WRITTEN during this run (not the superset across all runs).
 type Result struct {
-	ProjectName    string
-	TrailID        string // empty when no new entries were written
-	EntryIDs       []string
-	Modules        []Module
-	SkippedModules []string // module ids that were already ingested
-	SummaryErrors  []ModuleError
-	StartedAt      time.Time
-	FinishedAt     time.Time
-	State          ProjectState // the state written back at the end
+	ProjectName      string
+	TrailID          string // empty when no new entries were written
+	EntryIDs         []string
+	Modules          []Module
+	SkippedModules   []string // module ids that were already ingested
+	EvictedModules   []string // module ids evicted by delta detection
+	RetractedModules []string // module ids retracted (all files deleted)
+	SummaryErrors    []ModuleError
+	StartedAt        time.Time
+	FinishedAt       time.Time
+	State            ProjectState // the state written back at the end
 }
 
 // ModuleError records a per-module failure (summarizer error, empty
@@ -230,6 +232,17 @@ type Pipeline struct {
 	// overhead and the structured-output response. Zero disables the
 	// gate (default; preserves existing tests and small projects).
 	MaxModuleBytes int64
+	// Differ is the optional git-diff seam for incremental re-ingest
+	// (FR-023). When non-nil and the request carries a CommitSHA that
+	// differs from state.LastCommitSHA, Ingest diffs the two commits
+	// to find changed and deleted files, evicts affected modules from
+	// CompletedModuleIDs so they are re-processed, and retracts entries
+	// for modules whose files were all deleted. nil = no delta
+	// detection (preserves Phase 1 full-walk idempotent behavior).
+	Differ DiffFunc
+	// Retracter emits retraction datoms for deleted-file modules.
+	// Required when Differ is set; ignored otherwise.
+	Retracter Retracter
 }
 
 // ProgressEvent carries one per-module completion signal from the
@@ -266,6 +279,27 @@ type ProgressEvent struct {
 // walker.Walk via a tiny adapter.
 type WalkerFunc func(root string, fn func(languages.File) error) error
 
+// DiffResult holds the output of a git diff between two commits.
+// Changed lists relative paths of files that were added or modified.
+// Deleted lists relative paths of files that were removed.
+type DiffResult struct {
+	Changed []string
+	Deleted []string
+}
+
+// DiffFunc computes the set of changed and deleted files between two
+// commits in a project root. Production wires it to git diff
+// --name-status; tests supply a canned result.
+type DiffFunc func(projectRoot, oldSHA, newSHA string) (DiffResult, error)
+
+// Retracter emits retraction datoms for entries that were derived from
+// modules that no longer exist (all constituent files deleted). The
+// implementation looks up entries by their module facet and writes
+// OpRetract datoms.
+type Retracter interface {
+	RetractModules(ctx context.Context, projectName string, moduleIDs []string) error
+}
+
 // Ingest runs the full ingest sequence. Return values follow the
 // Cortex error envelope: validation failures become KindValidation,
 // operational failures become KindOperational, and per-module errors
@@ -296,6 +330,36 @@ func (p *Pipeline) Ingest(ctx context.Context, req Request) (*Result, error) {
 		ProjectName: req.ProjectName,
 		StartedAt:   started,
 		State:       state,
+	}
+
+	// --- delta detection (FR-023) ----------------------------------------
+	// When both old and new commit SHAs are available and a Differ is
+	// wired, diff the two commits to find changed/deleted files, map
+	// them to module IDs via the same grouping logic, evict affected
+	// modules from CompletedModuleIDs so they are re-processed, and
+	// retract entries for modules whose files were all deleted.
+	if p.Differ != nil && req.CommitSHA != "" && state.LastCommitSHA != "" &&
+		req.CommitSHA != state.LastCommitSHA {
+		diff, err := p.Differ(req.ProjectRoot, state.LastCommitSHA, req.CommitSHA)
+		if err != nil {
+			return res, errs.Operational("DIFF_FAILED",
+				"could not diff commits for incremental ingest", err)
+		}
+		evict, retract := p.computeDelta(diff)
+		if len(evict) > 0 {
+			state.CompletedModuleIDs = removeAll(state.CompletedModuleIDs, evict)
+			res.EvictedModules = evict
+		}
+		if len(retract) > 0 && p.Retracter != nil && !req.DryRun {
+			if err := p.Retracter.RetractModules(ctx, req.ProjectName, retract); err != nil {
+				return res, errs.Operational("RETRACT_FAILED",
+					"could not retract deleted-file modules", err)
+			}
+			// Also remove retracted modules from completed so stale
+			// state does not block future ingests of re-created files.
+			state.CompletedModuleIDs = removeAll(state.CompletedModuleIDs, retract)
+			res.RetractedModules = retract
+		}
 	}
 
 	// Stamp the start-of-run marker and persist it immediately so
@@ -649,6 +713,89 @@ func fileRelPaths(m Module) []string {
 	out := make([]string, 0, len(m.Files))
 	for _, f := range m.Files {
 		out = append(out, f.RelPath)
+	}
+	return out
+}
+
+// computeDelta maps a DiffResult (changed + deleted relative paths)
+// into two sets of module IDs:
+//   - evict: modules that contain at least one changed or deleted file
+//     and should be removed from CompletedModuleIDs so the pipeline
+//     re-processes them on the current walk.
+//   - retract: modules whose constituent files were ALL deleted (no
+//     changed files remain in that module). These modules will not
+//     appear in the walk so they need explicit retraction datoms.
+//
+// The mapping reuses languages.Classify + Matrix.Strategy to derive the
+// same module ID that languages.Group would produce, without needing
+// the files on disk.
+func (p *Pipeline) computeDelta(diff DiffResult) (evict, retract []string) {
+	// Build fake File entries for changed and deleted paths so we can
+	// run them through languages.Group to get the canonical module IDs.
+	changedFiles := make([]languages.File, 0, len(diff.Changed))
+	for _, rel := range diff.Changed {
+		changedFiles = append(changedFiles, languages.File{
+			AbsPath: rel, // Classify only uses the extension
+			RelPath: rel,
+		})
+	}
+	deletedFiles := make([]languages.File, 0, len(diff.Deleted))
+	for _, rel := range diff.Deleted {
+		deletedFiles = append(deletedFiles, languages.File{
+			AbsPath: rel,
+			RelPath: rel,
+		})
+	}
+
+	// Module IDs touched by changed files.
+	changedModIDs := make(map[string]bool)
+	for _, m := range languages.Group(changedFiles, p.Matrix) {
+		changedModIDs[m.ID] = true
+	}
+
+	// Module IDs touched by deleted files.
+	deletedModIDs := make(map[string]bool)
+	for _, m := range languages.Group(deletedFiles, p.Matrix) {
+		deletedModIDs[m.ID] = true
+	}
+
+	// Evict = union of changed and deleted module IDs.
+	seen := make(map[string]bool)
+	for id := range changedModIDs {
+		if !seen[id] {
+			evict = append(evict, id)
+			seen[id] = true
+		}
+	}
+	for id := range deletedModIDs {
+		if !seen[id] {
+			evict = append(evict, id)
+			seen[id] = true
+		}
+	}
+	sort.Strings(evict)
+
+	// Retract = deleted-only modules (no changed files in the same module).
+	for id := range deletedModIDs {
+		if !changedModIDs[id] {
+			retract = append(retract, id)
+		}
+	}
+	sort.Strings(retract)
+	return evict, retract
+}
+
+// removeAll returns a copy of ids with every element in remove deleted.
+func removeAll(ids []string, remove []string) []string {
+	drop := make(map[string]bool, len(remove))
+	for _, r := range remove {
+		drop[r] = true
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if !drop[id] {
+			out = append(out, id)
+		}
 	}
 	return out
 }

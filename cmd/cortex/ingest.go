@@ -30,6 +30,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -458,6 +459,8 @@ func buildIngestPipeline(cfg config.Config, segDir string) (*ingest.Pipeline, fu
 		// output response inside the model's context window. Modules
 		// exceeding this fall back to per-file granularity automatically.
 		MaxModuleBytes: int64(float64(cfg.Ollama.NumCtx) * 0.6 * 4),
+		Differ:         gitDiff,
+		Retracter:      newIngestRetracter(writer, bolt),
 	}
 	return p, cleanup, nil
 }
@@ -468,20 +471,28 @@ func renderIngestResult(cmd *cobra.Command, res *ingest.Result, jsonFlag bool) e
 		enc := json.NewEncoder(cmd.OutOrStdout())
 		enc.SetIndent("", "  ")
 		return enc.Encode(map[string]any{
-			"project":         res.ProjectName,
-			"trail_id":        res.TrailID,
-			"entry_ids":       res.EntryIDs,
-			"modules_found":   len(res.Modules),
-			"skipped_modules": res.SkippedModules,
-			"errors":          res.SummaryErrors,
-			"started_at":      res.StartedAt,
-			"finished_at":     res.FinishedAt,
+			"project":           res.ProjectName,
+			"trail_id":          res.TrailID,
+			"entry_ids":         res.EntryIDs,
+			"modules_found":     len(res.Modules),
+			"skipped_modules":   res.SkippedModules,
+			"evicted_modules":   res.EvictedModules,
+			"retracted_modules": res.RetractedModules,
+			"errors":            res.SummaryErrors,
+			"started_at":        res.StartedAt,
+			"finished_at":       res.FinishedAt,
 		})
 	}
 	w := cmd.OutOrStdout()
 	fmt.Fprintf(w, "project=%s modules=%d written=%d skipped=%d errors=%d\n",
 		res.ProjectName, len(res.Modules), len(res.EntryIDs),
 		len(res.SkippedModules), len(res.SummaryErrors))
+	if len(res.EvictedModules) > 0 {
+		fmt.Fprintf(w, "evicted=%d (delta detection)\n", len(res.EvictedModules))
+	}
+	if len(res.RetractedModules) > 0 {
+		fmt.Fprintf(w, "retracted=%d (deleted files)\n", len(res.RetractedModules))
+	}
 	if res.TrailID != "" {
 		fmt.Fprintf(w, "trail=%s\n", res.TrailID)
 	}
@@ -1118,4 +1129,131 @@ func (s *jsonFileStateStore) Write(_ context.Context, state ingest.ProjectState)
 		return fmt.Errorf("rename %s: %w", tmp, err)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Delta detection adapters (FR-023)
+// ---------------------------------------------------------------------------
+
+// gitDiff implements ingest.DiffFunc by running git diff --name-status
+// between two commits. It parses the output into changed (A/M/R) and
+// deleted (D) relative paths.
+func gitDiff(projectRoot, oldSHA, newSHA string) (ingest.DiffResult, error) {
+	cmd := exec.Command("git", "diff", "--name-status", oldSHA+".."+newSHA)
+	cmd.Dir = projectRoot
+	out, err := cmd.Output()
+	if err != nil {
+		return ingest.DiffResult{}, fmt.Errorf("git diff %s..%s: %w", oldSHA, newSHA, err)
+	}
+	var result ingest.DiffResult
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		// Format: "D\tpath" or "M\tpath" or "R100\told\tnew"
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		status := parts[0]
+		switch {
+		case status == "D":
+			result.Deleted = append(result.Deleted, parts[1])
+		case status == "A", status == "M":
+			result.Changed = append(result.Changed, parts[1])
+		case strings.HasPrefix(status, "R"):
+			// Rename: old path is deleted, new path is changed.
+			result.Deleted = append(result.Deleted, parts[1])
+			if len(parts) == 3 {
+				result.Changed = append(result.Changed, parts[2])
+			}
+		}
+	}
+	return result, nil
+}
+
+// ingestRetracter implements ingest.Retracter by looking up entries
+// with the given module facet in Neo4j and writing OpRetract datoms
+// through the log. When Neo4j is unavailable (boltErr was non-nil at
+// build time), retraction is a no-op — the module is still evicted
+// from CompletedModuleIDs so a future full-ingest cleans up.
+type ingestRetracter struct {
+	log  *log.Writer
+	bolt *neo4j.BoltClient
+}
+
+func newIngestRetracter(logWriter *log.Writer, bolt *neo4j.BoltClient) *ingestRetracter {
+	return &ingestRetracter{log: logWriter, bolt: bolt}
+}
+
+func (r *ingestRetracter) RetractModules(ctx context.Context, projectName string, moduleIDs []string) error {
+	if r.bolt == nil {
+		// No Neo4j → cannot look up entry IDs by module facet. The
+		// module is already evicted from CompletedModuleIDs, so a
+		// future full re-ingest will not see stale entries. Log the
+		// skip but do not fail the run.
+		return nil
+	}
+	for _, modID := range moduleIDs {
+		entryIDs, err := r.findEntriesByModule(ctx, projectName, modID)
+		if err != nil {
+			return fmt.Errorf("find entries for module %s: %w", modID, err)
+		}
+		for _, eid := range entryIDs {
+			if err := r.retractEntry(ctx, eid, modID); err != nil {
+				return fmt.Errorf("retract entry %s (module %s): %w", eid, modID, err)
+			}
+		}
+	}
+	return nil
+}
+
+// findEntriesByModule queries Neo4j for Entry nodes whose facet.module
+// and facet.project properties match.
+func (r *ingestRetracter) findEntriesByModule(ctx context.Context, projectName, moduleID string) ([]string, error) {
+	cypher := `MATCH (n:Entry)
+WHERE n.` + "`facet.module`" + ` = $module AND n.` + "`facet.project`" + ` = $project
+  AND (n.retracted IS NULL OR n.retracted = false)
+RETURN n.entry_id AS eid`
+	rows, err := r.bolt.QueryGraph(ctx, cypher, map[string]any{
+		"module":  moduleID,
+		"project": projectName,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, row := range rows {
+		if eid, ok := row["eid"].(string); ok && eid != "" {
+			ids = append(ids, eid)
+		}
+	}
+	return ids, nil
+}
+
+// retractEntry writes one OpRetract datom for the given entry.
+func (r *ingestRetracter) retractEntry(ctx context.Context, entryID, moduleID string) error {
+	tx := ulid.Make().String()
+	ts := time.Now().UTC().Format(time.RFC3339Nano)
+	reasonVal, _ := json.Marshal("incremental re-ingest: module " + moduleID + " deleted")
+	nullVal, _ := json.Marshal(nil)
+	group := []datom.Datom{
+		{
+			Tx: tx, Ts: ts, Actor: defaultActor(),
+			Op: datom.OpRetract, E: entryID, A: "exists",
+			V: nullVal, Src: "retract", InvocationID: tx,
+		},
+		{
+			Tx: tx, Ts: ts, Actor: defaultActor(),
+			Op: datom.OpAdd, E: entryID, A: "retract.reason",
+			V: reasonVal, Src: "retract", InvocationID: tx,
+		},
+	}
+	for i := range group {
+		if err := group[i].Seal(); err != nil {
+			return fmt.Errorf("seal datom: %w", err)
+		}
+	}
+	_, err := r.log.Append(group)
+	return err
 }
