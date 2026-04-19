@@ -96,22 +96,31 @@ func (r *ExecRunner) Run(ctx context.Context, req Request) (Response, error) {
 		DurationMS: elapsed.Milliseconds(),
 	}
 
-	if runErr != nil {
-		// Deadline/cancellation take precedence over exit-code
-		// interpretation so callers see ErrTimeout rather than
-		// ErrCLICrash for a killed subprocess.
-		if runCtx.Err() == context.DeadlineExceeded {
-			return resp, fmt.Errorf("%w: elapsed=%v", ErrTimeout, elapsed)
-		}
+	// Deadline/cancellation takes precedence over both exit code and
+	// envelope interpretation so callers see ErrTimeout rather than
+	// ErrCLICrash for a killed subprocess.
+	if runCtx.Err() == context.DeadlineExceeded {
+		return resp, fmt.Errorf("%w: elapsed=%v", ErrTimeout, elapsed)
+	}
+
+	// Some failure modes (notably error_max_turns on a structured-
+	// output call, and any error envelope produced by the CLI itself)
+	// emit a parseable JSON envelope on stdout AND exit non-zero. Try
+	// to parse stdout first — if it yields a usable payload, we can
+	// salvage the structured output or get a more descriptive error
+	// message than the bare exit code. Fall back to stderr
+	// classification only when stdout parsing fails.
+	parsed, parseErr := parseJSONEnvelope(stdout.Bytes())
+	if runErr != nil && parseErr != nil {
 		if err := classifyStderr(resp.Stderr); err != nil {
 			return resp, err
 		}
-		return resp, fmt.Errorf("%w: %v: %s", ErrCLICrash, runErr, truncate(resp.Stderr, 512))
+		return resp, fmt.Errorf("%w: %v: stderr=%q stdout=%q",
+			ErrCLICrash, runErr,
+			truncate(resp.Stderr, 256), truncate(stdout.String(), 256))
 	}
-
-	parsed, err := parseJSONEnvelope(stdout.Bytes())
-	if err != nil {
-		return resp, fmt.Errorf("%w: %v", ErrInvalidJSON, err)
+	if parseErr != nil {
+		return resp, fmt.Errorf("%w: %v", ErrInvalidJSON, parseErr)
 	}
 
 	resp.StructuredOutput = parsed.StructuredOutput

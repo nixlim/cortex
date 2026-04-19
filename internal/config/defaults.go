@@ -66,6 +66,14 @@ type SummariseConfig struct {
 	// hardware / wider rate-limit budgets; remember each worker
 	// spawns a fresh subprocess.
 	Concurrency int `yaml:"concurrency"`
+
+	// MaxCommunities caps the number of communities passed to the
+	// stage in one run. 0 = unlimited (production default). Useful
+	// for phased rollouts and smoke testing against a large graph
+	// without incurring the full fan-out cost on the first run. The
+	// cap is applied before hash gating so operators can bound
+	// worst-case cost precisely.
+	MaxCommunities int `yaml:"max_communities"`
 }
 
 // LLMConfig selects the generation provider and carries the

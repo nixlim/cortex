@@ -222,6 +222,7 @@ func buildSummariserRunner(
 			invocationID: invocationID,
 			now:          func() time.Time { return time.Now().UTC() },
 		},
+		maxCommunities: cfg.Summarise.MaxCommunities,
 	}, nil
 }
 

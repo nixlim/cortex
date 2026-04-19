@@ -354,11 +354,12 @@ type frameWriter interface {
 // dependency is provided at construction, and Run is safe to call
 // repeatedly (each call is one pass end-to-end).
 type summariserRunner struct {
-	project string
-	stage   *summarise.Stage
-	prior   priorBriefLoader
-	comm    communityMaterialiser
-	writer  frameWriter
+	project        string
+	stage          *summarise.Stage
+	prior          priorBriefLoader
+	comm           communityMaterialiser
+	writer         frameWriter
+	maxCommunities int // 0 = unlimited; see SummariseConfig.MaxCommunities
 }
 
 // Run executes one complete summarisation pass: load prior briefs,
@@ -376,6 +377,9 @@ func (r *summariserRunner) Run(ctx context.Context) error {
 		// No communities to summarise — probably a fresh graph. Don't
 		// treat this as an error; the stitch pass would be empty too.
 		return nil
+	}
+	if r.maxCommunities > 0 && len(communities) > r.maxCommunities {
+		communities = communities[:r.maxCommunities]
 	}
 	prior, err := r.prior.Load(ctx)
 	if err != nil {
