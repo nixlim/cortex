@@ -2,6 +2,7 @@ package analyze
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -390,5 +391,110 @@ func TestAnalyze_CommunityRefreshOnlyWhenAccepted(t *testing.T) {
 	}
 	if com.refreshCalls != 0 {
 		t.Fatalf("refresh ran on empty-accept run: %d", com.refreshCalls)
+	}
+}
+
+// fakeSummariser records Run invocations so the hook tests can assert
+// when (and how often) the analyze pipeline kicks off the
+// continuous-summarisation pass.
+type fakeSummariser struct {
+	runs int
+	err  error
+}
+
+func (f *fakeSummariser) Run(_ context.Context) error {
+	f.runs++
+	return f.err
+}
+
+// TestAnalyze_SummariserFiresAfterRefresh: when both a refresh and a
+// Summariser are configured, an accepted cross-project frame triggers
+// exactly one Run call, AFTER the refresh.
+func TestAnalyze_SummariserFiresAfterRefresh(t *testing.T) {
+	src := &fakeSource{candidates: []ClusterCandidate{crossProjectCluster("c1")}}
+	com := &fakeCommunity{}
+	sum := &fakeSummariser{}
+	p := newPipeline(src, &fakeProposer{frame: &Frame{Type: "BugPattern"}}, &fakeLog{}, com)
+	p.Summariser = sum
+	res, err := p.Analyze(context.Background(), RunOptions{})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if !res.CommunityRefresh {
+		t.Fatalf("refresh should have run")
+	}
+	if sum.runs != 1 {
+		t.Fatalf("summariser runs: got %d want 1", sum.runs)
+	}
+	if res.SummariseErr != nil {
+		t.Fatalf("SummariseErr should be nil: %v", res.SummariseErr)
+	}
+}
+
+// TestAnalyze_SummariserSkippedWhenNoRefresh: when no frames are
+// accepted (so refresh is skipped), the summariser MUST also be
+// skipped — otherwise we'd pay LLM cost on an idle run.
+func TestAnalyze_SummariserSkippedWhenNoRefresh(t *testing.T) {
+	// Single-project cluster → rejected → no refresh.
+	c := ClusterCandidate{
+		ID: "c1",
+		Exemplars: []ExemplarRef{
+			{EntryID: "entry:A", Project: "projA"},
+			{EntryID: "entry:B", Project: "projA"},
+		},
+		MDLRatio: 1.3,
+	}
+	src := &fakeSource{candidates: []ClusterCandidate{c}}
+	com := &fakeCommunity{}
+	sum := &fakeSummariser{}
+	p := newPipeline(src, &fakeProposer{frame: &Frame{Type: "X"}}, &fakeLog{}, com)
+	p.Summariser = sum
+	if _, err := p.Analyze(context.Background(), RunOptions{}); err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if sum.runs != 0 {
+		t.Fatalf("summariser ran on non-refresh run: %d", sum.runs)
+	}
+}
+
+// TestAnalyze_SummariserErrorIsNonFatal: a failing summariser MUST NOT
+// roll the analyze run back. The accepted frames are already
+// committed; SummariseErr records the failure for the caller.
+func TestAnalyze_SummariserErrorIsNonFatal(t *testing.T) {
+	src := &fakeSource{candidates: []ClusterCandidate{crossProjectCluster("c1")}}
+	com := &fakeCommunity{}
+	boom := errors.New("claude subprocess crashed")
+	sum := &fakeSummariser{err: boom}
+	log := &fakeLog{}
+	p := newPipeline(src, &fakeProposer{frame: &Frame{Type: "BugPattern"}}, log, com)
+	p.Summariser = sum
+	res, err := p.Analyze(context.Background(), RunOptions{})
+	if err != nil {
+		t.Fatalf("Analyze: got error %v, want nil (summariser is non-fatal)", err)
+	}
+	if len(res.Accepted) != 1 {
+		t.Fatalf("accepted frames: got %d want 1", len(res.Accepted))
+	}
+	if len(log.groups) != 1 {
+		t.Fatalf("log groups: got %d want 1 (accepted frame must have been appended)", len(log.groups))
+	}
+	if !errors.Is(res.SummariseErr, boom) {
+		t.Fatalf("SummariseErr: got %v want %v", res.SummariseErr, boom)
+	}
+}
+
+// TestAnalyze_SummariserSkippedOnDryRun: --dry-run keeps the whole
+// side-effect chain disabled, including the summariser.
+func TestAnalyze_SummariserSkippedOnDryRun(t *testing.T) {
+	src := &fakeSource{candidates: []ClusterCandidate{crossProjectCluster("c1")}}
+	com := &fakeCommunity{}
+	sum := &fakeSummariser{}
+	p := newPipeline(src, &fakeProposer{frame: &Frame{Type: "BugPattern"}}, &fakeLog{}, com)
+	p.Summariser = sum
+	if _, err := p.Analyze(context.Background(), RunOptions{DryRun: true}); err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if sum.runs != 0 {
+		t.Fatalf("summariser ran on dry-run: %d", sum.runs)
 	}
 }

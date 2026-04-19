@@ -26,12 +26,14 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/nixlim/cortex/internal/analyze"
+	"github.com/nixlim/cortex/internal/claudecli"
 	"github.com/nixlim/cortex/internal/community"
 	"github.com/nixlim/cortex/internal/config"
 	"github.com/nixlim/cortex/internal/errs"
 	"github.com/nixlim/cortex/internal/infra"
 	"github.com/nixlim/cortex/internal/log"
 	"github.com/nixlim/cortex/internal/neo4j"
+	"github.com/nixlim/cortex/internal/summarise"
 )
 
 // newAnalyzeCmdReal returns the production-wired `cortex analyze`
@@ -160,15 +162,77 @@ func buildAnalyzePipeline() (*analyze.Pipeline, func(), error) {
 		},
 	}
 
+	invocationID := ulid.Make().String()
+	actor := defaultActor()
+
 	pipeline := &analyze.Pipeline{
 		Source:       &neo4jAnalyzeClusterSource{client: bolt},
 		Proposer:     &ollamaFrameProposer{client: generator, source: "analyze"},
 		Log:          writer,
 		Community:    refreshBridge,
-		Actor:        defaultActor(),
-		InvocationID: ulid.Make().String(),
+		Actor:        actor,
+		InvocationID: invocationID,
 	}
+
+	// Continuous categorised-summarisation pass (cortex-8sr). Opt-in
+	// via cfg.Summarise.Enabled; absent config or false flag ⇒ nil
+	// Summariser ⇒ analyze pipeline skips the pass entirely.
+	if cfg.Summarise.Enabled {
+		runner, err := buildSummariserRunner(cfg, bolt, writer, actor, invocationID)
+		if err != nil {
+			_ = writer.Close()
+			_ = bolt.Close(context.Background())
+			return nil, func() {}, errs.Operational("SUMMARISE_CONFIG_INVALID",
+				"could not construct summariser runner", err)
+		}
+		pipeline.Summariser = runner
+	}
+
 	return pipeline, cleanup, nil
+}
+
+// buildSummariserRunner constructs the analyze.SummariseStage wiring
+// from config + shared Neo4j and log handles. The caller keeps
+// ownership of bolt/writer; we only borrow them for the pass.
+func buildSummariserRunner(
+	cfg config.Config,
+	bolt neo4j.Client,
+	writer logAppenderLike,
+	actor, invocationID string,
+) (*summariserRunner, error) {
+	runner := &claudecli.ExecRunner{Command: cfg.Summarise.Command}
+	stageCfg := summarise.Config{
+		Runner:      runner,
+		Model:       cfg.Summarise.Model,
+		Concurrency: cfg.Summarise.Concurrency,
+		CallTimeout: time.Duration(cfg.Summarise.CallTimeoutSeconds) * time.Second,
+	}
+	stage, err := summarise.New(stageCfg)
+	if err != nil {
+		return nil, err
+	}
+	return &summariserRunner{
+		project: summariseProject(cfg),
+		stage:   stage,
+		prior:   &neo4jPriorBriefLoader{client: bolt},
+		comm:    &neo4jCommunityMaterialiser{client: bolt},
+		writer: &logSummariseFrameWriter{
+			log:          writer,
+			actor:        actor,
+			invocationID: invocationID,
+			now:          func() time.Time { return time.Now().UTC() },
+		},
+	}, nil
+}
+
+// summariseProject picks the project label stamped onto the
+// ProjectBrief. Cross-project analyze is inherently multi-project, so
+// the default is the literal "all" — operators who want a narrower
+// scope will get it via the future reflect --for=<intent> path
+// (cortex-jr9), not through analyze. Kept as a helper so the choice
+// is visible and easy to override later.
+func summariseProject(_ config.Config) string {
+	return "all"
 }
 
 func renderAnalyzeJSON(cmd *cobra.Command, res *analyze.Result) error {

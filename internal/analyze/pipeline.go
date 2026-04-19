@@ -112,6 +112,18 @@ type CommunityRefresher interface {
 	Refresh(ctx context.Context) error
 }
 
+// SummariseStage is the continuous categorised-summarisation hook
+// (cortex-8sr Pass A). When configured, the analyze pipeline invokes
+// it once per run AFTER a successful community refresh, so the stage
+// can walk the freshly-redetected Leiden communities and produce
+// CommunityBrief + ProjectBrief frames. A nil stage skips the pass.
+// A non-nil error is recorded on Result.SummariseErr but does NOT
+// roll back the analyze frames already appended — the two passes are
+// independent by design.
+type SummariseStage interface {
+	Run(ctx context.Context) error
+}
+
 // CandidateOutcome records what happened to one candidate.
 type CandidateOutcome struct {
 	Cluster  ClusterCandidate
@@ -125,7 +137,8 @@ type Result struct {
 	Accepted         []*Frame
 	Outcomes         []CandidateOutcome
 	FrameDatoms      []datom.Datom
-	CommunityRefresh bool // true if a refresh was triggered
+	CommunityRefresh bool  // true if a refresh was triggered
+	SummariseErr     error // non-fatal error from the Summariser hook, if any
 }
 
 // RunOptions carries the CLI flags.
@@ -141,6 +154,11 @@ type Pipeline struct {
 	Proposer  FrameProposer
 	Log       LogAppender
 	Community CommunityRefresher
+
+	// Summariser runs after a successful community refresh. Nil
+	// disables the continuous-summarisation pass entirely, which is
+	// the default. See SummariseStage and cortex-8sr.
+	Summariser SummariseStage
 
 	MinProjects        int
 	MaxSharePerProject float64
@@ -217,6 +235,18 @@ func (p *Pipeline) Analyze(ctx context.Context, opts RunOptions) (*Result, error
 				"community refresh failed after cross-project writes", err)
 		}
 		res.CommunityRefresh = true
+	}
+
+	// Continuous categorised-summarisation pass (cortex-8sr). Fires
+	// only when a refresh actually ran, so the summariser always sees
+	// the post-refresh community set. A failure here is non-fatal: the
+	// analyze frames have already committed, and the summariser is a
+	// separately-budgeted side channel — a bad run should not roll
+	// them back.
+	if res.CommunityRefresh && p.Summariser != nil {
+		if err := p.Summariser.Run(ctx); err != nil {
+			res.SummariseErr = err
+		}
 	}
 
 	return res, nil
